@@ -1,0 +1,12 @@
+- Sourcing the GAP SDK:
+cd gap_sdk
+source configs/gapuino_v3.sh
+
+- Executing on the simulator:
+make clean all run platform=gvsoc
+
+- Executing on the board:
+make clean all run platform=board
+
+
+
