@@ -58,6 +58,33 @@ static Type i32Ty(MLIRContext *ctx) {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+// Classify captures: returns true if this capture is a private variable
+// (scalar alloca written before read inside the region — e.g. loop IV).
+static bool isPrivateCapture(Value val, Region &region) {
+  if (!val.getDefiningOp<LLVM::AllocaOp>()) return false;
+  auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
+  Type elemTy = allocaOp.getElemType();
+  // Only scalar non-pointer types can be private IVs.
+  if (!LLVM::isCompatibleType(elemTy)) return false;
+  if (llvm::isa<LLVM::LLVMPointerType>(elemTy)) return false;
+  if (llvm::isa<LLVM::LLVMArrayType>(elemTy)) return false;
+  if (llvm::isa<LLVM::LLVMStructType>(elemTy)) return false;
+  // Check if first use in region is a store (addr operand).
+  bool firstIsStore = false, found = false;
+  region.walk([&](Operation *op) {
+    if (found) return;
+    for (auto &use : op->getOpOperands()) {
+      if (use.get() == val) {
+        found = true;
+        if (auto st = llvm::dyn_cast<LLVM::StoreOp>(op))
+          if (&use == &op->getOpOperand(1)) firstIsStore = true;
+        break;
+      }
+    }
+  });
+  return firstIsStore;
+}
+
 static SmallVector<Value> collectCaptures(Region &region) {
   llvm::SetVector<Value> seen;
   SmallVector<Value> captures;
@@ -166,6 +193,12 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // Collect all values used inside the region but defined outside.
   SmallVector<Value> captures = collectCaptures(body);
 
+  // Compute private captures before takeBody (body region is consumed after).
+  llvm::SetVector<Value> privateCaptures;
+  for (auto cap : captures)
+    if (isPrivateCapture(cap, body))
+      privateCaptures.insert(cap);
+
   std::string fnName = "outlined_parallel_" + std::to_string(counter++);
 
   // Build outlined function argument types.
@@ -250,12 +283,22 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       // Keep loaded values so privatizer handling can reuse them.
       SmallVector<Value> loadedCaptures;
       for (size_t i = 0; i < captures.size(); i++) {
-        Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-          dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-        Value loaded = LLVM::LoadOp::create(prologue, loc,
-          captures[i].getType(), gep);
-        loadedCaptures.push_back(loaded);
-        replaceUsesInRegion(outlinedFn.getBody(), captures[i], loaded);
+        if (privateCaptures.contains(captures[i])) {
+          // Private capture (loop IV etc.): allocate fresh alloca per core.
+          // Don't load from struct — each core gets its own independent copy.
+          auto srcAlloca = captures[i].getDefiningOp<LLVM::AllocaOp>();
+          Value freshAlloca = LLVM::AllocaOp::create(prologue, loc,
+            ptrTy(ctx), srcAlloca.getElemType(), one64);
+          loadedCaptures.push_back(freshAlloca);
+          replaceUsesInRegion(outlinedFn.getBody(), captures[i], freshAlloca);
+        } else {
+          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
+            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+          Value loaded = LLVM::LoadOp::create(prologue, loc,
+            captures[i].getType(), gep);
+          loadedCaptures.push_back(loaded);
+          replaceUsesInRegion(outlinedFn.getBody(), captures[i], loaded);
+        }
       }
       // Handle privatizer args (firstprivate).
       // We already loaded the source ptrs from the struct above and stored
@@ -326,10 +369,48 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         Value srcVal = LLVM::LoadOp::create(copyBuilder, loc, elemTy, srcArg);
         LLVM::StoreOp::create(copyBuilder, loc, srcVal, privAlloca);
         replaceUsesInRegion(outlinedFn.getBody(), dstArg, privAlloca);
+        // Fix alignment on loads/stores of the private alloca.
+        // The original privatizer arg loads used alignment=1; fix to natural align.
+        if (LLVM::isCompatibleType(elemTy)) {
+          unsigned naturalAlign = 1;
+          if (elemTy.isInteger(32) || elemTy.isF32()) naturalAlign = 4;
+          else if (elemTy.isInteger(64) || elemTy.isF64()) naturalAlign = 8;
+          else if (elemTy.isInteger(16)) naturalAlign = 2;
+          if (naturalAlign > 1) {
+            outlinedFn.getBody().walk([&](Operation *useOp) {
+              if (auto load = llvm::dyn_cast<LLVM::LoadOp>(useOp)) {
+                if (load.getAddr() == privAlloca &&
+                    load.getAlignment().value_or(0) < naturalAlign)
+                  load.setAlignment(naturalAlign);
+              }
+              if (auto store = llvm::dyn_cast<LLVM::StoreOp>(useOp)) {
+                if (store.getAddr() == privAlloca &&
+                    store.getAlignment().value_or(0) < naturalAlign)
+                  store.setAlignment(naturalAlign);
+              }
+            });
+          }
+        }
       }
     }
   } else if (isClosure) {
     // closure without microtask: single env ptr already at index 0
+  }
+
+  // For closure/packed: remove privatizer block args from the entry block.
+  // They were already replaced in the unpack prolog; they must not appear
+  // in the function signature since PMSIS/libgomp calls with a single void*.
+  if (isPacked) {
+    // privatizerArgs are now unused (replaced by private copies in prolog).
+    // Erase them from the entry block in reverse order to preserve indices.
+    SmallVector<BlockArgument> toErase;
+    for (auto arg : entry.getArguments())
+      if (arg != entry.getArgument(0)) // keep only %arg0 (data ptr)
+        if (llvm::isa<LLVM::LLVMPointerType>(arg.getType()))
+          if (arg.use_empty())
+            toErase.push_back(arg);
+    for (auto arg : llvm::reverse(toErase))
+      entry.eraseArgument(arg.getArgNumber());
   }
 
   // Remove injected unrealized_conversion_cast marker ops (no users).
@@ -510,9 +591,16 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         structAlloca = LLVM::AllocaOp::create(builder, loc,
           ptrTy(ctx), structTy, one64);
         for (size_t i = 0; i < captures.size(); i++) {
+          Value capVal = captures[i];
+          // For private captures (loop IVs), allocate a fresh local alloca
+          // so each core gets its own private copy (no data race).
+          if (privateCaptures.contains(capVal)) {
+            // Private capture — slot not read in outlined fn; pass undef.
+            capVal = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+          }
           Value gep = LLVM::GEPOp::create(builder, loc, ptrTy(ctx), structTy,
             structAlloca, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          LLVM::StoreOp::create(builder, loc, captures[i], gep);
+          LLVM::StoreOp::create(builder, loc, capVal, gep);
         }
       } else {
         structAlloca = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
@@ -576,7 +664,19 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       callArgs.push_back(fnPtrCast); callTypes.push_back(ptrTy(ctx));
 
       for (auto cap : captures) {
-        callArgs.push_back(cap); callTypes.push_back(cap.getType());
+        Value capVal = cap;
+        // For private captures (loop IVs), pass a fresh local alloca.
+        if (privateCaptures.contains(cap)) {
+          // Private capture — pass a fresh local alloca so each core has
+          // its own copy (not shared through the original caller alloca).
+          auto srcAlloca = cap.getDefiningOp<LLVM::AllocaOp>();
+          Value cnt = LLVM::ConstantOp::create(builder, loc,
+            IntegerType::get(ctx, 64),
+            IntegerAttr::get(IntegerType::get(ctx, 64), 1));
+          capVal = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+            srcAlloca.getElemType(), cnt);
+        }
+        callArgs.push_back(capVal); callTypes.push_back(capVal.getType());
       }
     }
 
@@ -769,9 +869,10 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     // remaining blocks are spliced in between loopBody and loopLatch.
     auto &nestRegion = loopNest.getRegion();
     auto &nestFirst = nestRegion.front();
+    // Replace outer IV with curI.
     nestFirst.getArgument(0).replaceAllUsesWith(curI);
 
-    // Erase omp.yield/omp.terminator from the last block of the nest.
+    // Erase omp.yield/omp.terminator from the last block.
     auto &nestLast = nestRegion.back();
     for (auto &innerOp : llvm::make_early_inc_range(nestLast.getOperations()))
       if (innerOp.getName().getStringRef() == "omp.yield" ||
@@ -779,7 +880,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
         innerOp.erase();
 
     if (nestRegion.hasOneBlock()) {
-      // Single block: move all ops directly into loopBody.
+      // Single block: move all ops into loopBody.
       builder.setInsertionPointToEnd(loopBody);
       SmallVector<Operation *> opsToMove;
       for (auto &innerOp : nestFirst.getOperations())
@@ -789,33 +890,28 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       builder.setInsertionPointToEnd(loopBody);
       LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
     } else {
-      // Multiple blocks: move first block's ops into loopBody,
-      // then splice remaining blocks before loopLatch.
+      // Multiple blocks (inner loops from CIR): splice ALL blocks before loopLatch
+      // first, then move first block's ops into loopBody.
+      // This preserves branch targets since blocks are already in the region.
+      SmallVector<Block *> blocksToMove;
+      for (auto &blk : nestRegion)
+        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
+      for (auto *blk : blocksToMove)
+        blk->moveBefore(loopLatch);
+
+      // Now move nestFirst's ops into loopBody (branch targets are now valid).
       builder.setInsertionPointToEnd(loopBody);
       SmallVector<Operation *> firstOps;
       for (auto &innerOp : nestFirst.getOperations())
         firstOps.push_back(&innerOp);
       for (auto *innerOp : firstOps)
         innerOp->moveBefore(loopBody, loopBody->end());
-      // The last op of nestFirst should now be an llvm.br to ^bb1 inside
-      // the nest — that's fine, it will branch to the next spliced block.
 
-      // Splice remaining blocks (all except nestFirst) before loopLatch.
-      auto &parentRegion = *loopBody->getParent();
-      Block *insertBefore = loopLatch;
-      // Collect blocks to move (skip nestFirst which is now empty).
-      SmallVector<Block *> blocksToMove;
-      for (auto &blk : nestRegion)
-        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
-      for (auto *blk : blocksToMove) {
-        blk->moveBefore(insertBefore);
-      }
-      // The last moved block should fall through to loopLatch.
-      // Its terminator was the omp.yield we erased — add branch to loopLatch.
-      Block *lastMovedBlock = blocksToMove.back();
-      builder.setInsertionPointToEnd(lastMovedBlock);
+      // Add branch from last moved block to loopLatch.
+      Block *lastBlock = blocksToMove.back();
+      builder.setInsertionPointToEnd(lastBlock);
       LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-    }
+}
 
     builder.setInsertionPointToEnd(loopLatch);
     Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
@@ -925,22 +1021,41 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     // innerBody: truncate i64 to iterTy, run loop body.
     builder.setInsertionPointToEnd(innerBody);
     Value curI = LLVM::TruncOp::create(builder, loc, iterTy, curI64);
-    auto &nestBlock = loopNest.getRegion().front();
-    nestBlock.getArgument(0).replaceAllUsesWith(curI);
-    SmallVector<Operation *> opsToMove;
-    for (auto &innerOp : nestBlock.getOperations()) {
-      llvm::StringRef opName = innerOp.getName().getStringRef();
-      if (opName == "omp.yield" || opName == "omp.terminator") continue;
-      opsToMove.push_back(&innerOp);
-    }
-    for (auto *innerOp : opsToMove)
-      innerOp->moveBefore(innerBody, innerBody->end());
-    for (auto &innerOp : llvm::make_early_inc_range(nestBlock.getOperations()))
+    auto &gompNestRegion = loopNest.getRegion();
+    auto &gompNestFirst  = gompNestRegion.front();
+    gompNestFirst.getArgument(0).replaceAllUsesWith(curI);
+    // Erase omp.yield/omp.terminator from last block.
+    for (auto &innerOp : llvm::make_early_inc_range(gompNestRegion.back().getOperations()))
       if (innerOp.getName().getStringRef() == "omp.yield" ||
           innerOp.getName().getStringRef() == "omp.terminator")
         innerOp.erase();
-    builder.setInsertionPointToEnd(innerBody);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerLatch);
+    if (gompNestRegion.hasOneBlock()) {
+      builder.setInsertionPointToEnd(innerBody);
+      SmallVector<Operation *> opsToMove;
+      for (auto &innerOp : gompNestFirst.getOperations())
+        opsToMove.push_back(&innerOp);
+      for (auto *innerOp : opsToMove)
+        innerOp->moveBefore(innerBody, innerBody->end());
+      builder.setInsertionPointToEnd(innerBody);
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerLatch);
+    } else {
+      // Multi-block: splice remaining blocks before innerLatch first.
+      SmallVector<Block *> extraBlocks;
+      for (auto &blk : gompNestRegion)
+        if (&blk != &gompNestFirst) extraBlocks.push_back(&blk);
+      for (auto *blk : extraBlocks)
+        blk->moveBefore(innerLatch);
+      // Move first block's ops into innerBody.
+      builder.setInsertionPointToEnd(innerBody);
+      SmallVector<Operation *> firstOps;
+      for (auto &innerOp : gompNestFirst.getOperations())
+        firstOps.push_back(&innerOp);
+      for (auto *innerOp : firstOps)
+        innerOp->moveBefore(innerBody, innerBody->end());
+      // Last extra block branches to innerLatch.
+      builder.setInsertionPointToEnd(extraBlocks.back());
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerLatch);
+    }
 
     // innerLatch: i += step.
     builder.setInsertionPointToEnd(innerLatch);
@@ -1037,56 +1152,36 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
 
     // Move the loop nest body into loopBody.
-    // The nest region may have multiple blocks (from inner loops).
-    // Move all blocks: first block's ops go into loopBody,
-    // remaining blocks are spliced in between loopBody and loopLatch.
-    auto &nestRegion = loopNest.getRegion();
-    auto &nestFirst = nestRegion.front();
-    nestFirst.getArgument(0).replaceAllUsesWith(curI);
-
-    // Erase omp.yield/omp.terminator from the last block of the nest.
-    auto &nestLast = nestRegion.back();
-    for (auto &innerOp : llvm::make_early_inc_range(nestLast.getOperations()))
+    auto &ioNestRegion = loopNest.getRegion();
+    auto &ioNestFirst  = ioNestRegion.front();
+    ioNestFirst.getArgument(0).replaceAllUsesWith(curI);
+    // Erase omp.yield/omp.terminator from last block.
+    for (auto &innerOp : llvm::make_early_inc_range(ioNestRegion.back().getOperations()))
       if (innerOp.getName().getStringRef() == "omp.yield" ||
           innerOp.getName().getStringRef() == "omp.terminator")
         innerOp.erase();
-
-    if (nestRegion.hasOneBlock()) {
-      // Single block: move all ops directly into loopBody.
+    if (ioNestRegion.hasOneBlock()) {
       builder.setInsertionPointToEnd(loopBody);
       SmallVector<Operation *> opsToMove;
-      for (auto &innerOp : nestFirst.getOperations())
+      for (auto &innerOp : ioNestFirst.getOperations())
         opsToMove.push_back(&innerOp);
       for (auto *innerOp : opsToMove)
         innerOp->moveBefore(loopBody, loopBody->end());
       builder.setInsertionPointToEnd(loopBody);
       LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
     } else {
-      // Multiple blocks: move first block's ops into loopBody,
-      // then splice remaining blocks before loopLatch.
+      SmallVector<Block *> extraBlocks;
+      for (auto &blk : ioNestRegion)
+        if (&blk != &ioNestFirst) extraBlocks.push_back(&blk);
+      for (auto *blk : extraBlocks)
+        blk->moveBefore(loopLatch);
       builder.setInsertionPointToEnd(loopBody);
       SmallVector<Operation *> firstOps;
-      for (auto &innerOp : nestFirst.getOperations())
+      for (auto &innerOp : ioNestFirst.getOperations())
         firstOps.push_back(&innerOp);
       for (auto *innerOp : firstOps)
         innerOp->moveBefore(loopBody, loopBody->end());
-      // The last op of nestFirst should now be an llvm.br to ^bb1 inside
-      // the nest — that's fine, it will branch to the next spliced block.
-
-      // Splice remaining blocks (all except nestFirst) before loopLatch.
-      auto &parentRegion = *loopBody->getParent();
-      Block *insertBefore = loopLatch;
-      // Collect blocks to move (skip nestFirst which is now empty).
-      SmallVector<Block *> blocksToMove;
-      for (auto &blk : nestRegion)
-        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
-      for (auto *blk : blocksToMove) {
-        blk->moveBefore(insertBefore);
-      }
-      // The last moved block should fall through to loopLatch.
-      // Its terminator was the omp.yield we erased — add branch to loopLatch.
-      Block *lastMovedBlock = blocksToMove.back();
-      builder.setInsertionPointToEnd(lastMovedBlock);
+      builder.setInsertionPointToEnd(extraBlocks.back());
       LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
     }
 
