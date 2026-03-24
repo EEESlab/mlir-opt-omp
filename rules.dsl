@@ -26,7 +26,7 @@
 
       construct wsloop when schedule == static {
         invoke {
-          call "__kmpc_for_static_init_4"(ident, global_tid, 34, last, lower, upper, step, 1, chunk);
+          call "__kmpc_for_static_init_4"(ident, global_tid, 34, last, lower, upper, stride, step, 0);
           call body(lower, upper, step);
           call "__kmpc_for_static_fini"(ident, global_tid);
           when not nowait => call "__kmpc_barrier"(ident, global_tid);

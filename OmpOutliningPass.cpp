@@ -754,20 +754,22 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     IntegerAttr::get(iterTy, 1));
 
   // Allocate plb, pub, pstride, plast.
+  // plb/pub/plast are in/out: initialized here, overwritten by the runtime.
+  // pstride is pure output: NOT initialized — runtime writes the stride value.
   Value plb     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
   Value pub     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
   Value pstride = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
   Value plast   = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
 
-  // Convert exclusive upper bound to inclusive last-iteration index:
-  //   ub_inclusive = (ub - lb) / step - 1
-  Value ubMinusLb   = LLVM::SubOp::create(builder, loc, ub, lb);
-  Value tripCount   = LLVM::SDivOp::create(builder, loc, ubMinusLb, step);
-  Value ubInclusive = LLVM::SubOp::create(builder, loc, tripCount, one32);
+  // Convert exclusive upper bound to inclusive last-iteration index.
+  // omp.loop_nest uses exclusive ub: trip = (ub - lb) / step iterations.
+  // __kmpc_for_static_init_4 expects inclusive upper bound: ub_incl = lb + (trip-1)*step
+  //   = lb + ((ub-lb)/step - 1)*step  = ub - step
+  Value ubInclusive = LLVM::SubOp::create(builder, loc, ub, step);
 
   LLVM::StoreOp::create(builder, loc, lb,          plb);
   LLVM::StoreOp::create(builder, loc, ubInclusive, pub);
-  LLVM::StoreOp::create(builder, loc, step,        pstride);
+  // pstride: no initialization — pure output parameter
   LLVM::StoreOp::create(builder, loc, zero32,      plast);
 
   // Map symbolic DSL names to SSA values.
@@ -778,7 +780,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       if (s == "%tid"   || s == "global_tid") return gtidVal;
       if (s == "%lb"    || s == "lower")      return plb;
       if (s == "%ub"    || s == "upper")      return pub;
-      if (s == "%step"  || s == "step")       return pstride;
+      if (s == "%step"  || s == "step")       return step;    // actual loop step
+      if (s == "%stride" || s == "stride")    return pstride; // output ptr for runtime
       if (s == "last"   || s == "plast")      return plast;
       return LLVM::UndefOp::create(builder, loc, ptrT);
     }
@@ -1122,10 +1125,12 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       func::CallOp::create(builder, loc, decl, args);
     }
 
-    // Load adjusted bounds.
+    // Load adjusted bounds (written by __kmpc_for_static_init_4).
+    // plb/pub contain this thread's iteration range (inclusive).
+    // pstride contains the runtime stride (num_threads for static) — NOT used
+    // for loop increment. We increment by the original loop step instead.
     Value adjLb   = LLVM::LoadOp::create(builder, loc, iterTy, plb);
     Value adjUb   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
-    Value adjStep = LLVM::LoadOp::create(builder, loc, iterTy, pstride);
 
     // Build explicit loop blocks.
     Block *preBlock   = builder.getInsertionBlock();
@@ -1186,7 +1191,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     }
 
     builder.setInsertionPointToEnd(loopLatch);
-    Value nextI = LLVM::AddOp::create(builder, loc, curI, adjStep);
+    // Increment by original loop step, not by pstride (which is the runtime stride).
+    Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
     LLVM::StoreOp::create(builder, loc, nextI, pi);
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
@@ -1276,6 +1282,7 @@ struct OmpOutliningPass
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["body"]       = dsl::makeStr("body");
       ctx["schedule"]   = dsl::makeStr("static");
+      ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
       if (wsOp.getScheduleKind()) {
         auto sk = omp::stringifyClauseScheduleKind(*wsOp.getScheduleKind());
         ctx["schedule"] = dsl::makeStr(sk.str());
