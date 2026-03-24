@@ -763,23 +763,59 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     LLVM::CondBrOp::create(builder, loc, cond,
       loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
 
-    builder.setInsertionPointToEnd(loopBody);
-    auto &nestBlock = loopNest.getRegion().front();
-    nestBlock.getArgument(0).replaceAllUsesWith(curI);
-    SmallVector<Operation *> opsToMove;
-    for (auto &innerOp : nestBlock.getOperations()) {
-      llvm::StringRef opName = innerOp.getName().getStringRef();
-      if (opName == "omp.yield" || opName == "omp.terminator") continue;
-      opsToMove.push_back(&innerOp);
-    }
-    for (auto *innerOp : opsToMove)
-      innerOp->moveBefore(loopBody, loopBody->end());
-    for (auto &innerOp : llvm::make_early_inc_range(nestBlock.getOperations()))
+    // Move the loop nest body into loopBody.
+    // The nest region may have multiple blocks (from inner loops).
+    // Move all blocks: first block's ops go into loopBody,
+    // remaining blocks are spliced in between loopBody and loopLatch.
+    auto &nestRegion = loopNest.getRegion();
+    auto &nestFirst = nestRegion.front();
+    nestFirst.getArgument(0).replaceAllUsesWith(curI);
+
+    // Erase omp.yield/omp.terminator from the last block of the nest.
+    auto &nestLast = nestRegion.back();
+    for (auto &innerOp : llvm::make_early_inc_range(nestLast.getOperations()))
       if (innerOp.getName().getStringRef() == "omp.yield" ||
           innerOp.getName().getStringRef() == "omp.terminator")
         innerOp.erase();
-    builder.setInsertionPointToEnd(loopBody);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+
+    if (nestRegion.hasOneBlock()) {
+      // Single block: move all ops directly into loopBody.
+      builder.setInsertionPointToEnd(loopBody);
+      SmallVector<Operation *> opsToMove;
+      for (auto &innerOp : nestFirst.getOperations())
+        opsToMove.push_back(&innerOp);
+      for (auto *innerOp : opsToMove)
+        innerOp->moveBefore(loopBody, loopBody->end());
+      builder.setInsertionPointToEnd(loopBody);
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+    } else {
+      // Multiple blocks: move first block's ops into loopBody,
+      // then splice remaining blocks before loopLatch.
+      builder.setInsertionPointToEnd(loopBody);
+      SmallVector<Operation *> firstOps;
+      for (auto &innerOp : nestFirst.getOperations())
+        firstOps.push_back(&innerOp);
+      for (auto *innerOp : firstOps)
+        innerOp->moveBefore(loopBody, loopBody->end());
+      // The last op of nestFirst should now be an llvm.br to ^bb1 inside
+      // the nest — that's fine, it will branch to the next spliced block.
+
+      // Splice remaining blocks (all except nestFirst) before loopLatch.
+      auto &parentRegion = *loopBody->getParent();
+      Block *insertBefore = loopLatch;
+      // Collect blocks to move (skip nestFirst which is now empty).
+      SmallVector<Block *> blocksToMove;
+      for (auto &blk : nestRegion)
+        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
+      for (auto *blk : blocksToMove) {
+        blk->moveBefore(insertBefore);
+      }
+      // The last moved block should fall through to loopLatch.
+      // Its terminator was the omp.yield we erased — add branch to loopLatch.
+      Block *lastMovedBlock = blocksToMove.back();
+      builder.setInsertionPointToEnd(lastMovedBlock);
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+    }
 
     builder.setInsertionPointToEnd(loopLatch);
     Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
@@ -1000,23 +1036,59 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     LLVM::CondBrOp::create(builder, loc, cond,
       loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
 
-    builder.setInsertionPointToEnd(loopBody);
-    auto &nestBlock = loopNest.getRegion().front();
-    nestBlock.getArgument(0).replaceAllUsesWith(curI);
-    SmallVector<Operation *> opsToMove;
-    for (auto &innerOp : nestBlock.getOperations()) {
-      llvm::StringRef opName = innerOp.getName().getStringRef();
-      if (opName == "omp.yield" || opName == "omp.terminator") continue;
-      opsToMove.push_back(&innerOp);
-    }
-    for (auto *innerOp : opsToMove)
-      innerOp->moveBefore(loopBody, loopBody->end());
-    for (auto &innerOp : llvm::make_early_inc_range(nestBlock.getOperations()))
+    // Move the loop nest body into loopBody.
+    // The nest region may have multiple blocks (from inner loops).
+    // Move all blocks: first block's ops go into loopBody,
+    // remaining blocks are spliced in between loopBody and loopLatch.
+    auto &nestRegion = loopNest.getRegion();
+    auto &nestFirst = nestRegion.front();
+    nestFirst.getArgument(0).replaceAllUsesWith(curI);
+
+    // Erase omp.yield/omp.terminator from the last block of the nest.
+    auto &nestLast = nestRegion.back();
+    for (auto &innerOp : llvm::make_early_inc_range(nestLast.getOperations()))
       if (innerOp.getName().getStringRef() == "omp.yield" ||
           innerOp.getName().getStringRef() == "omp.terminator")
         innerOp.erase();
-    builder.setInsertionPointToEnd(loopBody);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+
+    if (nestRegion.hasOneBlock()) {
+      // Single block: move all ops directly into loopBody.
+      builder.setInsertionPointToEnd(loopBody);
+      SmallVector<Operation *> opsToMove;
+      for (auto &innerOp : nestFirst.getOperations())
+        opsToMove.push_back(&innerOp);
+      for (auto *innerOp : opsToMove)
+        innerOp->moveBefore(loopBody, loopBody->end());
+      builder.setInsertionPointToEnd(loopBody);
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+    } else {
+      // Multiple blocks: move first block's ops into loopBody,
+      // then splice remaining blocks before loopLatch.
+      builder.setInsertionPointToEnd(loopBody);
+      SmallVector<Operation *> firstOps;
+      for (auto &innerOp : nestFirst.getOperations())
+        firstOps.push_back(&innerOp);
+      for (auto *innerOp : firstOps)
+        innerOp->moveBefore(loopBody, loopBody->end());
+      // The last op of nestFirst should now be an llvm.br to ^bb1 inside
+      // the nest — that's fine, it will branch to the next spliced block.
+
+      // Splice remaining blocks (all except nestFirst) before loopLatch.
+      auto &parentRegion = *loopBody->getParent();
+      Block *insertBefore = loopLatch;
+      // Collect blocks to move (skip nestFirst which is now empty).
+      SmallVector<Block *> blocksToMove;
+      for (auto &blk : nestRegion)
+        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
+      for (auto *blk : blocksToMove) {
+        blk->moveBefore(insertBefore);
+      }
+      // The last moved block should fall through to loopLatch.
+      // Its terminator was the omp.yield we erased — add branch to loopLatch.
+      Block *lastMovedBlock = blocksToMove.back();
+      builder.setInsertionPointToEnd(lastMovedBlock);
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+    }
 
     builder.setInsertionPointToEnd(loopLatch);
     Value nextI = LLVM::AddOp::create(builder, loc, curI, adjStep);
