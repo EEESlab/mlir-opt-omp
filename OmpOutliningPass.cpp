@@ -696,8 +696,34 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       }
     }
 
-    auto decl = getOrInsertDecl(module, runtimeCallee, callTypes, builder);
-    func::CallOp::create(builder, loc, decl, callArgs);
+    // __kmpc_fork_call is variadic: (ident, argc, fn, ...captures) -> void.
+    // Declare it as llvm.func variadic so multiple parallel regions with
+    // different capture counts can share the same declaration.
+    if (runtimeCallee == "__kmpc_fork_call" ||
+        runtimeCallee == "__kmpc_fork_call_if") {
+      MLIRContext *mctx = module.getContext();
+      // Fixed prefix: ident(ptr), argc(i32), fn(ptr)
+      SmallVector<Type> fixedTypes;
+      size_t fixedCount = std::min((size_t)3, callTypes.size());
+      for (size_t fi = 0; fi < fixedCount; fi++)
+        fixedTypes.push_back(callTypes[fi]);
+      LLVM::LLVMFuncOp llvmDecl;
+      if (auto existing = module.lookupSymbol<LLVM::LLVMFuncOp>(runtimeCallee)) {
+        llvmDecl = existing;
+      } else {
+        auto varFnType = LLVM::LLVMFunctionType::get(
+          LLVM::LLVMVoidType::get(mctx), fixedTypes, /*isVarArg=*/true);
+        OpBuilder::InsertionGuard g(builder);
+        builder.setInsertionPointToStart(module.getBody());
+        llvmDecl = builder.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(mctx), runtimeCallee, varFnType,
+          LLVM::Linkage::External);
+      }
+      LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
+    } else {
+      auto decl = getOrInsertDecl(module, runtimeCallee, callTypes, builder);
+      func::CallOp::create(builder, loc, decl, callArgs);
+    }
   }
 
   op.erase();
@@ -1298,6 +1324,7 @@ struct OmpOutliningPass
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["body"]       = dsl::makeStr("body");
       ctx["schedule"]   = dsl::makeStr("static");
+      ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
       if (wsOp.getScheduleKind()) {
         auto sk = omp::stringifyClauseScheduleKind(*wsOp.getScheduleKind());
