@@ -397,20 +397,13 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     // closure without microtask: single env ptr already at index 0
   }
 
-  // For closure/packed: remove privatizer block args from the entry block.
-  // They were already replaced in the unpack prolog; they must not appear
-  // in the function signature since PMSIS/libgomp calls with a single void*.
-  if (isPacked) {
-    // privatizerArgs are now unused (replaced by private copies in prolog).
-    // Erase them from the entry block in reverse order to preserve indices.
-    SmallVector<BlockArgument> toErase;
-    for (auto arg : entry.getArguments())
-      if (arg != entry.getArgument(0)) // keep only %arg0 (data ptr)
-        if (llvm::isa<LLVM::LLVMPointerType>(arg.getType()))
-          if (arg.use_empty())
-            toErase.push_back(arg);
-    for (auto arg : llvm::reverse(toErase))
-      entry.eraseArgument(arg.getArgNumber());
+  // Remove unused privatizer block args from the entry block.
+  // They were already replaced by private copies in the prolog; keeping them
+  // would add extra parameters that receive no values at the call site.
+  if (!privatizerArgs.empty()) {
+    for (auto arg : llvm::reverse(privatizerArgs))
+      if (arg.use_empty())
+        entry.eraseArgument(arg.getArgNumber());
   }
 
   // Remove injected unrealized_conversion_cast marker ops (no users).
