@@ -413,6 +413,29 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   });
   for (auto *c : injectedCasts) c->erase();
 
+  // Erase unused capture args from the entry block and filter captures list.
+  // This removes captures that were only needed as privatizer sources
+  // (e.g., source allocas for private vars that don't need copying).
+  {
+    unsigned capBase = isMicrotask ? 2 : (isClosure ? 1 : 0);
+    llvm::DenseSet<unsigned> erasedCapIdx;
+    for (int i = (int)captures.size() - 1; i >= 0; i--) {
+      unsigned argIdx = capBase + (unsigned)i;
+      if (argIdx < entry.getNumArguments() &&
+          entry.getArgument(argIdx).use_empty()) {
+        entry.eraseArgument(argIdx);
+        erasedCapIdx.insert((unsigned)i);
+      }
+    }
+    if (!erasedCapIdx.empty()) {
+      SmallVector<Value> filtered;
+      for (size_t i = 0; i < captures.size(); i++)
+        if (!erasedCapIdx.count(i))
+          filtered.push_back(captures[i]);
+      captures = std::move(filtered);
+    }
+  }
+
   // Update function type to match actual entry block args.
   SmallVector<Type> finalArgTypes;
   for (auto arg : entry.getArguments())
