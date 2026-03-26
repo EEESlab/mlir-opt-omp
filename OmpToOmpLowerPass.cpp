@@ -272,13 +272,23 @@ struct OmpToOmpLowerPass
     for (auto op : parallels) {
       // Before moving the region, inject the privatizer source vars as
       // explicit uses inside the region so collectCaptures finds them.
-      // We do this by adding a no-op use (unrealized_conversion_cast) at
-      // the start of the entry block for each private var.
+      // Only inject for firstprivate vars (which need the source value
+      // copied); purely private vars just need a fresh alloca per thread.
       Region &parallelRegion = op.getRegion();
       if (!parallelRegion.empty()) {
         Block &entryBlock = parallelRegion.front();
         OpBuilder injector(&entryBlock, entryBlock.begin());
-        for (auto privateVar : op.getPrivateVars()) {
+        auto privateSyms = op.getPrivateSyms();
+        for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
+          // Look up the privatizer recipe to check if it's firstprivate.
+          bool isFirstprivate = false;
+          if (privateSyms) {
+            auto symRef = llvm::cast<SymbolRefAttr>((*privateSyms)[idx]);
+            if (auto recipe = SymbolTable::lookupNearestSymbolFrom<
+                    omp::PrivateClauseOp>(op, symRef))
+              isFirstprivate = !recipe.getCopyRegion().empty();
+          }
+          if (!isFirstprivate) continue;
           // Create a use of privateVar inside the region so collectCaptures
           // picks it up as a capture.
           UnrealizedConversionCastOp::create(injector, op.getLoc(),
