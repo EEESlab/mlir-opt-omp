@@ -120,6 +120,35 @@ static bool isScalarAllocaCapture(Value val, Region &region) {
   return firstIsLoad;
 }
 
+// Returns true if this capture is an alloca whose element type is a pointer
+// (e.g. alloca ptr storing an array pointer like A, B, C in GEMM).
+// For the packed/closure strategy these will be stored by value (i.e. the
+// pointer itself) in the capture struct so the outlined function receives
+// the array pointer directly — eliminating the double indirection
+// (struct field → alloca ptr → array ptr) that would otherwise cause three
+// extra loads per innermost-loop iteration.
+static bool isPtrAllocaCapture(Value val, Region &region) {
+  auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
+  if (!allocaOp) return false;
+  Type elemTy = allocaOp.getElemType();
+  // Element type must be exactly a pointer (storing another pointer).
+  if (!llvm::isa<LLVM::LLVMPointerType>(elemTy)) return false;
+  // First use in region must be a load (shared read), not a store.
+  bool firstIsLoad = false, found = false;
+  region.walk([&](Operation *op) {
+    if (found) return;
+    for (auto &use : op->getOpOperands()) {
+      if (use.get() == val) {
+        found = true;
+        if (llvm::isa<LLVM::LoadOp>(op))
+          firstIsLoad = true;
+        break;
+      }
+    }
+  });
+  return firstIsLoad;
+}
+
 static SmallVector<Value> collectCaptures(Region &region) {
   llvm::SetVector<Value> seen;
   SmallVector<Value> captures;
@@ -245,6 +274,15 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     if (!privateCaptures.contains(cap) && isScalarAllocaCapture(cap, body))
       scalarAllocaCaptures.insert(cap);
 
+  // Ptr-alloca captures: allocas whose element type is a pointer (e.g. the
+  // alloca ptr holding A*, B*, C* in GEMM).  Store the pointer value itself
+  // into the struct field so the outlined function receives the array pointer
+  // directly — one load from the struct, no second dereference inside the loop.
+  llvm::SetVector<Value> ptrAllocaCaptures;
+  for (auto cap : captures)
+    if (!privateCaptures.contains(cap) && isPtrAllocaCapture(cap, body))
+      ptrAllocaCaptures.insert(cap);
+
   std::string fnName = "outlined_parallel_" + std::to_string(counter++);
 
   // Build outlined function argument types.
@@ -326,6 +364,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       if (scalarAllocaCaptures.contains(cap))
         fieldTypes.push_back(
             cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
+      else if (ptrAllocaCaptures.contains(cap))
+        fieldTypes.push_back(
+            cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
       else
         fieldTypes.push_back(cap.getType());
     }
@@ -368,6 +409,22 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
             ptrTy(ctx), elemTy, one64);
           LLVM::StoreOp::create(prologue, loc, scalarVal, privAlloca);
+          loadedCaptures.push_back(privAlloca);
+          replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
+        } else if (ptrAllocaCaptures.contains(captures[i])) {
+          // Ptr-alloca capture packed by value: the struct field holds the
+          // actual array pointer (e.g. A*, B*, C*), not a pointer to an alloca
+          // that holds it.  Load the pointer from the struct — one load, no
+          // second dereference.  Replace all uses of the original alloca with a
+          // fresh single-store alloca holding the pointer so body load/store
+          // patterns stay valid; mem2reg promotes it to a register.
+          Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
+            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+          Value ptrVal = LLVM::LoadOp::create(prologue, loc, elemTy, gep);
+          Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
+            ptrTy(ctx), elemTy, one64);
+          LLVM::StoreOp::create(prologue, loc, ptrVal, privAlloca);
           loadedCaptures.push_back(privAlloca);
           replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
         } else {
@@ -681,6 +738,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         if (scalarAllocaCaptures.contains(cap))
           fieldTypes.push_back(
               cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
+        else if (ptrAllocaCaptures.contains(cap))
+          fieldTypes.push_back(
+              cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
         else
           fieldTypes.push_back(cap.getType());
       }
@@ -704,6 +764,13 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             // the parallel call site and store the scalar into the struct field.
             // The outlined function will unpack it with a single load — no
             // second pointer dereference anywhere inside the parallel region.
+            Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+            capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
+          } else if (ptrAllocaCaptures.contains(captures[i])) {
+            // Ptr-alloca capture: load the actual array pointer from the alloca
+            // and store it directly into the struct field.  The outlined fn
+            // receives the pointer itself — one load from the struct, no second
+            // dereference through an alloca on every loop iteration.
             Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
             capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
           } else {
@@ -1068,16 +1135,21 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     LLVM::StoreOp::create(builder, loc, nextI, pi);
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-    // After loop: emit barrier if needed, ignoring the DSL plan's runtime-specific
-    // calls (GOMP_loop_*, core_bounds, etc.) — the inline scheduling above replaces
-    // all of them.  For GOMP emit GOMP_barrier; for PMSIS emit the team barrier.
+    // After loop: emit post-loop calls from DSL (barriers etc).
     builder.setInsertionPointToStart(afterBlock);
-    if (isGOMP) {
-      auto decl = getOrInsertDecl(module, "GOMP_barrier", {}, builder);
-      func::CallOp::create(builder, loc, decl, ValueRange{});
-    } else if (isPMSIS) {
-      auto decl = getOrInsertDecl(module, "ext_pi_cl_team_barrier", {}, builder);
-      func::CallOp::create(builder, loc, decl, ValueRange{});
+    for (auto &action : plan.invoke) {
+      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+        if (ca->callee == "core_bounds") continue;
+        if (ca->callee.find("body") != std::string::npos) continue;
+        SmallVector<Value> args;
+        SmallVector<Type>  types;
+        for (auto &av : ca->args) {
+          Value v = resolveCallArg(av);
+          args.push_back(v); types.push_back(v.getType());
+        }
+        auto decl = getOrInsertDecl(module, ca->callee, types, builder);
+        func::CallOp::create(builder, loc, decl, args);
+      }
     }
 
   } else if (isGOMP) {
