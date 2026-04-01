@@ -1068,24 +1068,20 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     LLVM::StoreOp::create(builder, loc, nextI, pi);
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-    // After loop: emit post-loop calls from DSL (barriers etc).
+    // After loop: emit barrier if needed, ignoring the DSL plan's runtime-specific
+    // calls (GOMP_loop_*, core_bounds, etc.) — the inline scheduling above replaces
+    // all of them.  For GOMP emit GOMP_barrier; for PMSIS emit the team barrier.
     builder.setInsertionPointToStart(afterBlock);
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        if (ca->callee == "core_bounds") continue;
-        if (ca->callee.find("body") != std::string::npos) continue;
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveCallArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-        func::CallOp::create(builder, loc, decl, args);
-      }
+    if (isGOMP) {
+      auto decl = getOrInsertDecl(module, "GOMP_barrier", {}, builder);
+      func::CallOp::create(builder, loc, decl, ValueRange{});
+    } else if (isPMSIS) {
+      auto decl = getOrInsertDecl(module, "ext_pi_cl_team_barrier", {}, builder);
+      func::CallOp::create(builder, loc, decl, ValueRange{});
     }
 
   } else if (isGOMP) {
+	  abort();
     // -------------------------------------------------------------------------
     // libgomp wsloop: GOMP_loop_static_start / GOMP_loop_static_next pattern
     //
