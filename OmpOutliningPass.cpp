@@ -33,6 +33,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -466,9 +467,13 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     // -------------------------------------------------------------------------
     // BY_POINTER strategy (iomp microtask)
     // -------------------------------------------------------------------------
+    // Track which BlockArgument was created for each capture so we can
+    // add a LICM-enabling prologue after firstprivate handling.
+    llvm::DenseMap<Value, BlockArgument> capToArg;
     // Insert one capture arg per capture in reverse order.
     for (int i = (int)captures.size() - 1; i >= 0; i--) {
       BlockArgument arg = entry.insertArgument(0u, captures[i].getType(), loc);
+      capToArg[captures[i]] = arg;
       replaceUsesInRegion(outlinedFn.getBody(), captures[i], arg);
     }
     // Prepend btid then gtid.
@@ -527,6 +532,48 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             });
           }
         }
+      }
+    }
+
+    // Promote scalar/ptr alloca captures to local allocas so LLVM's LICM can
+    // hoist inner-loop loads at -O3.
+    //
+    // In by_pointer mode every capture arrives as a ptr parameter.  LLVM's
+    // alias analysis sees stores through pointers DERIVED from those params
+    // (e.g. store to B[i][j] via a ptr loaded from %B_param) and conservatively
+    // refuses to hoist "load double, ptr %alpha_param" out of the loop, even
+    // though alpha never changes.  Staging each captured scalar/ptr through a
+    // fresh local alloca (provably non-aliasing with everything outside) gives
+    // LLVM the alias freedom it needs to hoist those loads.
+    if (!scalarAllocaCaptures.empty() || !ptrAllocaCaptures.empty()) {
+      OpBuilder prologue(&entry, entry.begin());
+      Value one64p = LLVM::ConstantOp::create(prologue, loc,
+        IntegerType::get(ctx, 64),
+        IntegerAttr::get(IntegerType::get(ctx, 64), 1));
+      for (auto cap : captures) {
+        if (privateCaptures.contains(cap)) continue;
+        auto it = capToArg.find(cap);
+        if (it == capToArg.end()) continue;
+        BlockArgument arg = it->second;
+        bool isScalar = scalarAllocaCaptures.contains(cap);
+        bool isPtr    = ptrAllocaCaptures.contains(cap);
+        if (!isScalar && !isPtr) continue;
+        Type elemTy = cap.getDefiningOp<LLVM::AllocaOp>().getElemType();
+        // Collect existing uses of arg BEFORE creating the load so we don't
+        // accidentally replace the load's own operand.
+        SmallVector<OpOperand *> toReplace;
+        for (auto &use : arg.getUses())
+          toReplace.push_back(&use);
+        // Load the value from the parameter pointer once in the prologue.
+        Value val = LLVM::LoadOp::create(prologue, loc, elemTy, arg);
+        // Store into a fresh local alloca — provably non-aliasing with any
+        // pointer derived from the parallel region's array arguments.
+        Value localAlloca = LLVM::AllocaOp::create(prologue, loc,
+          ptrTy(ctx), elemTy, one64p);
+        LLVM::StoreOp::create(prologue, loc, val, localAlloca);
+        // Redirect the pre-gathered uses to the local alloca.
+        for (auto *use : toReplace)
+          use->set(localAlloca);
       }
     }
   } else if (isClosure) {
