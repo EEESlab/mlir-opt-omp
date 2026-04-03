@@ -1074,6 +1074,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
         if (ca->callee == "core_bounds") continue;
         if (ca->callee.find("body") != std::string::npos) continue;
+        if (ca->callee == "GOMP_loop_static_start") continue; // emitted before loop
         SmallVector<Value> args;
         SmallVector<Type>  types;
         for (auto &av : ca->args) {
