@@ -33,7 +33,6 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -121,28 +120,23 @@ static bool isScalarAllocaCapture(Value val, Region &region) {
   return firstIsLoad;
 }
 
-// Returns true if this capture is an alloca whose element type is a pointer
-// (e.g. alloca ptr storing an array pointer like A, B, C in GEMM).
-// For the packed/closure strategy these will be stored by value (i.e. the
-// pointer itself) in the capture struct so the outlined function receives
-// the array pointer directly — eliminating the double indirection
-// (struct field → alloca ptr → array ptr) that would otherwise cause three
-// extra loads per innermost-loop iteration.
+// Returns true if this capture is a ptr-typed alloca whose stored value
+// (a pointer to e.g. an array) should be packed directly into the capture
+// struct, eliminating one extra dereference inside the outlined function.
+// Criteria: alloca with element type ptr, and the first use in the region
+// is a load (reading the stored pointer, not writing it — i.e. not a private IV).
 static bool isPtrAllocaCapture(Value val, Region &region) {
   auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
   if (!allocaOp) return false;
   Type elemTy = allocaOp.getElemType();
-  // Element type must be exactly a pointer (storing another pointer).
   if (!llvm::isa<LLVM::LLVMPointerType>(elemTy)) return false;
-  // First use in region must be a load (shared read), not a store.
   bool firstIsLoad = false, found = false;
   region.walk([&](Operation *op) {
     if (found) return;
     for (auto &use : op->getOpOperands()) {
       if (use.get() == val) {
         found = true;
-        if (llvm::isa<LLVM::LoadOp>(op))
-          firstIsLoad = true;
+        if (llvm::isa<LLVM::LoadOp>(op)) firstIsLoad = true;
         break;
       }
     }
@@ -275,13 +269,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     if (!privateCaptures.contains(cap) && isScalarAllocaCapture(cap, body))
       scalarAllocaCaptures.insert(cap);
 
-  // Ptr-alloca captures: allocas whose element type is a pointer (e.g. the
-  // alloca ptr holding A*, B*, C* in GEMM).  Store the pointer value itself
-  // into the struct field so the outlined function receives the array pointer
-  // directly — one load from the struct, no second dereference inside the loop.
+  // Compute ptr-alloca captures: allocas holding a pointer (e.g. array ptr)
+  // whose first use in the region is a load.  Pack the pointer VALUE directly
+  // into the struct field instead of the alloca address, saving one dereference
+  // per array access inside the outlined function.
   llvm::SetVector<Value> ptrAllocaCaptures;
   for (auto cap : captures)
-    if (!privateCaptures.contains(cap) && isPtrAllocaCapture(cap, body))
+    if (!privateCaptures.contains(cap) && !scalarAllocaCaptures.contains(cap) &&
+        isPtrAllocaCapture(cap, body))
       ptrAllocaCaptures.insert(cap);
 
   std::string fnName = "outlined_parallel_" + std::to_string(counter++);
@@ -365,9 +360,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       if (scalarAllocaCaptures.contains(cap))
         fieldTypes.push_back(
             cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
-      else if (ptrAllocaCaptures.contains(cap))
-        fieldTypes.push_back(
-            cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
       else
         fieldTypes.push_back(cap.getType());
     }
@@ -413,18 +405,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           loadedCaptures.push_back(privAlloca);
           replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
         } else if (ptrAllocaCaptures.contains(captures[i])) {
-          // Ptr-alloca capture packed by value: the struct field holds the
-          // actual array pointer (e.g. A*, B*, C*), not a pointer to an alloca
-          // that holds it.  Load the pointer from the struct — one load, no
-          // second dereference.  Replace all uses of the original alloca with a
-          // fresh single-store alloca holding the pointer so body load/store
-          // patterns stay valid; mem2reg promotes it to a register.
-          Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+          // Ptr-alloca capture: the struct field holds the pointer value
+          // directly.  Unpack it into a fresh alloca so that existing
+          // load/store-of-alloca patterns in the body continue to work.
           Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
             dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value ptrVal = LLVM::LoadOp::create(prologue, loc, elemTy, gep);
+          Value ptrVal = LLVM::LoadOp::create(prologue, loc, ptrTy(ctx), gep);
           Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), elemTy, one64);
+            ptrTy(ctx), ptrTy(ctx), one64);
           LLVM::StoreOp::create(prologue, loc, ptrVal, privAlloca);
           loadedCaptures.push_back(privAlloca);
           replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
@@ -467,13 +455,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     // -------------------------------------------------------------------------
     // BY_POINTER strategy (iomp microtask)
     // -------------------------------------------------------------------------
-    // Track which BlockArgument was created for each capture so we can
-    // add a LICM-enabling prologue after firstprivate handling.
-    llvm::DenseMap<Value, BlockArgument> capToArg;
     // Insert one capture arg per capture in reverse order.
     for (int i = (int)captures.size() - 1; i >= 0; i--) {
       BlockArgument arg = entry.insertArgument(0u, captures[i].getType(), loc);
-      capToArg[captures[i]] = arg;
       replaceUsesInRegion(outlinedFn.getBody(), captures[i], arg);
     }
     // Prepend btid then gtid.
@@ -532,48 +516,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             });
           }
         }
-      }
-    }
-
-    // Promote scalar/ptr alloca captures to local allocas so LLVM's LICM can
-    // hoist inner-loop loads at -O3.
-    //
-    // In by_pointer mode every capture arrives as a ptr parameter.  LLVM's
-    // alias analysis sees stores through pointers DERIVED from those params
-    // (e.g. store to B[i][j] via a ptr loaded from %B_param) and conservatively
-    // refuses to hoist "load double, ptr %alpha_param" out of the loop, even
-    // though alpha never changes.  Staging each captured scalar/ptr through a
-    // fresh local alloca (provably non-aliasing with everything outside) gives
-    // LLVM the alias freedom it needs to hoist those loads.
-    if (!scalarAllocaCaptures.empty() || !ptrAllocaCaptures.empty()) {
-      OpBuilder prologue(&entry, entry.begin());
-      Value one64p = LLVM::ConstantOp::create(prologue, loc,
-        IntegerType::get(ctx, 64),
-        IntegerAttr::get(IntegerType::get(ctx, 64), 1));
-      for (auto cap : captures) {
-        if (privateCaptures.contains(cap)) continue;
-        auto it = capToArg.find(cap);
-        if (it == capToArg.end()) continue;
-        BlockArgument arg = it->second;
-        bool isScalar = scalarAllocaCaptures.contains(cap);
-        bool isPtr    = ptrAllocaCaptures.contains(cap);
-        if (!isScalar && !isPtr) continue;
-        Type elemTy = cap.getDefiningOp<LLVM::AllocaOp>().getElemType();
-        // Collect existing uses of arg BEFORE creating the load so we don't
-        // accidentally replace the load's own operand.
-        SmallVector<OpOperand *> toReplace;
-        for (auto &use : arg.getUses())
-          toReplace.push_back(&use);
-        // Load the value from the parameter pointer once in the prologue.
-        Value val = LLVM::LoadOp::create(prologue, loc, elemTy, arg);
-        // Store into a fresh local alloca — provably non-aliasing with any
-        // pointer derived from the parallel region's array arguments.
-        Value localAlloca = LLVM::AllocaOp::create(prologue, loc,
-          ptrTy(ctx), elemTy, one64p);
-        LLVM::StoreOp::create(prologue, loc, val, localAlloca);
-        // Redirect the pre-gathered uses to the local alloca.
-        for (auto *use : toReplace)
-          use->set(localAlloca);
       }
     }
   } else if (isClosure) {
@@ -785,9 +727,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         if (scalarAllocaCaptures.contains(cap))
           fieldTypes.push_back(
               cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
-        else if (ptrAllocaCaptures.contains(cap))
-          fieldTypes.push_back(
-              cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
         else
           fieldTypes.push_back(cap.getType());
       }
@@ -814,12 +753,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
             capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
           } else if (ptrAllocaCaptures.contains(captures[i])) {
-            // Ptr-alloca capture: load the actual array pointer from the alloca
-            // and store it directly into the struct field.  The outlined fn
-            // receives the pointer itself — one load from the struct, no second
-            // dereference through an alloca on every loop iteration.
-            Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
-            capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
+            // Ptr-alloca capture: load the pointer value from the alloca and
+            // store the pointer directly into the struct field — eliminates one
+            // extra dereference (struct field → alloca → ptr → array).
+            capVal = LLVM::LoadOp::create(builder, loc, ptrTy(ctx), captures[i]);
           } else {
             capVal = captures[i];
           }
@@ -961,6 +898,14 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   Value lb = lbs[0], ub = ubs[0], step = steps[0];
   Type iterTy = lb.getType();
 
+  // omp.loop_nest bounds may be inclusive or exclusive depending on how the
+  // front-end emitted them (the "inclusive" keyword on the op means the upper
+  // bound is the last valid iteration value, not one-past-the-end).
+  // Normalise to exclusive here so all downstream trip-count and range
+  // arithmetic is uniform: exclusive_ub = inclusive_ub + step.
+  if (loopNest.getLoopInclusive())
+    ub = LLVM::AddOp::create(builder, loc, ub, step);
+
   // Get ident and gtid from enclosing outlined function.
   // For iomp microtask: arg0 = ptr gtid, arg1 = ptr btid → load i32 from arg0.
   // For libgomp closure: arg0 = ptr data (capture struct) — no gtid ptr.
@@ -1084,24 +1029,42 @@ static void lowerWsloop(omp::WsloopOp wsOp,
                        LLVM::SubOp::create(builder, loc, step, one32));
     Value trip     = LLVM::SDivOp::create(builder, loc, rangeS, step);
 
-    // chunk = ceil(trip / num_cores)
-    Value tripPlusNC = LLVM::AddOp::create(builder, loc, trip,
-                         LLVM::SubOp::create(builder, loc, numCores, one32));
-    Value chunk    = LLVM::SDivOp::create(builder, loc, tripPlusNC, numCores);
+    // Exact DIVMOD work-distribution (mirrors GCC's _omp_fn lowering):
+    //   q  = trip / num_cores   -- base chunk size for every thread
+    //   tt = trip % num_cores   -- first `tt` threads get one extra iteration
+    //
+    // thread_start = q * coreId + min(coreId, tt)
+    // thread_end   = thread_start + q + (coreId < tt ? 1 : 0)
+    //
+    // This tiles [0, trip) with no overlap and no gap, matching the GCC ABI
+    // exactly.  The old ceiling-div formula used (trip + numCores - 1) /
+    // numCores as the chunk, which over-counts for threads beyond index `tt`
+    // and produces wrong ranges whenever trip % num_cores != 0.
+    Value q  = LLVM::SDivOp::create(builder, loc, trip, numCores);
+    Value tt = LLVM::SRemOp::create(builder, loc, trip, numCores);
 
-    // lb_core = lb + core_id * chunk * step
-    Value coreChunk    = LLVM::MulOp::create(builder, loc, coreId, chunk);
-    Value coreOff      = LLVM::MulOp::create(builder, loc, coreChunk, step);
-    Value lbCore       = LLVM::AddOp::create(builder, loc, lb, coreOff);
+    // minCoreIdTt = min(coreId, tt)
+    Value ltTt       = LLVM::ICmpOp::create(builder, loc,
+                         LLVM::ICmpPredicate::slt, coreId, tt);
+    Value minCoreIdTt = LLVM::SelectOp::create(builder, loc, ltTt, coreId, tt);
 
-    // ub_core = lb_core + chunk * step  (then clamp to ub)
-    Value chunkStep    = LLVM::MulOp::create(builder, loc, chunk, step);
-    Value lbCoreEnd    = LLVM::AddOp::create(builder, loc, lbCore, chunkStep);
-    // clamp: if lbCoreEnd > ub then ub, else lbCoreEnd
-    Value clampCond = LLVM::ICmpOp::create(builder, loc,
-      LLVM::ICmpPredicate::sgt, lbCoreEnd, ub);
-    // Use select: ub_core = clampCond ? ub : lbCoreEnd
-    Value ubCore = LLVM::SelectOp::create(builder, loc, clampCond, ub, lbCoreEnd);
+    // thread_start (in iteration space, 0-based)
+    Value qMulId     = LLVM::MulOp::create(builder, loc, q, coreId);
+    Value threadStart = LLVM::AddOp::create(builder, loc, qMulId, minCoreIdTt);
+
+    // thread_end = thread_start + q + (coreId < tt ? 1 : 0)
+    Value extraIter  = LLVM::SelectOp::create(builder, loc, ltTt, one32, zero32);
+    Value threadEnd  = LLVM::AddOp::create(builder, loc,
+                         LLVM::AddOp::create(builder, loc, threadStart, q),
+                         extraIter);
+
+    // Map iteration indices back to the original index space.
+    // lbCore = lb + thread_start * step  (inclusive start)
+    // ubCore = lb + thread_end   * step  (exclusive end — exact, no clamp needed)
+    Value lbCore = LLVM::AddOp::create(builder, loc, lb,
+                     LLVM::MulOp::create(builder, loc, threadStart, step));
+    Value ubCore = LLVM::AddOp::create(builder, loc, lb,
+                     LLVM::MulOp::create(builder, loc, threadEnd, step));
 
     // Build sequential loop: lb_core to ubCore (exclusive) step step.
     Block *preBlock   = builder.getInsertionBlock();
@@ -1188,6 +1151,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
         if (ca->callee == "core_bounds") continue;
         if (ca->callee.find("body") != std::string::npos) continue;
+        if (ca->callee == "GOMP_loop_static_start") continue; // emitted before loop
+		if (ca->callee == "GOMP_loop_end") continue; // emitted before loop
         SmallVector<Value> args;
         SmallVector<Type>  types;
         for (auto &av : ca->args) {
