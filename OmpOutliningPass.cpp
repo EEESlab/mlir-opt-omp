@@ -61,8 +61,8 @@ static Type i32Ty(MLIRContext *ctx) {
 // Classify captures: returns true if this capture is a private variable
 // (scalar alloca written before read inside the region — e.g. loop IV).
 static bool isPrivateCapture(Value val, Region &region) {
-  if (!val.getDefiningOp<LLVM::AllocaOp>()) return false;
   auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
+  if (!allocaOp) return false;
   Type elemTy = allocaOp.getElemType();
   // Only scalar non-pointer types can be private IVs.
   if (!LLVM::isCompatibleType(elemTy)) return false;
@@ -1510,7 +1510,6 @@ struct OmpOutliningPass
       ctx["body"]       = dsl::makeStr("body");
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
-      ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
       if (wsOp.getScheduleKind()) {
         auto sk = omp::stringifyClauseScheduleKind(*wsOp.getScheduleKind());
         ctx["schedule"] = dsl::makeStr(sk.str());
@@ -1535,8 +1534,4 @@ std::unique_ptr<mlir::Pass>
 mlir::createOmpOutliningPass(std::string dslFile, std::string runtime) {
   return std::make_unique<OmpOutliningPass>(
       std::move(dslFile), std::move(runtime));
-}
-
-void mlir::registerOmpOutliningPass() {
-  // Registration handled in mlir-opt-omp.cpp via factory lambda.
 }

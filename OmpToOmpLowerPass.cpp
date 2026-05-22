@@ -27,8 +27,6 @@ namespace {
 // dsl::Value -> MLIR Attribute conversion
 // ===========================================================================
 
-Attribute dslValueToAttr(const dsl::Value &v, MLIRContext *ctx);
-
 Attribute dslValueToAttr(const dsl::Value &v, MLIRContext *ctx) {
   return std::visit(llvm::makeVisitor(
     [&](const dsl::NullVal &)  -> Attribute {
@@ -321,8 +319,4 @@ std::unique_ptr<mlir::Pass>
 mlir::createOmpToOmpLowerPass(std::string dslFile, std::string runtime) {
   return std::make_unique<OmpToOmpLowerPass>(
       std::move(dslFile), std::move(runtime));
-}
-
-void mlir::registerOmpToOmpLowerPass() {
-  // Registration is handled in mlir-opt-omp.cpp main() via a factory lambda.
 }

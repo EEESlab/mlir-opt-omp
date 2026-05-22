@@ -18,6 +18,5 @@ namespace mlir {
 std::unique_ptr<mlir::Pass>
 createOmpToOmpLowerPass(std::string dslFile, std::string runtime);
 
-void registerOmpToOmpLowerPass();
 
 } // namespace mlir
