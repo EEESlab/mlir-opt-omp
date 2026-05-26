@@ -18,11 +18,7 @@
 
 namespace mlir {
 
-// Creates the pass.
 std::unique_ptr<mlir::Pass> createPlanLoweringPass();
-
-// Registers the pass with the MLIR pass manager infrastructure so it can be
-// referenced by name on the command line.
 void registerPlanLoweringPass();
 
 } // namespace mlir

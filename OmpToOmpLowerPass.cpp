@@ -120,7 +120,6 @@ extractParallelContext(omp::ParallelOp op) {
   llvm::StringMap<dsl::Value> ctx;
 
   ctx["body"]     = dsl::makeStr("outlined_parallel");
-
   ctx["captures"] = dsl::makeList({});
 
   // if_clause
@@ -180,7 +179,7 @@ extractWsloopContext(omp::WsloopOp op) {
 }
 
 static llvm::StringMap<dsl::Value>
-extractBarrierContext(omp::BarrierOp op) {
+extractBarrierContext(omp::BarrierOp /*op*/) {
   llvm::StringMap<dsl::Value> ctx;
   ctx["ident"]      = dsl::makeStr("%ident");
   ctx["global_tid"] = dsl::makeStr("%tid");

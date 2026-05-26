@@ -861,7 +861,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           LLVM::LLVMVoidType::get(mctx), fixedTypes, /*isVarArg=*/true);
         OpBuilder::InsertionGuard g(builder);
         builder.setInsertionPointToStart(module.getBody());
-        llvmDecl = builder.create<LLVM::LLVMFuncOp>(
+        llvmDecl = LLVM::LLVMFuncOp::create(builder,
           UnknownLoc::get(mctx), runtimeCallee, varFnType,
           LLVM::Linkage::External);
       }
@@ -999,29 +999,22 @@ static void lowerWsloop(omp::WsloopOp wsOp,
 
   if (isPMSIS || isGOMP) {
     // -------------------------------------------------------------------------
-    // PMSIS wsloop: static per-core bound computation, no runtime loop API.
-    //
-    // core_id   = pi_core_id()
-    // num_cores = pi_cl_nb_cores()
-    // chunk     = ceil((ub - lb) / step / num_cores)   [iterations per core]
-    // lb_core   = lb + core_id * chunk * step
-    // ub_core   = min(lb_core + chunk * step, ub)      [exclusive]
-    //
-    // Then a sequential loop from lb_core to ub_core step step.
-    // Post-loop: optional pi_cl_team_barrier() if not nowait.
+    // Static per-core wsloop: each thread computes its own [lb_core, ub_core)
+    // sub-range and runs a sequential loop over it — no runtime loop API.
+    // Shared by PMSIS (pi_core_id / pi_cl_nb_cores) and libgomp
+    // (omp_get_thread_num / omp_get_num_threads).  The exact distribution
+    // formula (DIVMOD, matching GCC's _omp_fn ABI) is documented at the
+    // computation site below.
     // -------------------------------------------------------------------------
     Value coreId;
     Value numCores;
-    if(isPMSIS)
-    {
+    if (isPMSIS) {
       coreId   = emitNoArgI32Call(module, builder, loc, "ext_pi_core_id");
       numCores = emitNoArgI32Call(module, builder, loc, "ext_pi_cl_nb_cores");
-    }
-    else
-    {
+    } else {
       coreId   = emitNoArgI32Call(module, builder, loc, "omp_get_thread_num");
       numCores = emitNoArgI32Call(module, builder, loc, "omp_get_num_threads");
-    } 
+    }
 
     // trip = (ub - lb + step - 1) / step  [ceiling division of iteration count]
     Value range    = LLVM::SubOp::create(builder, loc, ub, lb);
@@ -1138,7 +1131,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       Block *lastBlock = blocksToMove.back();
       builder.setInsertionPointToEnd(lastBlock);
       LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-}
+    }
 
     builder.setInsertionPointToEnd(loopLatch);
     Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
@@ -1151,167 +1144,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
         if (ca->callee == "core_bounds") continue;
         if (ca->callee.find("body") != std::string::npos) continue;
-        if (ca->callee == "GOMP_loop_static_start") continue; // emitted before loop
-		if (ca->callee == "GOMP_loop_end") continue; // emitted before loop
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveCallArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-        func::CallOp::create(builder, loc, decl, args);
-      }
-    }
-
-  } else if (isGOMP) {
-	  abort();
-    // -------------------------------------------------------------------------
-    // libgomp wsloop: GOMP_loop_static_start / GOMP_loop_static_next pattern
-    //
-    // GOMP_loop_static_start(long lb, long ub, long step, long chunk,
-    //                         long *istart, long *iend) -> bool
-    // Pattern:
-    //   alloca istart, iend (long = i64)
-    //   if (GOMP_loop_static_start(lb, ub, step, chunk, &istart, &iend)):
-    //     do {
-    //       for i = istart; i < iend; i += step: body(i)
-    //     } while (GOMP_loop_static_next(&istart, &iend))
-    //   GOMP_loop_end() [or GOMP_loop_end_nowait()]
-    // -------------------------------------------------------------------------
-    Type longTy = IntegerType::get(ctx, 64);
-    Value one64long = LLVM::ConstantOp::create(builder, loc, longTy,
-      IntegerAttr::get(longTy, 1));
-
-    // Sign-extend bounds to i64 (GOMP uses long).
-    Value lbLong   = LLVM::SExtOp::create(builder, loc, longTy, lb);
-    Value ubLong   = LLVM::SExtOp::create(builder, loc, longTy, ub);
-    Value stepLong = LLVM::SExtOp::create(builder, loc, longTy, step);
-    Value chunkLong = LLVM::ConstantOp::create(builder, loc, longTy,
-      IntegerAttr::get(longTy, 1));
-
-    // Allocate istart and iend.
-    Value pistart = LLVM::AllocaOp::create(builder, loc, ptrT, longTy, one64);
-    Value piend   = LLVM::AllocaOp::create(builder, loc, ptrT, longTy, one64);
-
-    // Call GOMP_loop_static_start.
-    SmallVector<Type> startArgTypes = {longTy, longTy, longTy, longTy,
-                                        ptrT,   ptrT};
-    SmallVector<Value> startArgs    = {lbLong, ubLong, stepLong, chunkLong,
-                                        pistart, piend};
-    // Returns i1 (bool).
-    auto startDecl = getOrInsertDeclWithReturn(module,
-      "GOMP_loop_static_start", startArgTypes, IntegerType::get(ctx, 1),
-      builder);
-    Value hasWork = func::CallOp::create(builder, loc, startDecl,
-      startArgs).getResult(0);
-
-    // Split current block: everything after this point goes to afterAll.
-    // preBlock → (conditional on hasWork) → chunkLoop or afterAll
-    Block *preBlock    = builder.getInsertionBlock();
-    Block *afterAll    = preBlock->splitBlock(builder.getInsertionPoint());
-    Block *chunkLoop   = new Block();
-    Block *innerHeader = new Block();
-    Block *innerBody   = new Block();
-    Block *innerLatch  = new Block();
-    Block *nextChunk   = new Block();
-
-    auto &pr = *preBlock->getParent();
-    pr.getBlocks().insertAfter(preBlock->getIterator(),     chunkLoop);
-    pr.getBlocks().insertAfter(chunkLoop->getIterator(),    innerHeader);
-    pr.getBlocks().insertAfter(innerHeader->getIterator(),  innerBody);
-    pr.getBlocks().insertAfter(innerBody->getIterator(),    innerLatch);
-    pr.getBlocks().insertAfter(innerLatch->getIterator(),   nextChunk);
-    // afterAll is already inserted (the split-off tail)
-
-    // Terminate preBlock: branch to chunkLoop if hasWork, else to afterAll.
-    builder.setInsertionPointToEnd(preBlock);
-    LLVM::CondBrOp::create(builder, loc, hasWork,
-      chunkLoop, mlir::ValueRange{},
-      afterAll, mlir::ValueRange{});
-
-    // chunkLoop: load istart/iend, init inner loop.
-    builder.setInsertionPointToEnd(chunkLoop);
-    Value curStart = LLVM::LoadOp::create(builder, loc, longTy, pistart);
-    Value curEnd   = LLVM::LoadOp::create(builder, loc, longTy, piend);
-    // Allocate inner induction var.
-    Value piInner = LLVM::AllocaOp::create(builder, loc, ptrT, longTy, one64long);
-    LLVM::StoreOp::create(builder, loc, curStart, piInner);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerHeader);
-
-    // innerHeader: check i < curEnd.
-    builder.setInsertionPointToEnd(innerHeader);
-    Value curI64 = LLVM::LoadOp::create(builder, loc, longTy, piInner);
-    Value innerCond = LLVM::ICmpOp::create(builder, loc,
-      LLVM::ICmpPredicate::slt, curI64, curEnd);
-    LLVM::CondBrOp::create(builder, loc, innerCond,
-      innerBody, mlir::ValueRange{},
-      nextChunk, mlir::ValueRange{});
-
-    // innerBody: truncate i64 to iterTy, run loop body.
-    builder.setInsertionPointToEnd(innerBody);
-    Value curI = LLVM::TruncOp::create(builder, loc, iterTy, curI64);
-    auto &gompNestRegion = loopNest.getRegion();
-    auto &gompNestFirst  = gompNestRegion.front();
-    gompNestFirst.getArgument(0).replaceAllUsesWith(curI);
-    // Erase omp.yield/omp.terminator from last block.
-    for (auto &innerOp : llvm::make_early_inc_range(gompNestRegion.back().getOperations()))
-      if (innerOp.getName().getStringRef() == "omp.yield" ||
-          innerOp.getName().getStringRef() == "omp.terminator")
-        innerOp.erase();
-    if (gompNestRegion.hasOneBlock()) {
-      builder.setInsertionPointToEnd(innerBody);
-      SmallVector<Operation *> opsToMove;
-      for (auto &innerOp : gompNestFirst.getOperations())
-        opsToMove.push_back(&innerOp);
-      for (auto *innerOp : opsToMove)
-        innerOp->moveBefore(innerBody, innerBody->end());
-      builder.setInsertionPointToEnd(innerBody);
-      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerLatch);
-    } else {
-      // Multi-block: splice remaining blocks before innerLatch first.
-      SmallVector<Block *> extraBlocks;
-      for (auto &blk : gompNestRegion)
-        if (&blk != &gompNestFirst) extraBlocks.push_back(&blk);
-      for (auto *blk : extraBlocks)
-        blk->moveBefore(innerLatch);
-      // Move first block's ops into innerBody.
-      builder.setInsertionPointToEnd(innerBody);
-      SmallVector<Operation *> firstOps;
-      for (auto &innerOp : gompNestFirst.getOperations())
-        firstOps.push_back(&innerOp);
-      for (auto *innerOp : firstOps)
-        innerOp->moveBefore(innerBody, innerBody->end());
-      // Last extra block branches to innerLatch.
-      builder.setInsertionPointToEnd(extraBlocks.back());
-      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerLatch);
-    }
-
-    // innerLatch: i += step.
-    builder.setInsertionPointToEnd(innerLatch);
-    Value nextI64 = LLVM::AddOp::create(builder, loc, curI64, stepLong);
-    LLVM::StoreOp::create(builder, loc, nextI64, piInner);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerHeader);
-
-    // nextChunk: call GOMP_loop_static_next, branch back or to afterAll.
-    builder.setInsertionPointToEnd(nextChunk);
-    auto nextDecl = getOrInsertDeclWithReturn(module,
-      "GOMP_loop_static_next", {ptrT, ptrT},
-      IntegerType::get(ctx, 1), builder);
-    Value hasMore = func::CallOp::create(builder, loc, nextDecl,
-      ValueRange{pistart, piend}).getResult(0);
-    LLVM::CondBrOp::create(builder, loc, hasMore,
-      chunkLoop, mlir::ValueRange{},
-      afterAll, mlir::ValueRange{});
-
-    // afterAll: emit post-loop calls (GOMP_loop_end, GOMP_barrier).
-    builder.setInsertionPointToStart(afterAll);
-    // Collect post calls from plan.
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        if (ca->callee.find("body") != std::string::npos) continue;
-        if (ca->callee.find("start") != std::string::npos) continue;
-        if (ca->callee.find("next") != std::string::npos) continue;
+        if (ca->callee == "GOMP_loop_static_start") continue; // not applicable to this distribution path
+        if (ca->callee == "GOMP_loop_end") continue;          // not applicable to this distribution path
         SmallVector<Value> args;
         SmallVector<Type>  types;
         for (auto &av : ca->args) {

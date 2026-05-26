@@ -331,7 +331,7 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       continue;
     }
 
-    if (std::get_if<WhenStmt>(&stmt)) {
+    if (std::holds_alternative<WhenStmt>(stmt)) {
       // Collect the when/otherwise chain
       bool taken = false;
       while (i < n) {
@@ -364,7 +364,7 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       continue;
     }
 
-    if (std::get_if<OtherwiseStmt>(&stmt)) {
+    if (std::holds_alternative<OtherwiseStmt>(stmt)) {
       return make_error<StringError>(
         "standalone 'otherwise' without 'when'", inconvertibleErrorCode());
     }
@@ -384,7 +384,7 @@ Expected<const ConstructDecl *> selectConstruct(
   std::vector<const ConstructDecl *> candidates;
   for (auto &item : runtime.items) {
     if (auto *cd = std::get_if<ConstructDecl>(&item))
-      if (cd->name == constructName.str())
+      if (constructName == cd->name)
         candidates.push_back(cd);
   }
   if (candidates.empty())
@@ -430,7 +430,7 @@ Expected<const ConstructDecl *> selectConstruct(
 
 const RuntimeDecl *Evaluator::findRuntime(StringRef name) const {
   for (auto &rt : program.runtimes)
-    if (rt.name == name.str()) return &rt;
+    if (name == rt.name) return &rt;
   return nullptr;
 }
 
