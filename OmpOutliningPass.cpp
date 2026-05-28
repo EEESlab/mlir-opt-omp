@@ -235,7 +235,7 @@ static Value getIdentAddr(ModuleOp module, OpBuilder &builder, Location loc,
 // ---------------------------------------------------------------------------
 
 static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
-                              llvm::StringRef runtimeName) {
+                              const dsl::LoweringPlan &barrierPlan) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -579,7 +579,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     termOp->erase();
   }
 
-  // Lower omp.barrier inside the outlined function — runtime-aware.
+  // Lower omp.barrier inside the outlined function — DSL-driven.
+  // The barrier plan (one per runtime) is built once in runOnOperation;
+  // here we only resolve the symbolic args (%ident, %tid) at each call site.
   SmallVector<Operation *> barriers;
   for (auto &block : outlinedFn.getBody())
     for (auto &innerOp : block)
@@ -587,24 +589,39 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         barriers.push_back(&innerOp);
   for (auto *barrierOp : barriers) {
     OpBuilder bb(barrierOp);
-    if (runtimeName == "libgomp") {
-      auto decl = getOrInsertDecl(module, "GOMP_barrier", {}, bb);
-      func::CallOp::create(bb, barrierOp->getLoc(), decl, ValueRange{});
-    } else if (runtimeName == "pmsis") {
-      auto decl = getOrInsertDecl(module, "ext_pi_cl_team_barrier", {}, bb);
-      func::CallOp::create(bb, barrierOp->getLoc(), decl, ValueRange{});
-    } else {
-      // __kmpc_barrier(ident, gtid)
-      Value identAddr = getIdentAddr(module, bb, barrierOp->getLoc(), ctx);
-      Value gtidVal = LLVM::UndefOp::create(bb, barrierOp->getLoc(), i32Ty(ctx));
-      auto &fnEntry = outlinedFn.getBody().front();
-      if (fnEntry.getNumArguments() >= 2)
-        gtidVal = LLVM::LoadOp::create(bb, barrierOp->getLoc(), i32Ty(ctx),
-                                        fnEntry.getArgument(0));
-      SmallVector<Type> bt = {ptrTy(ctx), i32Ty(ctx)};
-      auto decl = getOrInsertDecl(module, "__kmpc_barrier", bt, bb);
-      func::CallOp::create(bb, barrierOp->getLoc(), decl,
-                            ValueRange{identAddr, gtidVal});
+    Location bloc = barrierOp->getLoc();
+
+    auto resolveArg = [&](const dsl::Value &v) -> Value {
+      if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
+        llvm::StringRef s = sv->value;
+        if (s == "%ident" || s == "ident")
+          return getIdentAddr(module, bb, bloc, ctx);
+        if (s == "%tid" || s == "global_tid") {
+          // Microtask convention: first arg is ptr to i32 gtid.
+          auto &fnEntry = outlinedFn.getBody().front();
+          if (fnEntry.getNumArguments() >= 2)
+            return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
+                                         fnEntry.getArgument(0));
+          return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
+        }
+      }
+      if (auto *iv = std::get_if<dsl::IntVal>(&v))
+        return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
+          IntegerAttr::get(i32Ty(ctx), iv->value));
+      return LLVM::UndefOp::create(bb, bloc, ptrTy(ctx));
+    };
+
+    for (auto &action : barrierPlan.invoke) {
+      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+        SmallVector<Value> args;
+        SmallVector<Type>  types;
+        for (auto &av : ca->args) {
+          Value v = resolveArg(av);
+          args.push_back(v); types.push_back(v.getType());
+        }
+        auto decl = getOrInsertDecl(module, ca->callee, types, bb);
+        func::CallOp::create(bb, bloc, decl, args);
+      }
     }
     barrierOp->erase();
   }
@@ -1316,6 +1333,18 @@ struct OmpOutliningPass
     }
     dsl::Evaluator evaluator(*program);
 
+    // Pre-compute the barrier plan once; the same plan is reused for every
+    // omp.barrier inside outlined parallel functions.
+    llvm::StringMap<dsl::Value> barrierCtx;
+    barrierCtx["ident"]      = dsl::makeStr("%ident");
+    barrierCtx["global_tid"] = dsl::makeStr("%tid");
+    auto barrierPlan = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
+    if (!barrierPlan) {
+      module.emitError("omp-outline: barrier DSL evaluation failed: ")
+        << llvm::toString(barrierPlan.takeError());
+      return signalPassFailure();
+    }
+
     // Step 1: outline parallel constructs.
     SmallVector<ConstructOp> constructs;
     module.walk([&](ConstructOp op) {
@@ -1323,7 +1352,7 @@ struct OmpOutliningPass
     });
     int counter = 0;
     for (auto op : constructs)
-      outlineConstruct(op, module, counter, runtimeName);
+      outlineConstruct(op, module, counter, *barrierPlan);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;
