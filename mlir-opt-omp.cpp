@@ -29,7 +29,6 @@
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -50,10 +49,10 @@ static void extractCustomFlags(int &argc, char **&argv,
   for (int i = 1; i < argc; ++i) {
     llvm::StringRef arg(argv[i]);
 
-    if (arg.starts_with("--omp-lower-dsl=")) {
-      dslFile = arg.drop_front(strlen("--omp-lower-dsl=")).str();
-    } else if (arg.starts_with("--omp-lower-runtime=")) {
-      runtime = arg.drop_front(strlen("--omp-lower-runtime=")).str();
+    if (arg.consume_front("--omp-lower-dsl=")) {
+      dslFile = arg.str();
+    } else if (arg.consume_front("--omp-lower-runtime=")) {
+      runtime = arg.str();
     } else {
       newArgv.push_back(argv[i]);
     }

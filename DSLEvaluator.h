@@ -13,7 +13,6 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
-#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -101,7 +100,6 @@ class Evaluator {
 public:
   explicit Evaluator(const Program &p) : program(p) {}
 
-  // Main entry point.
   llvm::Expected<LoweringPlan> buildPlan(
       llvm::StringRef runtimeName,
       llvm::StringRef constructName,

@@ -4,8 +4,8 @@
 // lowering plan for each, and emits omp_lower.construct ops.
 // Run BEFORE PlanLoweringPass.
 //
-// Command-line usage:
-//   --omp-to-omp-lower="dsl=rules.dsl runtime=iomp"
+// Uses the --omp-lower-dsl and --omp-lower-runtime flags (extracted in
+// mlir-opt-omp.cpp and passed to the factory lambda).
 
 #pragma once
 
@@ -17,7 +17,5 @@ namespace mlir {
 
 std::unique_ptr<mlir::Pass>
 createOmpToOmpLowerPass(std::string dslFile, std::string runtime);
-
-void registerOmpToOmpLowerPass();
 
 } // namespace mlir

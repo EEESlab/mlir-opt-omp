@@ -15,5 +15,4 @@ namespace mlir {
 std::unique_ptr<mlir::Pass> createOmpOutliningPass(
     std::string dslFile = "rules.dsl",
     std::string runtime  = "iomp");
-void registerOmpOutliningPass();
 } // namespace mlir
