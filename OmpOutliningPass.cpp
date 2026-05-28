@@ -1004,34 +1004,50 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     return LLVM::UndefOp::create(builder, loc, ptrT);
   };
 
-  // Determine loop lowering strategy from DSL invoke callee names.
-  bool isGOMP    = false;
-  bool isPMSIS   = false;
-  for (auto &action : plan.invoke) {
-    if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-      if (ca->callee.find("GOMP_loop") != std::string::npos) isGOMP  = true;
-      if (ca->callee == "core_bounds")                        isPMSIS = true;
-    }
-  }
+  // Read DSL properties that drive loop lowering strategy.
+  auto getStrProp = [&](llvm::StringRef key) -> std::string {
+    auto it = plan.properties.find(key.str());
+    if (it == plan.properties.end()) return "";
+    if (auto *sv = std::get_if<dsl::StrVal>(&it->second)) return sv->value;
+    return "";
+  };
 
-  if (isPMSIS || isGOMP) {
-    // -------------------------------------------------------------------------
-    // Static per-core wsloop: each thread computes its own [lb_core, ub_core)
-    // sub-range and runs a sequential loop over it — no runtime loop API.
-    // Shared by PMSIS (pi_core_id / pi_cl_nb_cores) and libgomp
-    // (omp_get_thread_num / omp_get_num_threads).  The exact distribution
-    // formula (DIVMOD, matching GCC's _omp_fn ABI) is documented at the
-    // computation site below.
-    // -------------------------------------------------------------------------
-    Value coreId;
-    Value numCores;
-    if (isPMSIS) {
-      coreId   = emitNoArgI32Call(module, builder, loc, "ext_pi_core_id");
-      numCores = emitNoArgI32Call(module, builder, loc, "ext_pi_cl_nb_cores");
-    } else {
-      coreId   = emitNoArgI32Call(module, builder, loc, "omp_get_thread_num");
-      numCores = emitNoArgI32Call(module, builder, loc, "omp_get_num_threads");
+  // Emit each PlanCall in a block (e.g. plan.pre / plan.post) at the
+  // current insertion point of `b`. Symbolic args are resolved via
+  // resolveCallArg above.
+  auto emitPlanCalls = [&](const std::vector<dsl::PlanAction> &actions,
+                           OpBuilder &b) {
+    for (auto &action : actions) {
+      auto *ca = std::get_if<dsl::PlanCall>(&action);
+      if (!ca) continue;
+      SmallVector<Value> args;
+      SmallVector<Type>  types;
+      for (auto &av : ca->args) {
+        Value v = resolveCallArg(av);
+        args.push_back(v); types.push_back(v.getType());
+      }
+      auto decl = getOrInsertDecl(module, ca->callee, types, b);
+      func::CallOp::create(b, loc, decl, args);
     }
+  };
+
+  std::string loopStrategy = getStrProp("loop_strategy");
+
+  if (loopStrategy == "inline_static") {
+    // -------------------------------------------------------------------------
+    // Inline static wsloop: each thread computes its own [lb_core, ub_core)
+    // sub-range inline and runs a sequential loop over it — no runtime loop
+    // API is involved in the distribution.  The names of the helper functions
+    // that return the current thread index and the team size come from the
+    // DSL (core_id_function / num_cores_function), so the same code path
+    // serves any runtime that exposes such helpers (e.g. PMSIS, libgomp).
+    // The exact distribution formula (DIVMOD, matching GCC's _omp_fn ABI)
+    // is documented at the computation site below.
+    // -------------------------------------------------------------------------
+    std::string coreIdFn   = getStrProp("core_id_function");
+    std::string numCoresFn = getStrProp("num_cores_function");
+    Value coreId   = emitNoArgI32Call(module, builder, loc, coreIdFn);
+    Value numCores = emitNoArgI32Call(module, builder, loc, numCoresFn);
 
     // trip = (ub - lb + step - 1) / step  [ceiling division of iteration count]
     Value range    = LLVM::SubOp::create(builder, loc, ub, lb);
@@ -1155,53 +1171,19 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     LLVM::StoreOp::create(builder, loc, nextI, pi);
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-    // After loop: emit post-loop calls from DSL (barriers etc).
+    // After loop: emit post-loop calls (barriers etc) from plan.post.
     builder.setInsertionPointToStart(afterBlock);
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        if (ca->callee == "core_bounds") continue;
-        if (ca->callee.find("body") != std::string::npos) continue;
-        if (ca->callee == "GOMP_loop_static_start") continue; // not applicable to this distribution path
-        if (ca->callee == "GOMP_loop_end") continue;          // not applicable to this distribution path
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveCallArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-        func::CallOp::create(builder, loc, decl, args);
-      }
-    }
+    emitPlanCalls(plan.post, builder);
 
   } else {
     // -------------------------------------------------------------------------
-    // iomp wsloop: __kmpc_for_static_init_4 / explicit loop pattern
+    // Runtime-static wsloop: the runtime library performs the work
+    // distribution (e.g. __kmpc_for_static_init_4 writes per-thread
+    // adjusted bounds), and we emit an explicit loop driven by the plan.
     // -------------------------------------------------------------------------
 
-    // Separate invoke actions into pre-loop (init), body (skip), post-loop.
-    SmallVector<const dsl::PlanCall *> preCalls, postCalls;
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        bool isBody = ca->callee.find("body") != std::string::npos;
-        bool isInit = ca->callee.find("init") != std::string::npos;
-        if (isBody) continue;
-        if (isInit) preCalls.push_back(ca);
-        else        postCalls.push_back(ca);
-      }
-    }
-
-    // Emit pre-loop calls.
-    for (auto *ca : preCalls) {
-      SmallVector<Value> args;
-      SmallVector<Type>  types;
-      for (auto &av : ca->args) {
-        Value v = resolveCallArg(av);
-        args.push_back(v); types.push_back(v.getType());
-      }
-      auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-      func::CallOp::create(builder, loc, decl, args);
-    }
+    // Emit pre-loop calls (e.g. the init that writes adjusted bounds).
+    emitPlanCalls(plan.pre, builder);
 
     // Load adjusted bounds (written by __kmpc_for_static_init_4).
     // plb/pub contain this thread's iteration range (inclusive).
@@ -1274,19 +1256,10 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     LLVM::StoreOp::create(builder, loc, nextI, pi);
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-    // Emit post-loop calls.
+    // Emit post-loop calls (e.g. fini, optional barrier).
     builder.setInsertionPointToStart(afterBlock);
-    for (auto *ca : postCalls) {
-      SmallVector<Value> args;
-      SmallVector<Type>  types;
-      for (auto &av : ca->args) {
-        Value v = resolveCallArg(av);
-        args.push_back(v); types.push_back(v.getType());
-      }
-      auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-      func::CallOp::create(builder, loc, decl, args);
-    }
-  } // end iomp path
+    emitPlanCalls(plan.post, builder);
+  } // end runtime-static path
 
   wsOp.erase();
 }
@@ -1370,7 +1343,6 @@ struct OmpOutliningPass
       ctx["last"]       = dsl::makeStr("last");
       ctx["chunk"]      = dsl::makeInt(1);
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
-      ctx["body"]       = dsl::makeStr("body");
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
       if (wsOp.getScheduleKind()) {

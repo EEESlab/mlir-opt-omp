@@ -158,8 +158,6 @@ extractParallelContext(omp::ParallelOp op) {
 static llvm::StringMap<dsl::Value>
 extractWsloopContext(omp::WsloopOp op) {
   llvm::StringMap<dsl::Value> ctx;
-
-  ctx["body"]       = dsl::makeStr("loop_body");
   ctx["ident"]      = dsl::makeStr("%ident");
   ctx["global_tid"] = dsl::makeStr("%tid");
   ctx["lower"]      = dsl::makeStr("%lb");
