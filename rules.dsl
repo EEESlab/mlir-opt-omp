@@ -25,7 +25,6 @@
       }
 
       construct wsloop when schedule == static {
-        loop_strategy = "runtime_static";
         pre {
           call "__kmpc_for_static_init_4"(ident, global_tid, 34, last, lower, upper, stride, step, 1);
         }
@@ -50,9 +49,11 @@ runtime libgomp {
     }
   }
   construct wsloop when schedule == static {
-    loop_strategy      = "inline_static";
     core_id_function   = "omp_get_thread_num";
     num_cores_function = "omp_get_num_threads";
+    pre {
+      emit thread_bounds;
+    }
     invoke {
       emit loop_body;
     }
@@ -83,9 +84,11 @@ runtime pmsis {
     }
   }
   construct wsloop {
-    loop_strategy      = "inline_static";
     core_id_function   = "ext_pi_core_id";
     num_cores_function = "ext_pi_cl_nb_cores";
+    pre {
+      emit thread_bounds;
+    }
     invoke {
       emit loop_body;
     }
