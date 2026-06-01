@@ -75,6 +75,11 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
   let summary = "Encodes a fully-evaluated LoweringPlan as MLIR attributes";
 
   let arguments = (ins
+    // Clause operands. Carried as real SSA operands so the values from the
+    // original omp.* op survive into OmpOutliningPass — looking them up by
+    // symbolic name in the plan would otherwise lose the SSA reference.
+    Optional<AnyType>:$num_threads,
+
     StrAttr:$runtime,
     // NOTE: 'construct' is a reserved TableGen keyword so the accessor is
     // named construct_name here; the assembly format still prints 'construct ='.
@@ -98,6 +103,7 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     `pre` `=` $pre `,`
     `invoke` `=` $invoke `,`
     `post` `=` $post
+    (`,` `num_threads` `=` $num_threads^ `:` type($num_threads))?
     $body
     attr-dict
   }];

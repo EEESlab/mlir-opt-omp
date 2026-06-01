@@ -718,6 +718,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             v = gtidAtCallSite
               ? gtidAtCallSite
               : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
+          else if (s == "num_threads" && op.getNumThreads())
+            v = op.getNumThreads();
           else
             v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
         } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
@@ -794,10 +796,11 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
 
       // Build call args from DSL invoke args, resolving symbolic names:
-      //   "body"    → fnPtrCast  (the outlined function pointer)
-      //   "env_ptr" → structAlloca (the capture struct pointer)
-      //   integer   → i32 constant
-      //   other str → undef ptr
+      //   "body"        → fnPtrCast  (the outlined function pointer)
+      //   "env_ptr"     → structAlloca (the capture struct pointer)
+      //   "num_threads" → op.getNumThreads() (SSA operand from omp.parallel)
+      //   integer       → i32 constant
+      //   other str     → undef ptr
       for (auto attr : op.getInvoke()) {
         auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
         if (!ca) continue;
@@ -809,6 +812,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
               v = fnPtrCast;
             else if (s == "env_ptr")
               v = structAlloca;
+            else if (s == "num_threads" && op.getNumThreads())
+              v = op.getNumThreads();
             else
               v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
           } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {

@@ -73,7 +73,8 @@ Attribute planActionToAttr(const dsl::PlanAction &action, MLIRContext *ctx) {
 void emitConstructOp(const dsl::LoweringPlan &plan,
                      OpBuilder &builder,
                      Location loc,
-                     Region *srcRegion = nullptr) {
+                     Region *srcRegion = nullptr,
+                     Value numThreads = nullptr) {
   MLIRContext *ctx = builder.getContext();
 
   SmallVector<NamedAttribute> propPairs;
@@ -91,6 +92,7 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
   };
 
   auto constructOp = ConstructOp::create(builder, loc,
+    numThreads,
     builder.getStringAttr(plan.runtime),
     builder.getStringAttr(plan.construct),
     propDict,
@@ -128,9 +130,12 @@ extractParallelContext(omp::ParallelOp op) {
   else
     ctx["if_clause"] = dsl::makeNull();
 
-  // num_threads is variadic in newer MLIR – guard with count check
+  // num_threads is carried as a real SSA operand on the ConstructOp; in the
+  // DSL the identifier is just a sentinel (resolved to the operand in
+  // outlineConstruct).  Setting it to a non-null StrVal here is what makes
+  // `when has(num_threads)` evaluate to true.
   if (op.getNumThreadsDimsCount() > 0)
-    ctx["num_threads"] = ssaToStrVal(op.getNumThreads(0));
+    ctx["num_threads"] = dsl::makeStr("num_threads");
   else
     ctx["num_threads"] = dsl::makeNull();
 
@@ -248,7 +253,8 @@ struct OmpToOmpLowerPass
     auto process = [&](auto op,
                        llvm::StringRef construct,
                        llvm::StringMap<dsl::Value> ctx,
-                       Region *region = nullptr) -> bool {
+                       Region *region = nullptr,
+                       Value numThreads = nullptr) -> bool {
       auto plan = evaluator.buildPlan(runtimeName, construct, ctx);
       if (!plan) {
         op.emitError("DSL evaluation failed: ")
@@ -257,7 +263,7 @@ struct OmpToOmpLowerPass
         return false;
       }
       OpBuilder builder(op);
-      emitConstructOp(*plan, builder, op.getLoc(), region);
+      emitConstructOp(*plan, builder, op.getLoc(), region, numThreads);
       op.erase();
       return true;
     };
@@ -290,8 +296,11 @@ struct OmpToOmpLowerPass
             TypeRange{privateVar.getType()}, ValueRange{privateVar});
         }
       }
+      Value numThreads;
+      if (op.getNumThreadsDimsCount() > 0)
+        numThreads = op.getNumThreads(0);
       if (!process(op, "parallel", extractParallelContext(op),
-                   &op.getRegion())) return;
+                   &op.getRegion(), numThreads)) return;
     }
 
     for (auto op : wsloops) {

@@ -45,7 +45,8 @@ runtime libgomp {
     capture_strategy = "packed";
     pre {}
     invoke {
-      call "GOMP_parallel"(body, env_ptr, 0, 0);
+      when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, 0);
+      otherwise             => call "GOMP_parallel"(body, env_ptr, 0, 0);
     }
   }
   construct wsloop when schedule == static {
