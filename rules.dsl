@@ -50,8 +50,8 @@ runtime libgomp {
     }
   }
   construct wsloop when schedule == static {
-    core_id_function   = "omp_get_thread_num";
-    num_cores_function = "omp_get_num_threads";
+    thread_id_function  = "omp_get_thread_num";
+    num_thread_function = "omp_get_num_threads";
     pre {
       emit thread_bounds;
     }
@@ -85,8 +85,8 @@ runtime pmsis {
     }
   }
   construct wsloop {
-    core_id_function   = "ext_pi_core_id";
-    num_cores_function = "ext_pi_cl_nb_cores";
+    thread_id_function  = "ext_pi_core_id";
+    num_thread_function = "ext_pi_cl_nb_cores";
     pre {
       emit thread_bounds;
     }

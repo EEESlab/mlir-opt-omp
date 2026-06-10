@@ -1064,32 +1064,32 @@ static void lowerWsloop(omp::WsloopOp wsOp,
 
     // DIVMOD work-distribution:
     //   trip = ceil((ub - lb) / step)
-    //   q    = trip / num_cores   -- base chunk size for every thread
-    //   tt   = trip % num_cores   -- first `tt` threads get one extra iteration
-    //   thread_start = q * coreId + min(coreId, tt)
-    //   thread_end   = thread_start + q + (coreId < tt ? 1 : 0)
+    //   q    = trip / num_threads  -- base chunk size for every thread
+    //   tt   = trip % num_threads  -- first `tt` threads get one extra iteration
+    //   thread_start = q * threadId + min(threadId, tt)
+    //   thread_end   = thread_start + q + (threadId < tt ? 1 : 0)
     // Tiles [0, trip) with no overlap and no gap.  The helper function names
-    // come from the DSL properties core_id_function / num_cores_function,
+    // come from the DSL properties thread_id_function / num_thread_function,
     // so this code path serves any runtime that exposes such helpers.
-    std::string coreIdFn   = getStrProp("core_id_function");
-    std::string numCoresFn = getStrProp("num_cores_function");
-    Value coreId   = emitNoArgI32Call(module, builder, loc, coreIdFn);
-    Value numCores = emitNoArgI32Call(module, builder, loc, numCoresFn);
+    std::string threadIdFn  = getStrProp("thread_id_function");
+    std::string numThreadFn = getStrProp("num_thread_function");
+    Value threadId   = emitNoArgI32Call(module, builder, loc, threadIdFn);
+    Value numThreads = emitNoArgI32Call(module, builder, loc, numThreadFn);
 
     Value range    = LLVM::SubOp::create(builder, loc, ub, lb);
     Value rangeS   = LLVM::AddOp::create(builder, loc, range,
                        LLVM::SubOp::create(builder, loc, step, one32));
     Value trip     = LLVM::SDivOp::create(builder, loc, rangeS, step);
 
-    Value q  = LLVM::SDivOp::create(builder, loc, trip, numCores);
-    Value tt = LLVM::SRemOp::create(builder, loc, trip, numCores);
+    Value q  = LLVM::SDivOp::create(builder, loc, trip, numThreads);
+    Value tt = LLVM::SRemOp::create(builder, loc, trip, numThreads);
 
     Value ltTt       = LLVM::ICmpOp::create(builder, loc,
-                         LLVM::ICmpPredicate::slt, coreId, tt);
-    Value minCoreIdTt = LLVM::SelectOp::create(builder, loc, ltTt, coreId, tt);
+                         LLVM::ICmpPredicate::slt, threadId, tt);
+    Value minThreadIdTt = LLVM::SelectOp::create(builder, loc, ltTt, threadId, tt);
 
-    Value qMulId     = LLVM::MulOp::create(builder, loc, q, coreId);
-    Value threadStart = LLVM::AddOp::create(builder, loc, qMulId, minCoreIdTt);
+    Value qMulId     = LLVM::MulOp::create(builder, loc, q, threadId);
+    Value threadStart = LLVM::AddOp::create(builder, loc, qMulId, minThreadIdTt);
 
     Value extraIter  = LLVM::SelectOp::create(builder, loc, ltTt, one32, zero32);
     Value threadEnd  = LLVM::AddOp::create(builder, loc,
