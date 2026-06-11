@@ -32,6 +32,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/SetVector.h"
@@ -280,7 +281,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         isPtrAllocaCapture(cap, body))
       ptrAllocaCaptures.insert(cap);
 
-  std::string fnName = "outlined_parallel_" + std::to_string(counter++);
+  std::string fnName =
+    "outlined_" + op.getConstructName().str() + "_" + std::to_string(counter++);
 
   // Build outlined function argument types.
   SmallVector<Type> fnArgTypes;
@@ -342,16 +344,30 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     // Each field is the capture value itself (not a pointer to it) for
     // scalar types, or a pointer for pointer types.
     //
-    // For isMicrotask+isPacked (unusual): prepend gtid/btid first.
-    if (isMicrotask) {
-      entry.insertArgument(0u, ptrTy(ctx), loc); // btid
-      entry.insertArgument(0u, ptrTy(ctx), loc); // gtid
+    // Insert the leading args and determine `dataPtr`, the pointer to the
+    // capture struct that the unpack loop reads from.
+    //   closure          : (ptr data)                  -> dataPtr = arg0
+    //   microtask+packed : (ptr gtid, ptr btid, ptr d) -> dataPtr = arg2
+    //   task_entry (iomp): (i32 gtid, ptr task)        -> dataPtr = load(task)
+    //                      (captures live behind task->shareds, field 0)
+    Value dataPtr;
+    BlockArgument taskArg; // iomp task entry only
+    if (isTaskEntry) {
+      entry.insertArgument(0u, ptrTy(ctx), loc); // task (becomes arg 1)
+      entry.insertArgument(0u, i32Ty(ctx), loc); // gtid (arg 0)
+      taskArg = entry.getArgument(1);
+      // dataPtr = load(task) is materialised at the start of the unpack
+      // prologue below (so it precedes the GEPs that use it).
+    } else {
+      if (isMicrotask) {
+        entry.insertArgument(0u, ptrTy(ctx), loc); // btid
+        entry.insertArgument(0u, ptrTy(ctx), loc); // gtid
+      }
+      // The entry block may already have privatizer args — insert before them.
+      unsigned dataPtrIdx = isMicrotask ? 2u : 0u;
+      entry.insertArgument(dataPtrIdx, ptrTy(ctx), loc);
+      dataPtr = entry.getArgument(dataPtrIdx);
     }
-    // Always insert the data ptr at position 0 (closure) or 2 (microtask).
-    // The entry block may already have privatizer args — we insert before them.
-    unsigned dataPtrIdx = isMicrotask ? 2u : 0u;
-    entry.insertArgument(dataPtrIdx, ptrTy(ctx), loc);
-    BlockArgument dataPtr = entry.getArgument(dataPtrIdx);
 
     // Build the capture struct type: { cap_0_type, cap_1_type, ... }
     // Scalar-alloca captures use their element type as the field type (value
@@ -372,6 +388,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       Value one64 = LLVM::ConstantOp::create(prologue, loc,
         IntegerType::get(ctx, 64),
         IntegerAttr::get(IntegerType::get(ctx, 64), 1));
+      // For the iomp task entry, the capture struct sits behind task->shareds
+      // (field 0 of kmp_task_t); load it here before any GEP uses it.
+      if (isTaskEntry)
+        dataPtr = LLVM::LoadOp::create(prologue, loc, ptrTy(ctx), taskArg);
       // Keep loaded values so privatizer handling can reuse them.
       SmallVector<Value> loadedCaptures;
       for (size_t i = 0; i < captures.size(); i++) {
@@ -562,11 +582,13 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     }
   }
 
-  // Update function type to match actual entry block args.
+  // Update function type to match actual entry block args (preserving the
+  // i32 result for the iomp task entry).
   SmallVector<Type> finalArgTypes;
   for (auto arg : entry.getArguments())
     finalArgTypes.push_back(arg.getType());
-  outlinedFn.setFunctionType(FunctionType::get(ctx, finalArgTypes, {}));
+  outlinedFn.setFunctionType(FunctionType::get(ctx, finalArgTypes,
+    isTaskEntry ? TypeRange{i32Ty(ctx)} : TypeRange{}));
 
   // Replace omp.terminator with func.return (direct blocks only).
   SmallVector<Operation *> terminators;
@@ -576,7 +598,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         terminators.push_back(&innerOp);
   for (auto *termOp : terminators) {
     OpBuilder tb(termOp);
-    func::ReturnOp::create(tb, termOp->getLoc());
+    if (isTaskEntry) {
+      // iomp task entry returns kmp_int32 (0).
+      Value zero = LLVM::ConstantOp::create(tb, termOp->getLoc(), i32Ty(ctx),
+        IntegerAttr::get(i32Ty(ctx), 0));
+      func::ReturnOp::create(tb, termOp->getLoc(), ValueRange{zero});
+    } else {
+      func::ReturnOp::create(tb, termOp->getLoc());
+    }
     termOp->erase();
   }
 
@@ -735,6 +764,93 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       func::CallOp::create(builder, loc, preDecl, preArgs);
     }
 
+    if (isTaskEntry) {
+      // -----------------------------------------------------------------------
+      // iomp task: __kmpc_omp_task_alloc -> fill task->shareds -> __kmpc_omp_task
+      // -----------------------------------------------------------------------
+      // ABI constants — VERIFY against the target's kmp.h / clang codegen:
+      //   TASK_FLAGS = 1        (tied task)
+      //   KMP_TASK_T_SIZE = 40  (sizeof(kmp_task_t); the runtime places shareds
+      //                          right after this header and sets task->shareds
+      //                          to point there. Must be >= the runtime's real
+      //                          kmp_task_t size, else shareds overlap it.)
+      const int64_t TASK_FLAGS      = 1;
+      const int64_t KMP_TASK_T_SIZE = 40;
+
+      // Capture struct field types (same logic as the packed path).
+      SmallVector<Type> fieldTypes;
+      for (auto cap : captures) {
+        if (scalarAllocaCaptures.contains(cap))
+          fieldTypes.push_back(cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
+        else
+          fieldTypes.push_back(cap.getType());
+      }
+      auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+      auto i64Ty = IntegerType::get(ctx, 64);
+      uint64_t sharedsSize =
+        DataLayout(module).getTypeSize(structTy).getFixedValue();
+
+      Value gtidVal = gtidAtCallSite
+        ? gtidAtCallSite
+        : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
+
+      // Entry function pointer (cast to opaque ptr for the runtime call).
+      Value entryPtr = func::ConstantOp::create(builder, loc,
+        outlinedFn.getFunctionType(), FlatSymbolRefAttr::get(ctx, fnName));
+      Value entryCast = UnrealizedConversionCastOp::create(
+        builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{entryPtr}).getResult(0);
+
+      auto i32c = [&](int64_t v) -> Value {
+        return arith::ConstantOp::create(builder, loc, i32Ty(ctx),
+          IntegerAttr::get(i32Ty(ctx), v));
+      };
+      auto i64c = [&](int64_t v) -> Value {
+        return LLVM::ConstantOp::create(builder, loc, i64Ty,
+          IntegerAttr::get(i64Ty, v));
+      };
+
+      // task = __kmpc_omp_task_alloc(ident, gtid, flags, sizeof_kmp_task_t,
+      //                              sizeof_shareds, entry)
+      SmallVector<Type> allocArgTys = {ptrTy(ctx), i32Ty(ctx), i32Ty(ctx),
+                                       i64Ty, i64Ty, ptrTy(ctx)};
+      auto allocDecl = getOrInsertDeclWithReturn(module,
+        "__kmpc_omp_task_alloc", allocArgTys, ptrTy(ctx), builder);
+      Value task = func::CallOp::create(builder, loc, allocDecl,
+        ValueRange{identVal, gtidVal, i32c(TASK_FLAGS),
+                   i64c(KMP_TASK_T_SIZE), i64c((int64_t)sharedsSize),
+                   entryCast}).getResult(0);
+
+      // shareds = task->shareds (field 0 of kmp_task_t).
+      Value shareds = LLVM::LoadOp::create(builder, loc, ptrTy(ctx), task);
+
+      // Store each capture into the shareds struct.
+      for (size_t i = 0; i < captures.size(); i++) {
+        Value capVal;
+        if (privateCaptures.contains(captures[i])) {
+          capVal = LLVM::UndefOp::create(builder, loc, fieldTypes[i]);
+        } else if (scalarAllocaCaptures.contains(captures[i])) {
+          Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+          capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
+        } else if (ptrAllocaCaptures.contains(captures[i])) {
+          capVal = LLVM::LoadOp::create(builder, loc, ptrTy(ctx), captures[i]);
+        } else {
+          capVal = captures[i];
+        }
+        Value gep = LLVM::GEPOp::create(builder, loc, ptrTy(ctx), structTy,
+          shareds, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+        LLVM::StoreOp::create(builder, loc, capVal, gep);
+      }
+
+      // __kmpc_omp_task(ident, gtid, task)
+      auto submitDecl = getOrInsertDeclWithReturn(module, "__kmpc_omp_task",
+        {ptrTy(ctx), i32Ty(ctx), ptrTy(ctx)}, i32Ty(ctx), builder);
+      func::CallOp::create(builder, loc, submitDecl,
+        ValueRange{identVal, gtidVal, task});
+
+      op.erase();
+      return;
+    }
+
     if (isPacked) {
       // -----------------------------------------------------------------------
       // PACKED / CLOSURE: build capture struct on the stack, pass ptr to it
@@ -751,10 +867,12 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           fieldTypes.push_back(cap.getType());
       }
 
-      // Build the capture struct (same for all packed runtimes).
+      // Build the capture struct (same for all packed runtimes).  structTy is
+      // hoisted here (not scoped to the non-empty case) so env_size / env_align
+      // can be resolved from it in the invoke arg loop below.
+      auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
       Value structAlloca;
       if (!captures.empty()) {
-        auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
         Value one64 = LLVM::ConstantOp::create(builder, loc,
           IntegerType::get(ctx, 64),
           IntegerAttr::get(IntegerType::get(ctx, 64), 1));
@@ -798,9 +916,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       // Build call args from DSL invoke args, resolving symbolic names:
       //   "body"        → fnPtrCast  (the outlined function pointer)
       //   "env_ptr"     → structAlloca (the capture struct pointer)
+      //   "env_size"    → sizeof(structTy)  as i64  (GOMP_task arg_size)
+      //   "env_align"   → alignof(structTy) as i64  (GOMP_task arg_align)
+      //   "null"        → null pointer              (GOMP_task cpyfn / depend)
       //   "num_threads" → op.getNumThreads() (SSA operand from omp.parallel)
+      //   bool          → i8 constant (libgomp passes C bool as a byte)
       //   integer       → i32 constant
       //   other str     → undef ptr
+      auto i64Ty = IntegerType::get(ctx, 64);
       for (auto attr : op.getInvoke()) {
         auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
         if (!ca) continue;
@@ -812,10 +935,27 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
               v = fnPtrCast;
             else if (s == "env_ptr")
               v = structAlloca;
-            else if (s == "num_threads" && op.getNumThreads())
+            else if (s == "env_size") {
+              uint64_t sz =
+                DataLayout(module).getTypeSize(structTy).getFixedValue();
+              v = LLVM::ConstantOp::create(builder, loc, i64Ty,
+                IntegerAttr::get(i64Ty, (int64_t)sz));
+            } else if (s == "env_align") {
+              uint64_t al = DataLayout(module).getTypeABIAlignment(structTy);
+              v = LLVM::ConstantOp::create(builder, loc, i64Ty,
+                IntegerAttr::get(i64Ty, (int64_t)al));
+            } else if (s == "null") {
+              v = LLVM::ZeroOp::create(builder, loc, ptrTy(ctx));
+            } else if (s == "num_threads" && op.getNumThreads())
               v = op.getNumThreads();
             else
               v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+          } else if (auto ba = llvm::dyn_cast<BoolAttr>(argAttr)) {
+            // Check BoolAttr before IntegerAttr: in MLIR a BoolAttr *is* an
+            // i1 IntegerAttr, so the IntegerAttr branch would also match it.
+            auto i8Ty = IntegerType::get(ctx, 8);
+            v = LLVM::ConstantOp::create(builder, loc, i8Ty,
+              IntegerAttr::get(i8Ty, ba.getValue() ? 1 : 0));
           } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
             v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
               IntegerAttr::get(i32Ty(ctx), ia.getInt()));
@@ -865,6 +1005,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       }
     }
 
+    // PMSIS task: the DSL invoke is `call body(env_ptr)`, i.e. the callee is
+    // the outlined function itself.  Emit a direct synchronous call — the
+    // cluster has no task runtime, so the task runs inline on the encountering
+    // core (correct for independent tasks; serialises concurrent ones).
+    if (runtimeCallee == "body" || runtimeCallee == "outlined_parallel" ||
+        runtimeCallee == "outlined_task") {
+      func::CallOp::create(builder, loc, outlinedFn, callArgs);
+    } else
     // __kmpc_fork_call is variadic: (ident, argc, fn, ...captures) -> void.
     // Declare it as llvm.func variadic so multiple parallel regions with
     // different capture counts can share the same declaration.
@@ -1037,6 +1185,51 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     }
   };
 
+  // Move the loop_nest body into `bodyBlock`, bind the induction variable to
+  // `curI`, and append a branch to `latchBlock`. Handles single- and
+  // multi-block nests (the latter arising from inner loops in the CIR input).
+  // Shared by the single-loop and chunked (dynamic) lowering paths.
+  auto moveLoopBody = [&](Block *bodyBlock, Block *latchBlock, Value curI) {
+    auto &nestRegion = loopNest.getRegion();
+    auto &nestFirst  = nestRegion.front();
+    nestFirst.getArgument(0).replaceAllUsesWith(curI);
+    for (auto &innerOp :
+         llvm::make_early_inc_range(nestRegion.back().getOperations()))
+      if (innerOp.getName().getStringRef() == "omp.yield" ||
+          innerOp.getName().getStringRef() == "omp.terminator")
+        innerOp.erase();
+
+    if (nestRegion.hasOneBlock()) {
+      builder.setInsertionPointToEnd(bodyBlock);
+      SmallVector<Operation *> opsToMove;
+      for (auto &innerOp : nestFirst.getOperations())
+        opsToMove.push_back(&innerOp);
+      for (auto *innerOp : opsToMove)
+        innerOp->moveBefore(bodyBlock, bodyBlock->end());
+      builder.setInsertionPointToEnd(bodyBlock);
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, latchBlock);
+    } else {
+      // Multiple blocks (inner loops from CIR): splice ALL blocks before
+      // latchBlock first, then move first block's ops into bodyBlock — this
+      // preserves branch targets since blocks are already in the region.
+      SmallVector<Block *> blocksToMove;
+      for (auto &blk : nestRegion)
+        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
+      for (auto *blk : blocksToMove)
+        blk->moveBefore(latchBlock);
+
+      builder.setInsertionPointToEnd(bodyBlock);
+      SmallVector<Operation *> firstOps;
+      for (auto &innerOp : nestFirst.getOperations())
+        firstOps.push_back(&innerOp);
+      for (auto *innerOp : firstOps)
+        innerOp->moveBefore(bodyBlock, bodyBlock->end());
+
+      builder.setInsertionPointToEnd(blocksToMove.back());
+      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, latchBlock);
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // Process plan.pre: emit each PlanCall directly; if `emit thread_bounds`
   // is encountered, materialise per-thread [lbCore, ubCore) inline via the
@@ -1047,6 +1240,10 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   // ---------------------------------------------------------------------------
   Value lbCore, ubCore;
   bool haveInlineBounds = false;
+  bool haveChunkedLoop  = false;
+  bool haveDispatchLoop = false;
+  std::string chunkStartFn, chunkNextFn;
+  std::string dispatchInitFn, dispatchNextFn;
   for (auto &action : plan.pre) {
     if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
       SmallVector<Value> args;
@@ -1060,7 +1257,24 @@ static void lowerWsloop(omp::WsloopOp wsOp,
       continue;
     }
     auto *pe = std::get_if<dsl::PlanEmit>(&action);
-    if (!pe || pe->name != "thread_bounds") continue;
+    if (!pe) continue;
+    if (pe->name == "chunked_loop") {
+      // libgomp dynamic: start/next chunk acquisition (i64, half-open).
+      // The retry-loop CFG is built below; fn names come from properties.
+      haveChunkedLoop = true;
+      chunkStartFn = getStrProp("chunk_start_function");
+      chunkNextFn  = getStrProp("chunk_next_function");
+      continue;
+    }
+    if (pe->name == "dispatch_loop") {
+      // iomp dynamic: __kmpc_dispatch_init_4 + while(__kmpc_dispatch_next_4)
+      // (i32, inclusive ub). The dispatch CFG is built below.
+      haveDispatchLoop = true;
+      dispatchInitFn = getStrProp("dispatch_init_function");
+      dispatchNextFn = getStrProp("dispatch_next_function");
+      continue;
+    }
+    if (pe->name != "thread_bounds") continue;
 
     // DIVMOD work-distribution:
     //   trip = ceil((ub - lb) / step)
@@ -1106,6 +1320,192 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     haveInlineBounds = true;
   }
 
+  // -------------------------------------------------------------------------
+  // Chunked (dynamic / guided / runtime) wsloop.
+  // -------------------------------------------------------------------------
+  // The runtime hands out chunks one at a time:
+  //   if (start(lb, ub, step, chunk, &istart, &iend))
+  //     do { for (i = istart; i < iend; i += step) body; }
+  //     while (next(&istart, &iend));
+  //   <post: loop_end / loop_end_nowait>
+  // GOMP_loop_*_start / _next use `long` (i64): bounds are sign-extended to i64
+  // for the calls and the loaded half-open chunk bounds truncated back to
+  // iterTy for the body's induction variable.
+  if (haveChunkedLoop) {
+    auto longTy = IntegerType::get(ctx, 64);
+    Value one64long = LLVM::ConstantOp::create(builder, loc, longTy,
+      IntegerAttr::get(longTy, 1));
+    // chunk = 1 for now; schedule(dynamic, N) would thread N as an operand
+    // (same pattern as num_threads).
+    Value chunkLong = LLVM::ConstantOp::create(builder, loc, longTy,
+      IntegerAttr::get(longTy, 1));
+
+    Value lbLong   = LLVM::SExtOp::create(builder, loc, longTy, lb);
+    Value ubLong   = LLVM::SExtOp::create(builder, loc, longTy, ub);
+    Value stepLong = LLVM::SExtOp::create(builder, loc, longTy, step);
+
+    Value pistart = LLVM::AllocaOp::create(builder, loc, ptrT, longTy, one64long);
+    Value piend   = LLVM::AllocaOp::create(builder, loc, ptrT, longTy, one64long);
+
+    // hasWork = start(lb, ub, step, chunk, &istart, &iend) -> i1
+    SmallVector<Type> startArgTys = {longTy, longTy, longTy, longTy, ptrT, ptrT};
+    auto startDecl = getOrInsertDeclWithReturn(module, chunkStartFn,
+      startArgTys, IntegerType::get(ctx, 1), builder);
+    Value hasWork = func::CallOp::create(builder, loc, startDecl,
+      ValueRange{lbLong, ubLong, stepLong, chunkLong,
+                 pistart, piend}).getResult(0);
+
+    Block *preBlock    = builder.getInsertionBlock();
+    Block *afterAll    = preBlock->splitBlock(builder.getInsertionPoint());
+    Block *chunkLoop   = new Block();
+    Block *innerHeader = new Block();
+    Block *innerBody   = new Block();
+    Block *innerLatch  = new Block();
+    Block *nextChunk   = new Block();
+
+    auto &pr = *preBlock->getParent();
+    pr.getBlocks().insertAfter(preBlock->getIterator(),    chunkLoop);
+    pr.getBlocks().insertAfter(chunkLoop->getIterator(),   innerHeader);
+    pr.getBlocks().insertAfter(innerHeader->getIterator(), innerBody);
+    pr.getBlocks().insertAfter(innerBody->getIterator(),   innerLatch);
+    pr.getBlocks().insertAfter(innerLatch->getIterator(),  nextChunk);
+
+    builder.setInsertionPointToEnd(preBlock);
+    LLVM::CondBrOp::create(builder, loc, hasWork,
+      chunkLoop, mlir::ValueRange{}, afterAll, mlir::ValueRange{});
+
+    // chunkLoop: load this chunk's [istart, iend), init the inner IV.
+    builder.setInsertionPointToEnd(chunkLoop);
+    Value curStart = LLVM::LoadOp::create(builder, loc, longTy, pistart);
+    Value curEnd   = LLVM::LoadOp::create(builder, loc, longTy, piend);
+    Value piInner  = LLVM::AllocaOp::create(builder, loc, ptrT, longTy, one64long);
+    LLVM::StoreOp::create(builder, loc, curStart, piInner);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerHeader);
+
+    // innerHeader: i < iend ? innerBody : nextChunk   (half-open, slt)
+    builder.setInsertionPointToEnd(innerHeader);
+    Value curI64 = LLVM::LoadOp::create(builder, loc, longTy, piInner);
+    Value innerCond = LLVM::ICmpOp::create(builder, loc,
+      LLVM::ICmpPredicate::slt, curI64, curEnd);
+    LLVM::CondBrOp::create(builder, loc, innerCond,
+      innerBody, mlir::ValueRange{}, nextChunk, mlir::ValueRange{});
+
+    // innerBody: truncate the i64 IV to iterTy and run the loop body.
+    builder.setInsertionPointToEnd(innerBody);
+    Value curI = LLVM::TruncOp::create(builder, loc, iterTy, curI64);
+    moveLoopBody(innerBody, innerLatch, curI);
+
+    // innerLatch: i += step
+    builder.setInsertionPointToEnd(innerLatch);
+    Value nextI64 = LLVM::AddOp::create(builder, loc, curI64, stepLong);
+    LLVM::StoreOp::create(builder, loc, nextI64, piInner);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerHeader);
+
+    // nextChunk: next(&istart, &iend) ? chunkLoop : afterAll
+    builder.setInsertionPointToEnd(nextChunk);
+    auto nextDecl = getOrInsertDeclWithReturn(module, chunkNextFn,
+      {ptrT, ptrT}, IntegerType::get(ctx, 1), builder);
+    Value hasMore = func::CallOp::create(builder, loc, nextDecl,
+      ValueRange{pistart, piend}).getResult(0);
+    LLVM::CondBrOp::create(builder, loc, hasMore,
+      chunkLoop, mlir::ValueRange{}, afterAll, mlir::ValueRange{});
+
+    // afterAll: post calls (loop_end / loop_end_nowait, optional barrier).
+    builder.setInsertionPointToStart(afterAll);
+    emitPlanCalls(plan.post, builder);
+
+    wsOp.erase();
+    return;
+  }
+
+  // -------------------------------------------------------------------------
+  // iomp dynamic wsloop: __kmpc_dispatch_init_4 + while(__kmpc_dispatch_next_4).
+  // -------------------------------------------------------------------------
+  //   dispatch_init(ident, gtid, sched, lb, ub_incl, step, chunk)
+  //   while (dispatch_next(ident, gtid, &last, &lb, &ub, &stride))
+  //     for (i = lb; i <= ub; i += step) body;   // iomp chunk bounds inclusive
+  //   <post: barrier unless nowait>
+  // i32 bounds throughout (no SExt/Trunc). dispatch_next returns kmp_int32
+  // (0 = no more work). Reuses plb/pub/pstride/plast as the runtime out params.
+  if (haveDispatchLoop) {
+    // ABI: kmp_sch_dynamic_chunked = 35 — VERIFY against the target's kmp.h.
+    const int64_t KMP_SCH_DYNAMIC_CHUNKED = 35;
+    Value sched = LLVM::ConstantOp::create(builder, loc, iterTy,
+      IntegerAttr::get(iterTy, KMP_SCH_DYNAMIC_CHUNKED));
+    Value chunk = LLVM::ConstantOp::create(builder, loc, iterTy,
+      IntegerAttr::get(iterTy, 1)); // chunk = 1 (first cut)
+
+    // dispatch_init(ident, gtid, sched, lb, ub_incl, step, chunk) -> void
+    SmallVector<Type> initArgTys = {ptrT, iterTy, iterTy, iterTy, iterTy,
+                                    iterTy, iterTy};
+    auto initDecl = getOrInsertDecl(module, dispatchInitFn, initArgTys, builder);
+    func::CallOp::create(builder, loc, initDecl,
+      ValueRange{identAddr, gtidVal, sched, lb, ubInclusive, step, chunk});
+
+    Block *preBlock       = builder.getInsertionBlock();
+    Block *afterAll       = preBlock->splitBlock(builder.getInsertionPoint());
+    Block *dispatchHeader = new Block();
+    Block *chunkBody      = new Block();
+    Block *innerHeader    = new Block();
+    Block *innerBody      = new Block();
+    Block *innerLatch     = new Block();
+
+    auto &pr = *preBlock->getParent();
+    pr.getBlocks().insertAfter(preBlock->getIterator(),       dispatchHeader);
+    pr.getBlocks().insertAfter(dispatchHeader->getIterator(), chunkBody);
+    pr.getBlocks().insertAfter(chunkBody->getIterator(),      innerHeader);
+    pr.getBlocks().insertAfter(innerHeader->getIterator(),    innerBody);
+    pr.getBlocks().insertAfter(innerBody->getIterator(),      innerLatch);
+
+    builder.setInsertionPointToEnd(preBlock);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, dispatchHeader);
+
+    // dispatchHeader: hasWork = dispatch_next(...); loop while != 0.
+    builder.setInsertionPointToEnd(dispatchHeader);
+    SmallVector<Type> nextArgTys = {ptrT, iterTy, ptrT, ptrT, ptrT, ptrT};
+    auto nextDecl = getOrInsertDeclWithReturn(module, dispatchNextFn,
+      nextArgTys, iterTy, builder);
+    Value hasWork = func::CallOp::create(builder, loc, nextDecl,
+      ValueRange{identAddr, gtidVal, plast, plb, pub, pstride}).getResult(0);
+    Value cond = LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne,
+      hasWork, zero32);
+    LLVM::CondBrOp::create(builder, loc, cond,
+      chunkBody, mlir::ValueRange{}, afterAll, mlir::ValueRange{});
+
+    // chunkBody: load this chunk's [lb, ub] (inclusive), init the inner IV.
+    builder.setInsertionPointToEnd(chunkBody);
+    Value cStart = LLVM::LoadOp::create(builder, loc, iterTy, plb);
+    Value cEnd   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
+    Value piInner = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
+    LLVM::StoreOp::create(builder, loc, cStart, piInner);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerHeader);
+
+    // innerHeader: i <= ub ? innerBody : dispatchHeader  (inclusive, sle)
+    builder.setInsertionPointToEnd(innerHeader);
+    Value curI = LLVM::LoadOp::create(builder, loc, iterTy, piInner);
+    Value innerCond = LLVM::ICmpOp::create(builder, loc,
+      LLVM::ICmpPredicate::sle, curI, cEnd);
+    LLVM::CondBrOp::create(builder, loc, innerCond,
+      innerBody, mlir::ValueRange{}, dispatchHeader, mlir::ValueRange{});
+
+    // innerBody: run the loop body.
+    builder.setInsertionPointToEnd(innerBody);
+    moveLoopBody(innerBody, innerLatch, curI);
+
+    // innerLatch: i += step
+    builder.setInsertionPointToEnd(innerLatch);
+    Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
+    LLVM::StoreOp::create(builder, loc, nextI, piInner);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, innerHeader);
+
+    // afterAll: post calls (barrier unless nowait).
+    builder.setInsertionPointToStart(afterAll);
+    emitPlanCalls(plan.post, builder);
+
+    wsOp.erase();
+    return;
+  }
+
   // Choose loop bounds and comparison predicate based on how pre populated them.
   // Inline DIVMOD produces exclusive ubCore → use slt.
   // Runtime init (e.g. __kmpc_for_static_init_4) writes inclusive ub into pub
@@ -1147,45 +1547,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   LLVM::CondBrOp::create(builder, loc, cond,
     loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
 
-  // Move the loop nest body into loopBody.
-  // The nest region may have multiple blocks (from inner loops).
-  auto &nestRegion = loopNest.getRegion();
-  auto &nestFirst  = nestRegion.front();
-  nestFirst.getArgument(0).replaceAllUsesWith(curI);
-  for (auto &innerOp : llvm::make_early_inc_range(nestRegion.back().getOperations()))
-    if (innerOp.getName().getStringRef() == "omp.yield" ||
-        innerOp.getName().getStringRef() == "omp.terminator")
-      innerOp.erase();
-
-  if (nestRegion.hasOneBlock()) {
-    builder.setInsertionPointToEnd(loopBody);
-    SmallVector<Operation *> opsToMove;
-    for (auto &innerOp : nestFirst.getOperations())
-      opsToMove.push_back(&innerOp);
-    for (auto *innerOp : opsToMove)
-      innerOp->moveBefore(loopBody, loopBody->end());
-    builder.setInsertionPointToEnd(loopBody);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-  } else {
-    // Multiple blocks (inner loops from CIR): splice ALL blocks before
-    // loopLatch first, then move first block's ops into loopBody — this
-    // preserves branch targets since blocks are already in the region.
-    SmallVector<Block *> blocksToMove;
-    for (auto &blk : nestRegion)
-      if (&blk != &nestFirst) blocksToMove.push_back(&blk);
-    for (auto *blk : blocksToMove)
-      blk->moveBefore(loopLatch);
-
-    builder.setInsertionPointToEnd(loopBody);
-    SmallVector<Operation *> firstOps;
-    for (auto &innerOp : nestFirst.getOperations())
-      firstOps.push_back(&innerOp);
-    for (auto *innerOp : firstOps)
-      innerOp->moveBefore(loopBody, loopBody->end());
-
-    builder.setInsertionPointToEnd(blocksToMove.back());
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-  }
+  // Move the loop nest body into loopBody and branch to loopLatch.
+  moveLoopBody(loopBody, loopLatch, curI);
 
   builder.setInsertionPointToEnd(loopLatch);
   Value nextI = LLVM::AddOp::create(builder, loc, curI, step);

@@ -189,6 +189,34 @@ extractBarrierContext(omp::BarrierOp /*op*/) {
   return ctx;
 }
 
+static llvm::StringMap<dsl::Value>
+extractTaskContext(omp::TaskOp /*op*/) {
+  llvm::StringMap<dsl::Value> ctx;
+  // Symbolic names the task DSL refers to; resolved to SSA values in
+  // outlineConstruct:
+  //   body      -> outlined task function pointer
+  //   env_ptr   -> capture struct pointer
+  //   env_size  -> sizeof(capture struct)   (GOMP_task arg_size)
+  //   env_align -> alignof(capture struct)  (GOMP_task arg_align)
+  //   null      -> null pointer             (cpyfn / depend)
+  ctx["body"]      = dsl::makeStr("body");
+  ctx["env_ptr"]   = dsl::makeStr("env_ptr");
+  ctx["env_size"]  = dsl::makeStr("env_size");
+  ctx["env_align"] = dsl::makeStr("env_align");
+  ctx["null"]      = dsl::makeStr("null");
+  ctx["captures"]  = dsl::makeList({});
+  ctx["packed"]    = dsl::makeStr("packed");
+
+  // if clause is not yet threaded as an operand (first cut): treat as absent
+  // so the DSL `otherwise` branch fires and GOMP_task receives if_clause=true.
+  ctx["if_clause"] = dsl::makeNull();
+
+  // iomp identifiers (unused by the libgomp task path, harmless to bind).
+  ctx["ident"]      = dsl::makeStr("%ident");
+  ctx["global_tid"] = dsl::makeStr("%tid");
+  return ctx;
+}
+
 // ===========================================================================
 // The pass
 // ===========================================================================
@@ -233,9 +261,11 @@ struct OmpToOmpLowerPass
     dsl::Evaluator evaluator(*program);
 
     // Collect ops before modifying the IR
+    SmallVector<omp::TaskOp>     tasks;
     SmallVector<omp::ParallelOp> parallels;
     SmallVector<omp::WsloopOp>   wsloops;
     SmallVector<omp::BarrierOp>  barriers;
+    module.walk([&](omp::TaskOp op) { tasks.push_back(op); });
     module.walk([&](omp::ParallelOp op) { parallels.push_back(op); });
     // Only collect wsloops and barriers that are NOT nested inside a parallel.
     // Those inside a parallel are part of its body region and will be handled
@@ -268,34 +298,44 @@ struct OmpToOmpLowerPass
       return true;
     };
 
-    // Process parallels first, passing their region for later outlining.
+    // Inject privatizer source vars as explicit uses at the start of the
+    // region so collectCaptures (in OmpOutliningPass) finds them.  Only for
+    // firstprivate vars (which need the source value copied); purely private
+    // vars just need a fresh alloca per thread/task.  Shared by parallel and
+    // task (both expose getPrivateVars / getPrivateSyms).
+    auto injectFirstprivateSources = [&](auto op) {
+      Region &region = op.getRegion();
+      if (region.empty()) return;
+      Block &entryBlock = region.front();
+      OpBuilder injector(&entryBlock, entryBlock.begin());
+      auto privateSyms = op.getPrivateSyms();
+      for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
+        bool isFirstprivate = false;
+        if (privateSyms) {
+          auto symRef = llvm::cast<SymbolRefAttr>((*privateSyms)[idx]);
+          if (auto recipe = SymbolTable::lookupNearestSymbolFrom<
+                  omp::PrivateClauseOp>(op, symRef))
+            isFirstprivate = !recipe.getCopyRegion().empty();
+        }
+        if (!isFirstprivate) continue;
+        UnrealizedConversionCastOp::create(injector, op.getLoc(),
+          TypeRange{privateVar.getType()}, ValueRange{privateVar});
+      }
+    };
+
+    // Process tasks before parallels so a task nested inside a parallel
+    // becomes a task-construct *before* the parallel's region is moved into
+    // its own construct; OmpOutliningPass then outlines both (outer first).
+    for (auto op : tasks) {
+      injectFirstprivateSources(op);
+      if (!process(op, "task", extractTaskContext(op), &op.getRegion()))
+        return;
+    }
+
+    // Process parallels, passing their region for later outlining.
     // Wsloops and barriers nested inside a parallel are erased with it.
     for (auto op : parallels) {
-      // Before moving the region, inject the privatizer source vars as
-      // explicit uses inside the region so collectCaptures finds them.
-      // Only inject for firstprivate vars (which need the source value
-      // copied); purely private vars just need a fresh alloca per thread.
-      Region &parallelRegion = op.getRegion();
-      if (!parallelRegion.empty()) {
-        Block &entryBlock = parallelRegion.front();
-        OpBuilder injector(&entryBlock, entryBlock.begin());
-        auto privateSyms = op.getPrivateSyms();
-        for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
-          // Look up the privatizer recipe to check if it's firstprivate.
-          bool isFirstprivate = false;
-          if (privateSyms) {
-            auto symRef = llvm::cast<SymbolRefAttr>((*privateSyms)[idx]);
-            if (auto recipe = SymbolTable::lookupNearestSymbolFrom<
-                    omp::PrivateClauseOp>(op, symRef))
-              isFirstprivate = !recipe.getCopyRegion().empty();
-          }
-          if (!isFirstprivate) continue;
-          // Create a use of privateVar inside the region so collectCaptures
-          // picks it up as a capture.
-          UnrealizedConversionCastOp::create(injector, op.getLoc(),
-            TypeRange{privateVar.getType()}, ValueRange{privateVar});
-        }
-      }
+      injectFirstprivateSources(op);
       Value numThreads;
       if (op.getNumThreadsDimsCount() > 0)
         numThreads = op.getNumThreads(0);
