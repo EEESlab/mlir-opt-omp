@@ -247,8 +247,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   std::string outlineSig   = getPropStr(op, "outline_signature");
   std::string captureStrat = getPropStr(op, "capture_strategy");
 
-  bool isMicrotask = outlineSig.find("microtask") != std::string::npos;
-  bool isClosure   = outlineSig.find("closure")   != std::string::npos;
+  bool isMicrotask = outlineSig.find("microtask")  != std::string::npos;
+  bool isClosure   = outlineSig.find("closure")    != std::string::npos;
+  bool isTaskEntry = outlineSig.find("task_entry") != std::string::npos;
   bool isPacked    = captureStrat == "packed";
 
   // Collect all values used inside the region but defined outside.
