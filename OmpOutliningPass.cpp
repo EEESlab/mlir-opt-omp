@@ -582,7 +582,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
 
   // Lower omp.barrier inside the outlined function — DSL-driven.
   // The barrier plan (one per runtime) is built once in runOnOperation;
-  // here we only resolve the symbolic args (%ident, %tid) at each call site.
+  // here we only resolve the symbolic args (%ident, %gtid) at each call site.
   SmallVector<Operation *> barriers;
   for (auto &block : outlinedFn.getBody())
     for (auto &innerOp : block)
@@ -595,9 +595,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     auto resolveArg = [&](const dsl::Value &v) -> Value {
       if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
         llvm::StringRef s = sv->value;
-        if (s == "%ident" || s == "ident")
+        if (s == "%ident")
           return getIdentAddr(module, bb, bloc, ctx);
-        if (s == "%tid" || s == "global_tid") {
+        if (s == "%gtid") {
           // Microtask convention: first arg is ptr to i32 gtid.
           auto &fnEntry = outlinedFn.getBody().front();
           if (fnEntry.getNumArguments() >= 2)
@@ -712,9 +712,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         Value v;
         if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
           llvm::StringRef s = sa.getValue();
-          if (s == "ident" || s == "%ident")
+          if (s == "%ident")
             v = identVal;
-          else if (s == "global_tid" || s == "%tid")
+          else if (s == "%gtid")
             v = gtidAtCallSite
               ? gtidAtCallSite
               : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
@@ -995,13 +995,13 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   auto resolveCallArg = [&](const dsl::Value &v) -> Value {
     if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
       llvm::StringRef s = sv->value;
-      if (s == "%ident" || s == "ident")      return identAddr;
-      if (s == "%tid"   || s == "global_tid") return gtidVal;
-      if (s == "%lb"    || s == "lower")      return plb;
-      if (s == "%ub"    || s == "upper")      return pub;
-      if (s == "%step"  || s == "step")       return step;    // actual loop step
-      if (s == "%stride" || s == "stride")    return pstride; // output ptr for runtime
-      if (s == "last"   || s == "plast")      return plast;
+      if (s == "%ident")  return identAddr;
+      if (s == "%gtid")    return gtidVal;
+      if (s == "%lb")     return plb;
+      if (s == "%ub")     return pub;
+      if (s == "%step")   return step;    // actual loop step
+      if (s == "%stride") return pstride; // output ptr for runtime
+      if (s == "%last")   return plast;
       return LLVM::UndefOp::create(builder, loc, ptrT);
     }
     if (auto *iv = std::get_if<dsl::IntVal>(&v))
@@ -1241,7 +1241,7 @@ struct OmpOutliningPass
     // omp.barrier inside outlined parallel functions.
     llvm::StringMap<dsl::Value> barrierCtx;
     barrierCtx["ident"]      = dsl::makeStr("%ident");
-    barrierCtx["global_tid"] = dsl::makeStr("%tid");
+    barrierCtx["global_tid"] = dsl::makeStr("%gtid");
     auto barrierPlan = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
     if (!barrierPlan) {
       module.emitError("omp-outline: barrier DSL evaluation failed: ")
@@ -1267,11 +1267,11 @@ struct OmpOutliningPass
 
       llvm::StringMap<dsl::Value> ctx;
       ctx["ident"]      = dsl::makeStr("%ident");
-      ctx["global_tid"] = dsl::makeStr("%tid");
+      ctx["global_tid"] = dsl::makeStr("%gtid");
       ctx["lower"]      = dsl::makeStr("%lb");
       ctx["upper"]      = dsl::makeStr("%ub");
       ctx["step"]       = dsl::makeStr("%step");
-      ctx["last"]       = dsl::makeStr("last");
+      ctx["last"]       = dsl::makeStr("%last");
       ctx["chunk"]      = dsl::makeInt(1);
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["schedule"]   = dsl::makeStr("static");

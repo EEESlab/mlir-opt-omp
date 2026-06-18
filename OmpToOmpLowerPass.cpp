@@ -148,7 +148,7 @@ extractParallelContext(omp::ParallelOp op) {
 
   // iomp runtime identifiers
   ctx["ident"]      = dsl::makeStr("%ident");
-  ctx["global_tid"] = dsl::makeStr("%tid");
+  ctx["global_tid"] = dsl::makeStr("%gtid");
   ctx["ptr_tid"]    = dsl::makeStr("ptr_tid");
   ctx["ptr_btid"]   = dsl::makeStr("ptr_btid");
 
@@ -164,7 +164,7 @@ static llvm::StringMap<dsl::Value>
 extractWsloopContext(omp::WsloopOp op) {
   llvm::StringMap<dsl::Value> ctx;
   ctx["ident"]      = dsl::makeStr("%ident");
-  ctx["global_tid"] = dsl::makeStr("%tid");
+  ctx["global_tid"] = dsl::makeStr("%gtid");
   ctx["lower"]      = dsl::makeStr("%lb");
   ctx["upper"]      = dsl::makeStr("%ub");
   ctx["step"]       = dsl::makeStr("%step");
@@ -185,7 +185,7 @@ static llvm::StringMap<dsl::Value>
 extractBarrierContext(omp::BarrierOp /*op*/) {
   llvm::StringMap<dsl::Value> ctx;
   ctx["ident"]      = dsl::makeStr("%ident");
-  ctx["global_tid"] = dsl::makeStr("%tid");
+  ctx["global_tid"] = dsl::makeStr("%gtid");
   return ctx;
 }
 
