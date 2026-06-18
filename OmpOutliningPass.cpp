@@ -16,7 +16,7 @@
 // 2. WSLOOP LOWERING — for each omp.wsloop surviving inside outlined funcs:
 //    - Extract context (schedule, nowait, bounds) from the omp.loop_nest
 //    - Call dsl::Evaluator::buildPlan(runtime, "wsloop", ctx) to get the plan
-//    - Emit plan.pre (runtime init call OR `emit thread_bounds` → DIVMOD),
+//    - Emit plan.pre (runtime init call OR `emit thread_bounds` → block chunk),
 //      then an explicit loop, then plan.post
 
 #include "OmpOutliningPass.h"
@@ -1039,13 +1039,13 @@ static void lowerWsloop(omp::WsloopOp wsOp,
 
   // ---------------------------------------------------------------------------
   // Process plan.pre: emit each PlanCall directly; if `emit thread_bounds`
-  // is encountered, materialise per-thread [lbCore, ubCore) inline via the
-  // DIVMOD formula (matches GCC's _omp_fn ABI).  The runtime path (e.g. iomp
+  // is encountered, materialise per-thread [lbThread, ubThread) inline via a
+  // contiguous block-chunk formula.  The runtime path (e.g. iomp
   // __kmpc_for_static_init_4) has only PlanCalls in pre; the inline path
   // (PMSIS, libgomp) has only `emit thread_bounds`.  Whether `emit
   // thread_bounds` was seen drives the loop bounds choice below.
   // ---------------------------------------------------------------------------
-  Value lbCore, ubCore;
+  Value lbThread, ubThread;
   bool haveInlineBounds = false;
   for (auto &action : plan.pre) {
     if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
@@ -1062,59 +1062,55 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     auto *pe = std::get_if<dsl::PlanEmit>(&action);
     if (!pe || pe->name != "thread_bounds") continue;
 
-    // DIVMOD work-distribution:
-    //   trip = ceil((ub - lb) / step)
-    //   q    = trip / num_threads  -- base chunk size for every thread
-    //   tt   = trip % num_threads  -- first `tt` threads get one extra iteration
-    //   thread_start = q * threadId + min(threadId, tt)
-    //   thread_end   = thread_start + q + (threadId < tt ? 1 : 0)
-    // Tiles [0, trip) with no overlap and no gap.  The helper function names
-    // come from the DSL properties thread_id_function / num_thread_function,
-    // so this code path serves any runtime that exposes such helpers.
+    // Block work-distribution (one contiguous chunk per thread):
+    //   trip  = ceil((ub - lb) / step)        -- iteration count
+    //   chunk = ceil(trip / num_threads)      -- block size per thread
+    //   lbThread = lb + threadId * chunk * step           (inclusive start)
+    //   ubThread = min(lbThread + chunk * step, ub)         (exclusive end, clamped)
+    // This avoids the per-thread DIVMOD (SDiv + SRem) of the balanced scheme:
+    // a single ceiling-division computes the chunk and the upper bound is
+    // clamped with a select.  The helper function names come from the DSL
+    // properties thread_id_function / num_thread_function, so this code path
+    // serves any runtime that exposes such helpers.
     std::string threadIdFn  = getStrProp("thread_id_function");
     std::string numThreadFn = getStrProp("num_thread_function");
     Value threadId   = emitNoArgI32Call(module, builder, loc, threadIdFn);
     Value numThreads = emitNoArgI32Call(module, builder, loc, numThreadFn);
 
+    // trip = (ub - lb + step - 1) / step  [ceiling division of iteration count]
     Value range    = LLVM::SubOp::create(builder, loc, ub, lb);
     Value rangeS   = LLVM::AddOp::create(builder, loc, range,
                        LLVM::SubOp::create(builder, loc, step, one32));
     Value trip     = LLVM::SDivOp::create(builder, loc, rangeS, step);
 
-    Value q  = LLVM::SDivOp::create(builder, loc, trip, numThreads);
-    Value tt = LLVM::SRemOp::create(builder, loc, trip, numThreads);
+    // chunk = ceil(trip / num_threads)
+    Value tripPlusNC = LLVM::AddOp::create(builder, loc, trip,
+                         LLVM::SubOp::create(builder, loc, numThreads, one32));
+    Value chunk    = LLVM::SDivOp::create(builder, loc, tripPlusNC, numThreads);
 
-    Value ltTt       = LLVM::ICmpOp::create(builder, loc,
-                         LLVM::ICmpPredicate::slt, threadId, tt);
-    Value minThreadIdTt = LLVM::SelectOp::create(builder, loc, ltTt, threadId, tt);
+    // lbThread = lb + threadId * chunk * step
+    Value threadChunk  = LLVM::MulOp::create(builder, loc, threadId, chunk);
+    Value threadOff    = LLVM::MulOp::create(builder, loc, threadChunk, step);
+    lbThread           = LLVM::AddOp::create(builder, loc, lb, threadOff);
 
-    Value qMulId     = LLVM::MulOp::create(builder, loc, q, threadId);
-    Value threadStart = LLVM::AddOp::create(builder, loc, qMulId, minThreadIdTt);
-
-    Value extraIter  = LLVM::SelectOp::create(builder, loc, ltTt, one32, zero32);
-    Value threadEnd  = LLVM::AddOp::create(builder, loc,
-                         LLVM::AddOp::create(builder, loc, threadStart, q),
-                         extraIter);
-
-    // Map back to the original index space.
-    // lbCore = lb + thread_start * step  (inclusive start)
-    // ubCore = lb + thread_end   * step  (exclusive end — exact, no clamp)
-    lbCore = LLVM::AddOp::create(builder, loc, lb,
-               LLVM::MulOp::create(builder, loc, threadStart, step));
-    ubCore = LLVM::AddOp::create(builder, loc, lb,
-               LLVM::MulOp::create(builder, loc, threadEnd, step));
+    // ubThread = lbThread + chunk * step, then clamp to ub
+    Value chunkStep  = LLVM::MulOp::create(builder, loc, chunk, step);
+    Value lbThreadEnd  = LLVM::AddOp::create(builder, loc, lbThread, chunkStep);
+    Value clampCond  = LLVM::ICmpOp::create(builder, loc,
+                         LLVM::ICmpPredicate::sgt, lbThreadEnd, ub);
+    ubThread           = LLVM::SelectOp::create(builder, loc, clampCond, ub, lbThreadEnd);
     haveInlineBounds = true;
   }
 
   // Choose loop bounds and comparison predicate based on how pre populated them.
-  // Inline DIVMOD produces exclusive ubCore → use slt.
+  // Inline block-chunking produces exclusive ubThread → use slt.
   // Runtime init (e.g. __kmpc_for_static_init_4) writes inclusive ub into pub
   // (we initialised pub with ub - step) → use sle.
   Value loopStart, loopEnd;
   LLVM::ICmpPredicate cmpPred;
   if (haveInlineBounds) {
-    loopStart = lbCore;
-    loopEnd   = ubCore;
+    loopStart = lbThread;
+    loopEnd   = ubThread;
     cmpPred   = LLVM::ICmpPredicate::slt;
   } else {
     loopStart = LLVM::LoadOp::create(builder, loc, iterTy, plb);
