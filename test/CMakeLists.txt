@@ -15,10 +15,15 @@ configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
 )
 
-set(OMP_LOWER_TEST_DEPENDS
-  FileCheck count not
-  mlir-opt-omp
-)
+# mlir-opt-omp is always ours to build. FileCheck/count/not are real CMake
+# targets only for an in-tree LLVM; against an installed/external LLVM they are
+# plain binaries found via PATH, so only depend on them when the target exists.
+set(OMP_LOWER_TEST_DEPENDS mlir-opt-omp)
+foreach(tool FileCheck count not)
+  if(TARGET ${tool})
+    list(APPEND OMP_LOWER_TEST_DEPENDS ${tool})
+  endif()
+endforeach()
 
 add_lit_testsuite(check-omp "Running the omp-lower regression tests"
   ${CMAKE_CURRENT_BINARY_DIR}
