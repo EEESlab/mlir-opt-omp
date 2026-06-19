@@ -1,0 +1,5 @@
+# Per-machine config — never commit local paths.
+config.env
+
+# Build/run artefacts.
+results/

@@ -26,6 +26,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Colours (disabled when stdout is not a terminal).
+if [ -t 1 ]; then
+    GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
+    BOLD='\033[1m'; RESET='\033[0m'
+else
+    GREEN=''; RED=''; YELLOW=''; BOLD=''; RESET=''
+fi
+
 # Optional per-machine config: copy config.env.example -> config.env and edit.
 # Values already set in the environment take precedence over the file.
 if [ -f "$SCRIPT_DIR/config.env" ]; then
@@ -52,7 +60,10 @@ MLIR_TRANSLATE="${MLIR_TRANSLATE:-mlir-translate}"
 MLIR_OPT_OMP="${MLIR_OPT_OMP:-mlir-opt-omp}"
 
 # --- Paths -----------------------------------------------------------------
-POLYBENCH="${POLYBENCH:-$HOME/eeeslab/PolyBenchC-4.2.1-OpenMP}"
+# Defaults to the kernels vendored in this repo, so the test is self-contained.
+# Point POLYBENCH at a full PolyBench/OMP checkout (and use SUITE=full) to run
+# the whole benchmark set.
+POLYBENCH="${POLYBENCH:-$SCRIPT_DIR/kernels}"
 INC="${POLYBENCH_UTIL:-$POLYBENCH/utilities}"
 RULES="${RULES:-$SCRIPT_DIR/../../rules.dsl}"
 # OpenMP headers used by the clang->CIR front-end. Adjust to your GCC version.
@@ -63,12 +74,22 @@ OUTDIR="${OUTDIR:-$PWD/results}"
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp
 DATASET="${DATASET:-MINI_DATASET}"
 THREADS="${THREADS:-16}"
+SUITE="${SUITE:-bundled}"            # bundled | full
 
 export OMP_NUM_THREADS="$THREADS"
 export OMP_PLACES="${OMP_PLACES:-cores}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 
 POLYBENCH_CFLAGS="-DPOLYBENCH_DUMP_ARRAYS"
+
+# Running as root needs the FIFO scheduler define + an explicit libc link
+# (PolyBench convention). Honoured automatically; override POLYBENCH_LFLAGS to
+# disable.
+POLYBENCH_LFLAGS="${POLYBENCH_LFLAGS:-}"
+if [ "$(id -u)" -eq 0 ]; then
+    POLYBENCH_CFLAGS="$POLYBENCH_CFLAGS -DPOLYBENCH_LINUX_FIFO_SCHEDULER"
+    POLYBENCH_LFLAGS="$POLYBENCH_LFLAGS -lc"
+fi
 
 # Strict FP flags — keep ref and opt in sync.
 CLANG_STRICT_FP="${CLANG_STRICT_FP:--ffp-contract=off -fno-vectorize -fno-slp-vectorize}"
@@ -96,7 +117,14 @@ case "$RUNTIME" in
         ;;
 esac
 
-# Default kernel set (paths relative to $POLYBENCH).
+# Kernels bundled in this repo (paths relative to $POLYBENCH).
+BUNDLED_KERNELS=(
+    "linear-algebra/blas/gemm/gemm-omp.c"
+    "linear-algebra/kernels/atax/atax-omp.c"
+)
+
+# The full PolyBench/OMP suite (paths relative to $POLYBENCH). Used with
+# SUITE=full against an external checkout.
 ALL_KERNELS=(
     "datamining/covariance/covariance-omp.c"
     "datamining/correlation/correlation-omp.c"
@@ -196,7 +224,8 @@ compile_opt() {
     "$CLANG" -O3 $CLANG_STRICT_FP \
         $OPT_FOPENMP -no-pie \
         "$tmpdir/$name.o" "$tmpdir/polybench.o" \
-        $OPT_EXTRA_LIBS -o "$outdir/$binname" || { rm -rf "$tmpdir"; return 1; }
+        $OPT_EXTRA_LIBS $POLYBENCH_LFLAGS -o "$outdir/$binname" \
+        || { rm -rf "$tmpdir"; return 1; }
 
     cp "$tmpdir/$name.opt.ll" "$outdir/$binname.ll"   # keep final IR for debugging
     rm -rf "$tmpdir"
@@ -213,7 +242,7 @@ compile_ref() {
         -I"$INC" -I"$(dirname "$src")" $REF_OMP_INC \
         -D"$DATASET" $POLYBENCH_CFLAGS \
         "$src" "$INC/polybench.c" \
-        -lm -o "$outdir/$binname" || return 1
+        -lm $POLYBENCH_LFLAGS -o "$outdir/$binname" || return 1
     [ -f "$outdir/$binname" ]
 }
 
@@ -244,9 +273,9 @@ run_kernel() {
 
     echo "  [4/4] comparing..."
     if diff -q "$ref_dir/dump.txt" "$opt_dir/dump.txt" > /dev/null; then
-        echo "  PASS"; echo "$name;PASS" >> "$CSV"
+        echo -e "  ${GREEN}${BOLD}PASS${RESET}"; echo "$name;PASS" >> "$CSV"
     else
-        echo "  FAIL — first differences:"
+        echo -e "  ${RED}${BOLD}FAIL${RESET} — first differences:"
         diff --unified=3 "$ref_dir/dump.txt" "$opt_dir/dump.txt" | head -20
         echo "$name;FAIL" >> "$CSV"
     fi
@@ -258,7 +287,7 @@ mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_correctness.csv"
 
 echo "=== MLIR OpenMP CORRECTNESS CHECK ==="
-echo "runtime: $RUNTIME    dataset: $DATASET    threads: $THREADS"
+echo "runtime: $RUNTIME    dataset: $DATASET    threads: $THREADS    suite: $SUITE"
 echo "ref cc : $REF_CC"
 echo "polybench: $POLYBENCH"
 echo "rules: $RULES"
@@ -267,10 +296,20 @@ echo ""
 
 echo "kernel;result" > "$CSV"
 
+# Select the kernel list: an explicit KERNELS override wins, otherwise SUITE
+# picks the bundled set or the full suite.
+if [ -n "${KERNELS:-}" ]; then
+    read -ra KERNEL_LIST <<< "$KERNELS"
+elif [ "$SUITE" = "full" ]; then
+    KERNEL_LIST=("${ALL_KERNELS[@]}")
+else
+    KERNEL_LIST=("${BUNDLED_KERNELS[@]}")
+fi
+
 if [ $# -ge 1 ]; then
     run_kernel "$1"
 else
-    for k in "${ALL_KERNELS[@]}"; do
+    for k in "${KERNEL_LIST[@]}"; do
         run_kernel "$k"
     done
 fi
@@ -280,10 +319,10 @@ failed=$(grep -c ';FAIL$' "$CSV" || true)
 errors=$(grep -c ';ERROR$' "$CSV" || true)
 total=$((passed + failed + errors))
 
-echo "=== SUMMARY ==="
-echo "passed: $passed / $total"
-[ "$failed" -gt 0 ] && echo "failed: $failed"
-[ "$errors" -gt 0 ] && echo "errors: $errors"
+echo -e "${BOLD}=== SUMMARY ===${RESET}"
+echo -e "  ${GREEN}passed: $passed / $total${RESET}"
+[ "$failed" -gt 0 ] && echo -e "  ${RED}failed: $failed${RESET}"
+[ "$errors" -gt 0 ] && echo -e "  ${YELLOW}errors: $errors${RESET}"
 if [ "$failed" -gt 0 ] || [ "$errors" -gt 0 ]; then
     echo ""
     echo "non-passing kernels:"
