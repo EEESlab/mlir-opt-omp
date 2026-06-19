@@ -6,7 +6,8 @@
 //    - Collect captures, create @outlined_parallel_N func.func
 //    - Move region body into it, wire captured values as block args
 //    - Emit __kmpc_fork_call (iomp) or GOMP_parallel (libgomp) with captures
-//    - Create __omp_ident_N global if DSL pre block contains "emit ident"
+//    - Create per-flags __omp_ident_<hex> globals (Clang-parity ident_t) on
+//      demand via getOrCreateIdent; "emit ident" requests the default one
 //
 //    Capture strategies:
 //      by_pointer (iomp): each capture passed as a separate pointer argument
@@ -36,6 +37,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 
 using namespace mlir;
@@ -220,15 +222,93 @@ static Value emitNoArgI32Call(ModuleOp module, OpBuilder &builder,
   return func::CallOp::create(builder, loc, decl, ValueRange{}).getResult(0);
 }
 
-// Get the address of an existing __omp_ident_ global, or undef if none.
-static Value getIdentAddr(ModuleOp module, OpBuilder &builder, Location loc,
-                          MLIRContext *ctx) {
-  for (auto &op : *module.getBody())
-    if (auto g = llvm::dyn_cast<LLVM::GlobalOp>(op))
-      if (g.getSymName().starts_with("__omp_ident_"))
-        return LLVM::AddressOfOp::create(builder, loc, ptrTy(ctx),
-          FlatSymbolRefAttr::get(ctx, g.getSymName()));
-  return LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+// Map a DSL ident flag token to the effective `ident_t.flags` bitmask.
+// KMP_IDENT_KMPC (0x02) is always set, mirroring OMPIRBuilder::getOrCreateIdent.
+// Values match clang's OpenMPLocationFlags (CGOpenMPRuntime.cpp).
+static uint32_t identFlagBits(llvm::StringRef tok) {
+  uint32_t kmpc = 0x02;
+  if (tok.empty() || tok == "kmpc")        return kmpc;
+  if (tok == "barrier_expl")               return kmpc | 0x20;
+  if (tok == "barrier_impl" ||
+      tok == "barrier_impl_for")           return kmpc | 0x40;
+  if (tok == "barrier_impl_sections")      return kmpc | 0xC0;
+  if (tok == "barrier_impl_single")        return kmpc | 0x140;
+  if (tok == "work_loop")                  return kmpc | 0x200;
+  if (tok == "work_sections")              return kmpc | 0x400;
+  if (tok == "work_distribute")            return kmpc | 0x800;
+  return kmpc; // unknown token → plain KMPC
+}
+
+// Recognise a symbolic ident reference: "ident", "%ident", or "%ident:<flag>".
+// On match, set `flagsOut` to the effective flag bits and return true.
+static bool parseIdentRef(llvm::StringRef s, uint32_t &flagsOut) {
+  if (!(s.consume_front("%ident") || s.consume_front("ident")))
+    return false;
+  llvm::StringRef flag = "";
+  if (s.consume_front(":"))
+    flag = s;
+  else if (!s.empty())
+    return false; // e.g. "identity" must not match
+  flagsOut = identFlagBits(flag);
+  return true;
+}
+
+// Get (creating on first use) the address of the `ident_t` global for a given
+// flags value. Mirrors OMPIRBuilder::getOrCreateIdent: one private constant
+// global per distinct flags value, all sharing a single default psource string
+// ";unknown;unknown;0;0;;" (reserved_3 = its length, NUL excluded).
+static Value getOrCreateIdent(ModuleOp module, OpBuilder &builder, Location loc,
+                              MLIRContext *ctx, uint32_t flags) {
+  auto i32t = IntegerType::get(ctx, 32);
+  auto ptr  = ptrTy(ctx);
+
+  // Shared default source-location string, NUL-terminated like
+  // ConstantDataArray::getString. reserved_3 stores the length without NUL.
+  llvm::StringRef srcName = "__omp_src_loc_default";
+  const std::string srcText = ";unknown;unknown;0;0;;";
+  if (!module.lookupSymbol(srcName)) {
+    std::string data = srcText;
+    data.push_back('\0');
+    auto arrTy = LLVM::LLVMArrayType::get(IntegerType::get(ctx, 8), data.size());
+    OpBuilder gb(ctx);
+    gb.setInsertionPointToStart(module.getBody());
+    LLVM::GlobalOp::create(gb, loc, arrTy, /*isConstant=*/true,
+      LLVM::Linkage::Private, srcName, StringAttr::get(ctx, data));
+  }
+
+  std::string identName = ("__omp_ident_" + llvm::utohexstr(flags, true)).str();
+  if (!module.lookupSymbol(identName)) {
+    auto identStructTy = LLVM::LLVMStructType::getLiteral(
+      ctx, {i32t, i32t, i32t, i32t, ptr});
+    OpBuilder gb(ctx);
+    gb.setInsertionPointToStart(module.getBody());
+    auto global = LLVM::GlobalOp::create(gb, loc, identStructTy,
+      /*isConstant=*/true, LLVM::Linkage::Private, identName, Attribute{},
+      /*alignment=*/8);
+    global.setUnnamedAddr(LLVM::UnnamedAddr::Global);
+    Block *initBlock = new Block();
+    global.getInitializerRegion().push_back(initBlock);
+    OpBuilder ib(ctx);
+    ib.setInsertionPointToStart(initBlock);
+    auto ci = [&](int64_t v) -> Value {
+      return LLVM::ConstantOp::create(ib, loc, i32t, IntegerAttr::get(i32t, v));
+    };
+    auto ins = [&](Value v, Value st, unsigned idx) -> Value {
+      return LLVM::InsertValueOp::create(ib, loc, identStructTy, st, v,
+        ArrayRef<int64_t>{(int64_t)idx});
+    };
+    Value s = LLVM::UndefOp::create(ib, loc, identStructTy);
+    s = ins(ci(0),                       s, 0); // reserved_1
+    s = ins(ci((int64_t)flags),          s, 1); // flags (incl. KMPC)
+    s = ins(ci(0),                       s, 2); // reserved_2
+    s = ins(ci((int64_t)srcText.size()), s, 3); // reserved_3 = strlen(psource)
+    Value srcAddr = LLVM::AddressOfOp::create(ib, loc, ptr,
+      FlatSymbolRefAttr::get(ctx, srcName));
+    s = ins(srcAddr, s, 4);                     // psource
+    LLVM::ReturnOp::create(ib, loc, s);
+  }
+  return LLVM::AddressOfOp::create(builder, loc, ptr,
+    FlatSymbolRefAttr::get(ctx, identName));
 }
 
 // ---------------------------------------------------------------------------
@@ -595,8 +675,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     auto resolveArg = [&](const dsl::Value &v) -> Value {
       if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
         llvm::StringRef s = sv->value;
-        if (s == "%ident")
-          return getIdentAddr(module, bb, bloc, ctx);
+        uint32_t identFlags;
+        if (parseIdentRef(s, identFlags))
+          return getOrCreateIdent(module, bb, bloc, ctx, identFlags);
         if (s == "%gtid") {
           // Microtask convention: first arg is ptr to i32 gtid.
           auto &fnEntry = outlinedFn.getBody().front();
@@ -637,40 +718,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     }
   }
 
-  std::string identName = "__omp_ident_" + std::to_string(counter - 1);
-  if (needsIdent && !module.lookupSymbol(identName)) {
-    auto i32t = IntegerType::get(ctx, 32);
-    auto identStructTy = LLVM::LLVMStructType::getLiteral(
-      ctx, {i32t, i32t, i32t, i32t, ptrTy(ctx)});
-    OpBuilder gBuilder(ctx);
-    gBuilder.setInsertionPointToStart(module.getBody());
-    auto global = LLVM::GlobalOp::create(gBuilder, loc,
-      identStructTy, true, LLVM::Linkage::Private, identName, Attribute{});
-    Block *initBlock = new Block();
-    global.getInitializerRegion().push_back(initBlock);
-    OpBuilder initB(ctx);
-    initB.setInsertionPointToStart(initBlock);
-    Value s = LLVM::UndefOp::create(initB, loc, identStructTy);
-    auto ci = [&](int64_t v) -> Value {
-      return LLVM::ConstantOp::create(initB, loc, i32t,
-        IntegerAttr::get(i32t, v));
-    };
-    auto ins = [&](Value v, Value st, unsigned idx) -> Value {
-      return LLVM::InsertValueOp::create(initB, loc, identStructTy, st, v,
-        ArrayRef<int64_t>{(int64_t)idx});
-    };
-    s = ins(ci(0), s, 0);
-    s = ins(ci(2), s, 1);
-    s = ins(ci(0), s, 2);
-    s = ins(ci(0), s, 3);
-    Value zero64 = LLVM::ConstantOp::create(initB, loc,
-      IntegerType::get(ctx, 64), IntegerAttr::get(IntegerType::get(ctx,64),0));
-    Value nullPtr = LLVM::IntToPtrOp::create(initB, loc, ptrTy(ctx), zero64);
-    s = LLVM::InsertValueOp::create(initB, loc, identStructTy, s, nullPtr,
-      ArrayRef<int64_t>{4});
-    LLVM::ReturnOp::create(initB, loc, s);
-  }
-
   // ---- Emit the runtime call at the call site ----
   std::string runtimeCallee;
   for (auto attr : op.getInvoke())
@@ -685,11 +732,11 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     SmallVector<Value> callArgs;
     SmallVector<Type>  callTypes;
 
-    // ident
+    // ident (default flags: KMPC only) — used for the fork call, the
+    // global_thread_num seed, and bare `ident` references in the pre block.
     Value identVal;
     if (needsIdent)
-      identVal = LLVM::AddressOfOp::create(builder, loc, ptrTy(ctx),
-        FlatSymbolRefAttr::get(ctx, identName));
+      identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
     else
       identVal = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
 
@@ -712,8 +759,11 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         Value v;
         if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
           llvm::StringRef s = sa.getValue();
-          if (s == "%ident")
-            v = identVal;
+          uint32_t identFlags;
+          if (parseIdentRef(s, identFlags))
+            v = identFlags == 0x02
+              ? identVal
+              : getOrCreateIdent(module, builder, loc, ctx, identFlags);
           else if (s == "%gtid")
             v = gtidAtCallSite
               ? gtidAtCallSite
@@ -929,11 +979,12 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   if (loopNest.getLoopInclusive())
     ub = LLVM::AddOp::create(builder, loc, ub, step);
 
-  // Get ident and gtid from enclosing outlined function.
+  // Get gtid from enclosing outlined function. (idents are resolved per call
+  // argument below, since init/fini and the trailing barrier use different
+  // flags.)
   // For iomp microtask: arg0 = ptr gtid, arg1 = ptr btid → load i32 from arg0.
   // For libgomp closure: arg0 = ptr data (capture struct) — no gtid ptr.
   //   Use omp_get_thread_num() to obtain the current thread id.
-  Value identAddr = getIdentAddr(module, builder, loc, ctx);
   Value gtidVal   = LLVM::UndefOp::create(builder, loc, iterTy);
   if (auto parentFn = wsOp->getParentOfType<func::FuncOp>()) {
     auto &entry = parentFn.getBody().front();
@@ -995,8 +1046,10 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   auto resolveCallArg = [&](const dsl::Value &v) -> Value {
     if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
       llvm::StringRef s = sv->value;
-      if (s == "%ident")  return identAddr;
-      if (s == "%gtid")    return gtidVal;
+      uint32_t identFlags;
+      if (parseIdentRef(s, identFlags))
+        return getOrCreateIdent(module, builder, loc, ctx, identFlags);
+      if (s == "%gtid")   return gtidVal;
       if (s == "%lb")     return plb;
       if (s == "%ub")     return pub;
       if (s == "%step")   return step;    // actual loop step
