@@ -36,7 +36,7 @@ func.func @parallel_with_barrier() {
 // CHECK-DAG: llvm.mlir.addressof @__omp_src_loc_default
 
 // The fork takes the default ident; the barrier takes the explicit-barrier one:
-// CHECK-DAG: llvm.mlir.addressof @__omp_ident_2
-// CHECK-DAG: llvm.mlir.addressof @__omp_ident_22
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_2 :
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_22 :
 // CHECK-DAG: @__kmpc_fork_call
 // CHECK-DAG: @__kmpc_barrier

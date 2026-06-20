@@ -276,7 +276,7 @@ static Value getOrCreateIdent(ModuleOp module, OpBuilder &builder, Location loc,
       LLVM::Linkage::Private, srcName, StringAttr::get(ctx, data));
   }
 
-  std::string identName = ("__omp_ident_" + llvm::utohexstr(flags, true)).str();
+  std::string identName = "__omp_ident_" + llvm::utohexstr(flags, true);
   if (!module.lookupSymbol(identName)) {
     auto identStructTy = LLVM::LLVMStructType::getLiteral(
       ctx, {i32t, i32t, i32t, i32t, ptr});

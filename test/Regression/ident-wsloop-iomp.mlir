@@ -45,9 +45,9 @@ func.func @parallel_wsloop() {
 // CHECK-DAG: llvm.mlir.constant(22 : i32)
 
 // init/fini take the work-loop ident; the implicit barrier its own; fork the default:
-// CHECK-DAG: llvm.mlir.addressof @__omp_ident_202
-// CHECK-DAG: llvm.mlir.addressof @__omp_ident_42
-// CHECK-DAG: llvm.mlir.addressof @__omp_ident_2
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_202 :
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_42 :
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_2 :
 // CHECK-DAG: @__kmpc_for_static_init_4
 // CHECK-DAG: @__kmpc_for_static_fini
 // CHECK-DAG: @__kmpc_barrier
