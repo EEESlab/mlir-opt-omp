@@ -1,7 +1,14 @@
-# Integration tests — end-to-end correctness
+# Integration tests — end-to-end correctness & performance
 
-`run_correctness.sh` compiles each PolyBench kernel twice and checks that the
-two runs produce **bit-identical** array dumps:
+Two drivers share one compile pipeline (`common.sh`), against the same
+PolyBench kernels and the same `config.env`:
+
+- **`run_correctness.sh`** — compiles each kernel twice and checks the two runs
+  produce **bit-identical** array dumps.
+- **`run_performance.sh`** — times our tool against the native compiler and
+  reports speedups (see [Performance](#performance) below).
+
+In both, the two compilers are:
 
 - **ref** — a stock OpenMP compiler (clang for `iomp`, gcc for `libgomp`)
 - **opt** — the full CIR/MLIR pipeline through `mlir-opt-omp`
@@ -72,6 +79,50 @@ results/
 
 The script exits non-zero if any kernel is not PASS, so it can gate CI.
 
+## Performance
+
+`run_performance.sh` builds a 2×2 matrix per kernel and times each cell with
+PolyBench's cycle-accurate TSC timer:
+
+|              | sequential (1T)        | parallel (`$THREADS`)        |
+|--------------|------------------------|------------------------------|
+| native (ref) | `ref_seq` (`-O3`)      | `ref_par` (`-O3 -fopenmp`)   |
+| our tool(opt)| `opt_seq` (no omp)     | `opt_par` (CIR/MLIR -fopenmp)|
+
+Each cell is run `REPS` times (default 5); the min and max are dropped and the
+mean ± std-dev of the rest is reported. A cell whose relative std-dev exceeds
+`VARIANCE_ACCEPTED`% (default 5) is flagged as noisy.
+
+Reported ratios:
+
+| Metric              | Formula             | Meaning                              |
+|---------------------|---------------------|--------------------------------------|
+| `speedup_native`    | `ref_seq / ref_par` | native self seq→par speedup          |
+| `speedup_opt`       | `opt_seq / opt_par` | our self seq→par speedup             |
+| `opt_vs_native_par` | `ref_par / opt_par` | **headline**: our parallel vs native (>1 = we win) |
+| `opt_vs_native_seq` | `ref_seq / opt_seq` | same, sequential                     |
+
+The suite summary uses the **geometric mean** of each ratio across all kernels
+(the standard way to average benchmark speedups).
+
+```sh
+./run_performance.sh                                   # bundled kernels
+RUNTIME=libgomp DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
+./run_performance.sh linear-algebra/blas/gemm/gemm-omp.c   # single kernel
+SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
+```
+
+> Use a larger `DATASET` (`LARGE_DATASET`/`EXTRALARGE_DATASET`) for the parallel
+> numbers to mean anything — `MINI_DATASET` is dominated by thread-spawn cost.
+
+Output:
+
+```
+results/
+  results_performance.csv         # per-kernel rows + a GEOMEAN summary row
+  <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
+```
+
 ## Configuration reference
 
 All variables, with their defaults, are documented in
@@ -86,9 +137,11 @@ All variables, with their defaults, are documented in
 | `INC_OMP`      | OpenMP headers for the clang→CIR front-end           |
 | `RUNTIME`      | `iomp` or `libgomp`                                  |
 | `DATASET`      | PolyBench dataset size macro                         |
-| `THREADS`      | `OMP_NUM_THREADS`                                    |
+| `THREADS`      | thread count for parallel runs                       |
 | `SUITE`        | `bundled` (vendored kernels) or `full`              |
 | `KERNELS`      | explicit space-separated kernel list (overrides `SUITE`) |
+| `REPS`         | (perf) timed runs per cell — min+max dropped         |
+| `VARIANCE_ACCEPTED` | (perf) warn if a cell's relative std-dev exceeds this % |
 
 Strict FP flags (`-ffp-contract=off`, no auto-vectorisation) are enabled by
 default and must match between ref and opt — without them FMA contraction and
