@@ -93,6 +93,12 @@ Each cell is run `REPS` times (default 5); the min and max are dropped and the
 mean ± std-dev of the rest is reported. A cell whose relative std-dev exceeds
 `VARIANCE_ACCEPTED`% (default 5) is flagged as noisy.
 
+The sequential cells are compiled **without** `-fopenmp` (the `#pragma omp` are
+ignored → serial code). PolyBench kernels that call `omp_get_thread_num()` /
+`omp_get_num_threads()` unconditionally would then fail to link, so the seq
+builds pull in `omp_stubs.c` — serial OpenMP stubs (one thread, id 0). No
+OpenMP runtime is attached to the sequential baseline.
+
 Reported ratios:
 
 | Metric              | Formula             | Meaning                              |
@@ -112,8 +118,9 @@ RUNTIME=libgomp DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
 ```
 
-> Use a larger `DATASET` (`LARGE_DATASET`/`EXTRALARGE_DATASET`) for the parallel
-> numbers to mean anything — `MINI_DATASET` is dominated by thread-spawn cost.
+> The perf script defaults to `DATASET=LARGE_DATASET` (correctness defaults to
+> `MINI`). At `MINI` the parallel run is pure thread-spawn overhead and the
+> speedups are meaningless — keep it `LARGE`/`EXTRALARGE` for real numbers.
 
 Output:
 

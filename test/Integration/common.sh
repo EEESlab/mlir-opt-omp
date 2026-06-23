@@ -66,10 +66,14 @@ INC="${POLYBENCH_UTIL:-$POLYBENCH/utilities}"
 RULES="${RULES:-$COMMON_DIR/../../rules.dsl}"
 # OpenMP headers used by the clang->CIR front-end. Adjust to your GCC version.
 INC_OMP="${INC_OMP:-/usr/lib/gcc/x86_64-linux-gnu/13/include}"
+# Serial OpenMP stubs, linked into the sequential builds (see compile_*).
+OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
 
 # --- Run parameters --------------------------------------------------------
+# DATASET_DEFAULT lets a driver pick its own default (e.g. LARGE for perf)
+# while still letting the user/config.env override via DATASET.
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp
-DATASET="${DATASET:-MINI_DATASET}"
+DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
 SUITE="${SUITE:-bundled}"            # bundled | full
 
 export OMP_PLACES="${OMP_PLACES:-cores}"
@@ -241,10 +245,13 @@ compile_opt() {
         -D"$DATASET" $POLYBENCH_CFLAGS \
         -o "$tmpdir/polybench.o" || { rm -rf "$tmpdir"; return 1; }
 
-    # 9) link
+    # 9) link — seq builds also pull in the serial OpenMP stubs so kernels that
+    #    call omp_get_thread_num()/omp_get_num_threads() unconditionally resolve.
+    local stub=""
+    [ "$omp" = "off" ] && stub="$OMP_STUBS_SRC"
     "$CLANG" -O3 $CLANG_STRICT_FP \
         $link_omp -no-pie \
-        "$tmpdir/$name.o" "$tmpdir/polybench.o" \
+        "$tmpdir/$name.o" "$tmpdir/polybench.o" $stub \
         $link_libs $POLYBENCH_LFLAGS -o "$outdir/$binname" \
         || { rm -rf "$tmpdir"; return 1; }
 
@@ -259,15 +266,19 @@ compile_ref() {
     local src="$1" outdir="$2" binname="$3" omp="${4:-on}"
     mkdir -p "$outdir"
 
-    local omp_flag=""
-    [ "$omp" = "on" ] && omp_flag="-fopenmp"
+    local omp_flag="" stub=""
+    if [ "$omp" = "on" ]; then
+        omp_flag="-fopenmp"
+    else
+        stub="$OMP_STUBS_SRC"   # serial OpenMP stubs for the seq baseline
+    fi
 
     echo "  compiling $(basename "${src%.c}") (ref, $REF_CC, omp=$omp) ..."
 
     "$REF_CC" -O3 $REF_FP $omp_flag \
         -I"$INC" -I"$(dirname "$src")" $REF_OMP_INC \
         -D"$DATASET" $POLYBENCH_CFLAGS \
-        "$src" "$INC/polybench.c" \
+        "$src" "$INC/polybench.c" $stub \
         -lm $POLYBENCH_LFLAGS -o "$outdir/$binname" || return 1
     [ -f "$outdir/$binname" ]
 }

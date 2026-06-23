@@ -39,6 +39,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Perf wants a real workload by default; MINI is dominated by thread-spawn cost.
+# DATASET / config.env still override this (see common.sh).
+DATASET_DEFAULT="LARGE_DATASET"
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
 
