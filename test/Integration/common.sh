@@ -33,10 +33,25 @@ else
 fi
 
 # --- Optional per-machine config -------------------------------------------
-# config.env is git-ignored; values already in the environment win over it.
+# config.env is git-ignored. Precedence: inline env (FOO=bar ./script) wins,
+# then config.env, then the built-in defaults below.
+#
+# config.env uses plain assignments (FOO="..."), which would clobber an inline
+# override when sourced. So we snapshot any knob already set in the environment,
+# source config.env, then re-apply the snapshot — making inline overrides win.
 if [ -f "$COMMON_DIR/config.env" ]; then
+    __preset=""
+    for __v in LLVM_BIN OMP_TOOL_BIN CLANG GCC OPT LLC CIR_OPT MLIR_OPT \
+               MLIR_TRANSLATE MLIR_OPT_OMP POLYBENCH POLYBENCH_UTIL RULES \
+               INC_OMP OUTDIR RUNTIME DATASET THREADS SUITE KERNELS REPS \
+               VARIANCE_ACCEPTED POLYBENCH_LFLAGS CLANG_STRICT_FP GCC_STRICT_FP \
+               OMP_PLACES OMP_PROC_BIND; do
+        [ -n "${!__v+x}" ] && __preset="$__preset $__v=$(printf '%q' "${!__v}")"
+    done
     # shellcheck disable=SC1091
     set -a; . "$COMMON_DIR/config.env"; set +a
+    [ -n "$__preset" ] && eval "$__preset"   # inline overrides reclaim priority
+    unset __preset __v
 fi
 
 # --- Tool locations --------------------------------------------------------
@@ -95,6 +110,11 @@ fi
 # kernels diverge even though both binaries are IEEE-correct.
 CLANG_STRICT_FP="${CLANG_STRICT_FP:--ffp-contract=off -fno-vectorize -fno-slp-vectorize}"
 GCC_STRICT_FP="${GCC_STRICT_FP:--ffp-contract=off -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize}"
+
+# Silence the noisy (harmless) warnings clang emits when it parses GCC's omp.h
+# (the __malloc__ attribute signature it does not implement). Both clang and
+# gcc accept -Wno-ignored-attributes.
+WARN_SUPPRESS="${WARN_SUPPRESS:--Wno-ignored-attributes}"
 
 # --- Per-runtime knobs -----------------------------------------------------
 case "$RUNTIME" in
@@ -201,7 +221,7 @@ compile_opt() {
     echo "  compiling $name (opt, runtime=$RUNTIME, omp=$omp) ..."
 
     # 1) clang -> CIR
-    "$CLANG" -S $CLANG_STRICT_FP \
+    "$CLANG" -S $CLANG_STRICT_FP $WARN_SUPPRESS \
         -Xclang -fclangir -Xclang -emit-cir $omp_cir \
         -I"$INC" -I"$(dirname "$src")" -I"$INC_OMP" \
         -D"$DATASET" $POLYBENCH_CFLAGS \
@@ -240,7 +260,7 @@ compile_opt() {
         -o "$tmpdir/$name.o" || { rm -rf "$tmpdir"; return 1; }
 
     # 8) polybench support object
-    "$CLANG" -O3 $CLANG_STRICT_FP \
+    "$CLANG" -O3 $CLANG_STRICT_FP $WARN_SUPPRESS \
         -c "$INC/polybench.c" -I"$INC" \
         -D"$DATASET" $POLYBENCH_CFLAGS \
         -o "$tmpdir/polybench.o" || { rm -rf "$tmpdir"; return 1; }
@@ -275,7 +295,7 @@ compile_ref() {
 
     echo "  compiling $(basename "${src%.c}") (ref, $REF_CC, omp=$omp) ..."
 
-    "$REF_CC" -O3 $REF_FP $omp_flag \
+    "$REF_CC" -O3 $REF_FP $WARN_SUPPRESS $omp_flag \
         -I"$INC" -I"$(dirname "$src")" $REF_OMP_INC \
         -D"$DATASET" $POLYBENCH_CFLAGS \
         "$src" "$INC/polybench.c" $stub \
