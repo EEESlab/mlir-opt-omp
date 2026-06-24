@@ -44,7 +44,10 @@ fail=0
 # mlir-opt-omp); output is a libgomp-linked executable.
 mlir_to_bin() {
     local in="$1" out="$2"
+    # --allow-unregistered-dialect: CIR-lowered modules carry a dlti.dl_spec
+    # attribute (dlti dialect isn't registered in mlir-opt-omp); parse it opaque.
     "$MLIR_OPT_OMP" \
+        --allow-unregistered-dialect \
         --omp-lower-dsl="$RULES" --omp-lower-runtime=libgomp \
         --omp-to-omp-lower --omp-outline --omp-lower-plan \
         "$in" > "$TMP/s2.mlir" || return 1
