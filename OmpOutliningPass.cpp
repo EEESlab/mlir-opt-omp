@@ -165,6 +165,14 @@ static void replaceUsesInRegion(Region &region, Value oldVal, Value newVal) {
       use.set(newVal);
 }
 
+// The single clause operand carried by a ConstructOp, if any: num_threads for
+// parallel, if_clause for task.  Which one it is follows from the construct
+// kind and the symbolic arg name being resolved in the plan.
+static Value getClauseOperand(ConstructOp op) {
+  auto ops = op.getClauseOperands();
+  return ops.empty() ? Value() : ops[0];
+}
+
 static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
   auto dict = op.getPropDict();
   if (!dict) return "";
@@ -772,8 +780,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             v = gtidAtCallSite
               ? gtidAtCallSite
               : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
-          else if (s == "num_threads" && op.getNumThreads())
-            v = op.getNumThreads();
+          else if (s == "num_threads" && getClauseOperand(op))
+            v = getClauseOperand(op);
           else
             v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
         } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
@@ -867,9 +875,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       // Build call args from DSL invoke args, resolving symbolic names:
       //   "body"               → fnPtrCast  (the outlined function pointer)
       //   "env_ptr"            → structAlloca (the capture struct pointer)
-      //   "num_threads"        → op.getNumThreads() (SSA operand)
+      //   "num_threads"        → clause operand (SSA value)
       //   "env_size"/"env_align" → i64 constants (task capture struct)
-      //   "if_clause"          → op.getIfClause(), as i8 (C _Bool)
+      //   "if_clause"          → clause operand, as i8 (C _Bool)
       //   "null"               → null pointer
       //   bool literal         → i8 constant (C _Bool)
       //   integer              → i32 constant
@@ -885,18 +893,18 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
               v = fnPtrCast;
             else if (s == "env_ptr")
               v = structAlloca;
-            else if (s == "num_threads" && op.getNumThreads())
-              v = op.getNumThreads();
+            else if (s == "num_threads" && getClauseOperand(op))
+              v = getClauseOperand(op);
             else if (s == "env_size")
               v = LLVM::ConstantOp::create(builder, loc, i64t,
                     IntegerAttr::get(i64t, (int64_t)envSize));
             else if (s == "env_align")
               v = LLVM::ConstantOp::create(builder, loc, i64t,
                     IntegerAttr::get(i64t, (int64_t)envAlign));
-            else if (s == "if_clause" && op.getIfClause()) {
+            else if (s == "if_clause" && getClauseOperand(op)) {
               // Normalise the if-clause SSA value (typically i1) to i8 to
               // match the C `_Bool` parameter of GOMP_task.
-              Value ifv = op.getIfClause();
+              Value ifv = getClauseOperand(op);
               if (ifv.getType() != i8t) {
                 unsigned bw = ifv.getType().getIntOrFloatBitWidth();
                 ifv = bw < 8

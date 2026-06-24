@@ -70,7 +70,7 @@ def PlanEmitAttr : OmpLowering_Attr<"PlanEmit", "emit"> {
 // ---------------------------------------------------------------------------
 
 def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
-    [NoMemoryEffect, AttrSizedOperandSegments]> {
+    [NoMemoryEffect]> {
 
   let summary = "Encodes a fully-evaluated LoweringPlan as MLIR attributes";
 
@@ -78,9 +78,13 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     // Clause operands. Carried as real SSA operands so the values from the
     // original omp.* op survive into OmpOutliningPass — looking them up by
     // symbolic name in the plan would otherwise lose the SSA reference.
-    // (Two optional operands require AttrSizedOperandSegments above.)
-    Optional<AnyType>:$num_threads,
-    Optional<AnyType>:$if_clause,
+    //
+    // A single variadic list (rather than several Optional operands) avoids
+    // AttrSizedOperandSegments, whose generated verifier is broken when the
+    // dialect disables usePropertiesForAttributes.  At most one operand is
+    // present today: num_threads (parallel) or if_clause (task); the construct
+    // kind and the plan's symbolic arg name disambiguate which it is.
+    Variadic<AnyType>:$clause_operands,
 
     StrAttr:$runtime,
     // NOTE: 'construct' is a reserved TableGen keyword so the accessor is
@@ -105,8 +109,7 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     `pre` `=` $pre `,`
     `invoke` `=` $invoke `,`
     `post` `=` $post
-    (`,` `num_threads` `=` $num_threads^ `:` type($num_threads))?
-    (`,` `if_clause` `=` $if_clause^ `:` type($if_clause))?
+    (`,` `clause_operands` `=` `(` $clause_operands^ `:` type($clause_operands) `)`)?
     $body
     attr-dict
   }];

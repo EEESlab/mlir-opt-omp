@@ -200,9 +200,14 @@ the shape mirrors libgomp (`closure` + `packed`) with a different callee.
     (non-null → `has(if_clause)` is true), else `null`.
   The actual `if` SSA value is **not** encoded in the context (its printed name
   is meaningless downstream); it rides as a real operand instead.
-- **`ConstructOp` gains an optional `if_clause` operand** alongside
-  `num_threads`. Two optional operands require the `AttrSizedOperandSegments`
-  trait. `emitConstructOp` / the `process` lambda thread the value through.
+- **`ConstructOp` carries clause operands in a single `Variadic`
+  (`clause_operands`)** rather than several `Optional` operands. At most one is
+  present today — `num_threads` (parallel) or `if_clause` (task) — and the
+  construct kind plus the plan's symbolic arg name disambiguate which it is.
+  (Two `Optional` operands would need `AttrSizedOperandSegments`, whose
+  generated verifier is broken when the dialect disables
+  `usePropertiesForAttributes`, so a single variadic is used instead.)
+  `emitConstructOp` / the `process` lambda thread the value through.
 - **Shared `injectFirstprivateUses` helper** (used by both `parallel` and
   `task`) injects `unrealized_conversion_cast` uses of firstprivate source vars
   into the region so `collectCaptures` finds them.

@@ -92,9 +92,14 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
     return ArrayAttr::get(ctx, attrs);
   };
 
+  // At most one clause operand is present: num_threads (parallel) or
+  // if_clause (task).  Both ride a single variadic operand list.
+  SmallVector<Value> clauseOperands;
+  if (numThreads) clauseOperands.push_back(numThreads);
+  if (ifClause)   clauseOperands.push_back(ifClause);
+
   auto constructOp = ConstructOp::create(builder, loc,
-    numThreads,
-    ifClause,
+    clauseOperands,
     builder.getStringAttr(plan.runtime),
     builder.getStringAttr(plan.construct),
     propDict,
