@@ -33,6 +33,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/SetVector.h"
@@ -360,7 +361,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         isPtrAllocaCapture(cap, body))
       ptrAllocaCaptures.insert(cap);
 
-  std::string fnName = "outlined_parallel_" + std::to_string(counter++);
+  // Name the outlined function after the construct ("outlined_parallel_N",
+  // "outlined_task_N", ...).  Parallel keeps its historical name.
+  std::string fnName =
+      "outlined_" + op.getConstructName().str() + "_" + std::to_string(counter++);
 
   // Build outlined function argument types.
   SmallVector<Type> fnArgTypes;
@@ -801,10 +805,12 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           fieldTypes.push_back(cap.getType());
       }
 
+      // Capture-struct type — also needed below for env_size / env_align (task).
+      auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+
       // Build the capture struct (same for all packed runtimes).
       Value structAlloca;
       if (!captures.empty()) {
-        auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
         Value one64 = LLVM::ConstantOp::create(builder, loc,
           IntegerType::get(ctx, 64),
           IntegerAttr::get(IntegerType::get(ctx, 64), 1));
@@ -845,12 +851,29 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       Value fnPtrCast = UnrealizedConversionCastOp::create(
         builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
 
+      // Capture-struct size/alignment for GOMP_task's `long arg_size,
+      // long arg_align` (libgomp memcpys arg_size bytes into task-private
+      // memory when cpyfn is NULL).  Computed via the module DataLayout;
+      // alignment falls back to 16 (a valid power-of-2 ≥ any field's align).
+      auto i64t = IntegerType::get(ctx, 64);
+      auto i8t  = IntegerType::get(ctx, 8);
+      DataLayout dataLayout(module);
+      uint64_t envSize  = captures.empty()
+        ? 0u : dataLayout.getTypeSize(structTy).getFixedValue();
+      uint64_t envAlign = captures.empty()
+        ? 1u : dataLayout.getTypeABIAlignment(structTy);
+      if (envAlign == 0) envAlign = 16;
+
       // Build call args from DSL invoke args, resolving symbolic names:
-      //   "body"        → fnPtrCast  (the outlined function pointer)
-      //   "env_ptr"     → structAlloca (the capture struct pointer)
-      //   "num_threads" → op.getNumThreads() (SSA operand from omp.parallel)
-      //   integer       → i32 constant
-      //   other str     → undef ptr
+      //   "body"               → fnPtrCast  (the outlined function pointer)
+      //   "env_ptr"            → structAlloca (the capture struct pointer)
+      //   "num_threads"        → op.getNumThreads() (SSA operand)
+      //   "env_size"/"env_align" → i64 constants (task capture struct)
+      //   "if_clause"          → op.getIfClause(), as i8 (C _Bool)
+      //   "null"               → null pointer
+      //   bool literal         → i8 constant (C _Bool)
+      //   integer              → i32 constant
+      //   other str            → undef ptr
       for (auto attr : op.getInvoke()) {
         auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
         if (!ca) continue;
@@ -858,14 +881,36 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           Value v;
           if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
             llvm::StringRef s = sa.getValue();
-            if (s == "body" || s == "outlined_parallel")
+            if (s == "body" || s == "outlined_parallel" || s == "outlined_task")
               v = fnPtrCast;
             else if (s == "env_ptr")
               v = structAlloca;
             else if (s == "num_threads" && op.getNumThreads())
               v = op.getNumThreads();
+            else if (s == "env_size")
+              v = LLVM::ConstantOp::create(builder, loc, i64t,
+                    IntegerAttr::get(i64t, (int64_t)envSize));
+            else if (s == "env_align")
+              v = LLVM::ConstantOp::create(builder, loc, i64t,
+                    IntegerAttr::get(i64t, (int64_t)envAlign));
+            else if (s == "if_clause" && op.getIfClause()) {
+              // Normalise the if-clause SSA value (typically i1) to i8 to
+              // match the C `_Bool` parameter of GOMP_task.
+              Value ifv = op.getIfClause();
+              if (ifv.getType() != i8t) {
+                unsigned bw = ifv.getType().getIntOrFloatBitWidth();
+                ifv = bw < 8
+                  ? LLVM::ZExtOp::create(builder, loc, i8t, ifv).getResult()
+                  : LLVM::TruncOp::create(builder, loc, i8t, ifv).getResult();
+              }
+              v = ifv;
+            } else if (s == "null")
+              v = LLVM::ZeroOp::create(builder, loc, ptrTy(ctx));
             else
               v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+          } else if (auto ba = llvm::dyn_cast<BoolAttr>(argAttr)) {
+            v = LLVM::ConstantOp::create(builder, loc, i8t,
+                  IntegerAttr::get(i8t, ba.getValue() ? 1 : 0));
           } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
             v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
               IntegerAttr::get(i32Ty(ctx), ia.getInt()));

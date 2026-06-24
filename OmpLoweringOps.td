@@ -70,7 +70,7 @@ def PlanEmitAttr : OmpLowering_Attr<"PlanEmit", "emit"> {
 // ---------------------------------------------------------------------------
 
 def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
-    [NoMemoryEffect]> {
+    [NoMemoryEffect, AttrSizedOperandSegments]> {
 
   let summary = "Encodes a fully-evaluated LoweringPlan as MLIR attributes";
 
@@ -78,7 +78,9 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     // Clause operands. Carried as real SSA operands so the values from the
     // original omp.* op survive into OmpOutliningPass — looking them up by
     // symbolic name in the plan would otherwise lose the SSA reference.
+    // (Two optional operands require AttrSizedOperandSegments above.)
     Optional<AnyType>:$num_threads,
+    Optional<AnyType>:$if_clause,
 
     StrAttr:$runtime,
     // NOTE: 'construct' is a reserved TableGen keyword so the accessor is
@@ -104,6 +106,7 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     `invoke` `=` $invoke `,`
     `post` `=` $post
     (`,` `num_threads` `=` $num_threads^ `:` type($num_threads))?
+    (`,` `if_clause` `=` $if_clause^ `:` type($if_clause))?
     $body
     attr-dict
   }];
