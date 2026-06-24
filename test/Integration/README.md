@@ -8,6 +8,15 @@ PolyBench kernels and the same `config.env`:
 - **`run_performance.sh`** — times our tool against the native compiler and
   reports speedups (see [Performance](#performance) below).
 
+A third, lighter driver covers the task construct:
+
+- **`run_tasks.sh`** — end-to-end smoke test for `omp.task` (libgomp). It lowers
+  a hand-written `parallel { task { *p = 42 } }` MLIR module
+  ([`tasks/task_nested.mlir`](tasks/task_nested.mlir)) through `mlir-opt-omp` +
+  the MLIR/LLVM tools, links `-lgomp`, runs it, and asserts the output is `42`.
+  It starts from MLIR (not C), so it does not need the CIR front-end to emit
+  `omp.task`. Run: `./run_tasks.sh`.
+
 In both, the two compilers are:
 
 - **ref** — a stock OpenMP compiler (clang for `iomp`, gcc for `libgomp`)

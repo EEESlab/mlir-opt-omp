@@ -13,8 +13,11 @@ Status:
 | pmsis   | planned (phase 3, API to be defined) |
 
 Decisions baked into v1: **closure/packed reuse** for libgomp, **DataLayout
-with fallback-16** for the env-struct alignment, and **top-level tasks only**
-(tasks nested in a `parallel` or another `task` are a documented follow-up).
+with fallback-16** for the env-struct alignment.
+
+v2 (libgomp): **nested tasks** — tasks inside a `parallel` (the realistic
+`parallel { ... task ... }` pattern) or inside another `task` — plus an
+end-to-end run-against-libgomp integration test.
 
 ---
 
@@ -211,8 +214,25 @@ the shape mirrors libgomp (`closure` + `packed`) with a different callee.
 - **Shared `injectFirstprivateUses` helper** (used by both `parallel` and
   `task`) injects `unrealized_conversion_cast` uses of firstprivate source vars
   into the region so `collectCaptures` finds them.
+- **Nested tasks (v2)** — *every* `omp.task` is collected, including those
+  inside a `parallel` or another `task`. Parallels are converted first: moving a
+  parallel body into a `ConstructOp` region carries any nested `omp.task` with
+  it (the op pointer stays valid), and the task is then converted into a
+  *nested* `ConstructOp`. Pre-order walk guarantees an outer task is processed
+  before a task nested inside it.
 
 ### 5.2 `OmpOutliningPass.cpp`
+
+`OmpOutliningPass` already `walk`s nested `ConstructOp`s and processes them in
+pre-order, so the outer parallel is outlined before the inner task: the parallel
+body (with the nested task `ConstructOp`) moves into `outlined_parallel_N`, the
+parallel's `collectCaptures` pulls in anything the task uses from outside, and
+`replaceUsesInRegion` rewrites those uses *inside* the task region too. When the
+task is then outlined, its captures resolve to the unpacked values living in
+`outlined_parallel_N`. No special nesting code is required beyond collecting the
+tasks. (The shared `counter` is global, so the inner task's function is e.g.
+`outlined_task_1` when the parallel took `0`.)
+
 
 - Outlined function name is now `outlined_<construct>_N`
   (`outlined_parallel_N` unchanged; tasks become `outlined_task_N`).
@@ -286,6 +306,16 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   `--omp-to-omp-lower --omp-outline` on a task with a capture and an `if`
   clause: checks the `outlined_task_0` closure, the `i1 → i8` widening of the
   if-clause, and the `GOMP_task` call.
+- **`test/Regression/task-nested-libgomp.mlir`** — a `parallel { task }`:
+  checks the task is outlined into its own closure, the `GOMP_task` call lands
+  inside the parallel's outlined function, and the outer function forks via
+  `GOMP_parallel`.
+- **`test/Integration/run_tasks.sh`** + `tasks/task_nested.mlir` — end-to-end:
+  lowers `parallel { task { *p = 42 } }` through the full pipeline, links
+  `-lgomp`, runs it, and asserts the program prints `42` (the task's write to
+  the shared pointer is visible after the parallel region's implicit barrier).
+  Starts from MLIR (not C) so it does not depend on the CIR front-end emitting
+  `omp.task`.
 - Future (iomp): `__kmpc_omp_task_alloc` + `__kmpc_omp_task` emission, the
   `task_entry(gtid, task_t)` signature, and the `if0` begin/complete path.
 
@@ -293,9 +323,6 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 
 ## 8. Non-goals / deferred
 
-- **Nested tasks** (inside a `parallel` or another `task`). v1 handles only
-  top-level tasks; nested support depends on outlining order of nested
-  construct ops and needs dedicated tests.
 - **`depend`, `priority`, `untied`, `mergeable`, `final`** clauses — currently
   hard-wired (`depend = null`, `priority = 0`, `flags = 0`). Additive later.
 - **`taskwait` / `taskgroup` / `taskloop`** — separate constructs, out of scope.
@@ -307,11 +334,13 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 
 ## 9. Implementation order
 
-1. **libgomp** — DSL `construct task`; `ConstructOp` `if_clause` operand
-   (+`AttrSizedOperandSegments`); `extractTaskContext` + task collection;
-   packed-invoke resolver cases (`env_size`/`env_align`/`if_clause`/`null`/bool);
-   DataLayout size/align; regression tests. **(done)**
-2. **iomp** — new `task_entry`/`shareds` outline branch; `task_alloc` +
+1. **libgomp v1** — DSL `construct task`; `ConstructOp` clause operand;
+   `extractTaskContext` + top-level task collection; packed-invoke resolver
+   cases (`env_size`/`env_align`/`if_clause`/`null`/bool); DataLayout size/align;
+   `null` DSL literal; regression tests. **(done)**
+2. **libgomp v2** — nested tasks (collect every `omp.task`); nested-task
+   regression test; end-to-end `run_tasks.sh` integration test. **(done)**
+3. **iomp** — new `task_entry`/`shareds` outline branch; `task_alloc` +
    `task`/`if0` lowering; flag tokens; tests.
-3. **pmsis** — define the embedded task API, then map (closure-style if
+4. **pmsis** — define the embedded task API, then map (closure-style if
    available); tests.

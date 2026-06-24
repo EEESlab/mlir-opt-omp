@@ -272,13 +272,13 @@ struct OmpToOmpLowerPass
     SmallVector<omp::BarrierOp>  barriers;
     SmallVector<omp::TaskOp>     tasks;
     module.walk([&](omp::ParallelOp op) { parallels.push_back(op); });
-    // TODO: only outline top-level tasks are implemented.
-    // Nested tasks are a documented follow-up.
-    module.walk([&](omp::TaskOp op) {
-      if (!op->getParentOfType<omp::ParallelOp>() &&
-          !op->getParentOfType<omp::TaskOp>())
-        tasks.push_back(op);
-    });
+    // Collect every task, including those nested in a parallel (the common
+    // `parallel { ... task ... }` pattern) or in another task.  Parallels are
+    // processed first, moving their body — with any nested task ops — into a
+    // ConstructOp region; the task op pointers stay valid and are converted
+    // afterwards into nested ConstructOps.  Pre-order walk guarantees an outer
+    // task is processed before a task nested inside it.
+    module.walk([&](omp::TaskOp op) { tasks.push_back(op); });
     // Only collect wsloops and barriers that are NOT nested inside a parallel.
     // Those inside a parallel are part of its body region and will be handled
     // by the outlining pass after the parallel body is moved.
