@@ -310,12 +310,13 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   checks the task is outlined into its own closure, the `GOMP_task` call lands
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
-- **`test/Integration/run_tasks.sh`** + `tasks/task_nested.mlir` — end-to-end:
-  lowers `parallel { task { *p = 42 } }` through the full pipeline, links
-  `-lgomp`, runs it, and asserts the program prints `42` (the task's write to
-  the shared pointer is visible after the parallel region's implicit barrier).
-  Starts from MLIR (not C) so it does not depend on the CIR front-end emitting
-  `omp.task`.
+- **`test/Integration/run_tasks.sh`** — two end-to-end checks against real
+  libgomp, both expecting `42`:
+  - `tasks/task_nested.mlir` — hand-written `parallel { task { *p = 42 } }`
+    lowered + linked + run. MLIR input, so independent of the CIR front-end.
+  - `tasks/task_smoke.c` — same program in C, built with `gcc -fopenmp` (ref)
+    and through the full CIR / `mlir-opt-omp` pipeline (opt); outputs must
+    match. Depends on ClangIR emitting `omp.task`.
 - Future (iomp): `__kmpc_omp_task_alloc` + `__kmpc_omp_task` emission, the
   `task_entry(gtid, task_t)` signature, and the `if0` begin/complete path.
 

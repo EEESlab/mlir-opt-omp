@@ -1,22 +1,26 @@
 #!/bin/bash
 # =============================================================================
-# run_tasks.sh — end-to-end smoke test for omp.task lowering (libgomp).
+# run_tasks.sh — end-to-end smoke tests for omp.task lowering (libgomp).
 #
-# Unlike run_correctness.sh / run_performance.sh (PolyBench C kernels through
-# the CIR front-end), this driver starts from a hand-written MLIR module so it
-# does not depend on the front-end emitting omp.task.  It exercises the part we
-# own — the omp.task lowering — and then *runs* the result against real libgomp:
+# Two checks, both ending in a real run against libgomp:
 #
-#   tasks/task_nested.mlir  (parallel { task { *p = 42 } })
-#     -> mlir-opt-omp  (omp-to-omp-lower, omp-outline, omp-lower-plan)
-#     -> mlir-opt      (lower to the LLVM dialect)
-#     -> mlir-translate-> LLVM IR -> opt -O3 -> llc -> link -lgomp -> run
+#   [1] MLIR  — a hand-written parallel { task { *p = 42 } } module
+#               (tasks/task_nested.mlir) lowered through mlir-opt-omp and run.
+#               Independent of the CIR front-end (does not need clang to emit
+#               omp.task), so it always exercises the lowering we own.
 #
-# PASS iff the program prints 42 (the task's write to the shared int is visible
-# after the parallel region's implicit barrier).
+#   [2] C     — tasks/task_smoke.c compiled two ways and compared:
+#                 ref : gcc -fopenmp
+#                 opt : clang->CIR->cir-opt->mlir-opt-omp->...->llc->link -lgomp
+#               This is the full front-end path; it depends on ClangIR emitting
+#               omp.task.  If your clang-cir lacks task support, [2] fails at the
+#               front-end while [1] still passes.
 #
-# Tool locations come from common.sh (config.env / env vars), same as the other
-# drivers.  This test is libgomp-only.
+# A test PASSes iff the program prints 42 (the task's write to the shared int is
+# visible after the parallel region's implicit barrier).  For [2] the ref and
+# opt outputs must also match.
+#
+# Tool locations come from common.sh (config.env / env vars).  libgomp only.
 #
 # Usage:
 #   ./run_tasks.sh
@@ -30,50 +34,95 @@ RUNTIME=libgomp
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
 
-SRC="$SCRIPT_DIR/tasks/task_nested.mlir"
 EXPECTED="42"
-
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+fail=0
+
+# --- shared tail: a (post-front-end) MLIR module -> runnable binary ---------
+# Input is in the omp + llvm + func dialects (i.e. the state just before
+# mlir-opt-omp); output is a libgomp-linked executable.
+mlir_to_bin() {
+    local in="$1" out="$2"
+    "$MLIR_OPT_OMP" \
+        --omp-lower-dsl="$RULES" --omp-lower-runtime=libgomp \
+        --omp-to-omp-lower --omp-outline --omp-lower-plan \
+        "$in" > "$TMP/s2.mlir" || return 1
+    "$MLIR_OPT" "$TMP/s2.mlir" \
+        --canonicalize --cse --sccp --symbol-dce \
+        --loop-invariant-code-motion --canonicalize --cse \
+        --convert-arith-to-llvm --convert-func-to-llvm \
+        --reconcile-unrealized-casts \
+        -o "$TMP/s3.mlir" || return 1
+    "$MLIR_TRANSLATE" "$TMP/s3.mlir" --mlir-to-llvmir > "$TMP/a.ll" || return 1
+    "$OPT" -S -O3 "$TMP/a.ll" > "$TMP/a.opt.ll" || return 1
+    "$LLC" -O3 -relocation-model=pic -filetype=obj "$TMP/a.opt.ll" \
+        -o "$TMP/a.o" || return 1
+    "$CLANG" -no-pie "$TMP/a.o" -lgomp -lm -o "$out" || return 1
+}
+
+# --- C -> CIR -> LLVM-dialect MLIR (front-end half of the opt pipeline) -----
+c_to_mlir() {
+    local src="$1" out="$2"
+    local name; name="$(basename "${src%.c}")"
+    "$CLANG" -S $CLANG_STRICT_FP $WARN_SUPPRESS \
+        -Xclang -fclangir -Xclang -emit-cir -fopenmp \
+        -I"$INC_OMP" \
+        "$src" -o "$TMP/$name.cir" || return 1
+    "$CIR_OPT" "$TMP/$name.cir" --cir-to-llvm --reconcile-unrealized-casts \
+        -o "$out" || return 1
+    sed -i -E 's/cir\.[^,}]+,? ?//g' "$out"
+}
 
 echo "=== omp.task END-TO-END (libgomp) ==="
-echo "source: $SRC"
-echo "rules : $RULES"
+echo "rules: $RULES"
 echo ""
 
-echo "  [1/5] omp lowering (mlir-opt-omp) ..."
-"$MLIR_OPT_OMP" \
-    --omp-lower-dsl="$RULES" --omp-lower-runtime=libgomp \
-    --omp-to-omp-lower --omp-outline --omp-lower-plan \
-    "$SRC" > "$TMP/s2.mlir" || { echo "  ERROR: mlir-opt-omp failed"; exit 1; }
-
-echo "  [2/5] lower to LLVM dialect (mlir-opt) ..."
-"$MLIR_OPT" "$TMP/s2.mlir" \
-    --convert-arith-to-llvm --convert-func-to-llvm \
-    --reconcile-unrealized-casts \
-    -o "$TMP/s3.mlir" || { echo "  ERROR: mlir-opt failed"; exit 1; }
-
-echo "  [3/5] translate to LLVM IR (mlir-translate) ..."
-"$MLIR_TRANSLATE" "$TMP/s3.mlir" --mlir-to-llvmir > "$TMP/a.ll" \
-    || { echo "  ERROR: mlir-translate failed"; exit 1; }
-
-echo "  [4/5] opt -O3 / llc / link -lgomp ..."
-"$OPT" -S -O3 "$TMP/a.ll" > "$TMP/a.opt.ll" || { echo "  ERROR: opt failed"; exit 1; }
-"$LLC" -O3 -relocation-model=pic -filetype=obj "$TMP/a.opt.ll" -o "$TMP/a.o" \
-    || { echo "  ERROR: llc failed"; exit 1; }
-"$CLANG" -no-pie "$TMP/a.o" -lgomp -lm -o "$TMP/task_nested" \
-    || { echo "  ERROR: link failed"; exit 1; }
-
-echo "  [5/5] running ..."
-got="$(OMP_NUM_THREADS=2 "$TMP/task_nested")" || { echo "  ERROR: program crashed"; exit 1; }
-echo "      output: '$got' (expected '$EXPECTED')"
-echo ""
-
-if [ "$got" = "$EXPECTED" ]; then
-    echo -e "${GREEN}${BOLD}PASS${RESET}"
-    exit 0
+# --- [1] hand-written MLIR -------------------------------------------------
+echo "── [1] MLIR: parallel { task }"
+if mlir_to_bin "$SCRIPT_DIR/tasks/task_nested.mlir" "$TMP/mlir_bin"; then
+    got="$(OMP_NUM_THREADS=2 "$TMP/mlir_bin" 2>/dev/null || echo '<crash>')"
+    echo "     output: '$got' (expected '$EXPECTED')"
+    if [ "$got" = "$EXPECTED" ]; then
+        echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+    else
+        echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+    fi
 else
-    echo -e "${RED}${BOLD}FAIL${RESET}"
-    echo "  --- final LLVM IR ($TMP kept? no) ---"
-    exit 1
+    echo -e "     ${RED}${BOLD}ERROR${RESET}: lowering/build failed"; fail=1
 fi
+echo ""
+
+# --- [2] C through the CIR front-end (ref vs opt) --------------------------
+echo "── [2] C: parallel { task }  (ref=gcc vs opt=CIR pipeline)"
+CSRC="$SCRIPT_DIR/tasks/task_smoke.c"
+
+ref="<n/a>"
+if "$GCC" -O3 $GCC_STRICT_FP $WARN_SUPPRESS -fopenmp "$CSRC" -o "$TMP/c_ref"; then
+    ref="$(OMP_NUM_THREADS=4 "$TMP/c_ref" 2>/dev/null || echo '<crash>')"
+else
+    echo -e "     ${RED}ERROR${RESET}: ref (gcc) build failed"; fail=1
+fi
+
+opt="<n/a>"
+if c_to_mlir "$CSRC" "$TMP/c_s1.mlir" && mlir_to_bin "$TMP/c_s1.mlir" "$TMP/c_opt"; then
+    opt="$(OMP_NUM_THREADS=4 "$TMP/c_opt" 2>/dev/null || echo '<crash>')"
+else
+    echo -e "     ${RED}ERROR${RESET}: opt (CIR pipeline) build failed"; fail=1
+fi
+
+echo "     ref='$ref'  opt='$opt'  (expected '$EXPECTED')"
+if [ "$ref" = "$EXPECTED" ] && [ "$opt" = "$EXPECTED" ]; then
+    echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+else
+    echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+fi
+echo ""
+
+# --- summary ---------------------------------------------------------------
+if [ "$fail" -eq 0 ]; then
+    echo -e "${GREEN}${BOLD}ALL TASK TESTS PASSED${RESET}"
+else
+    echo -e "${RED}${BOLD}SOME TASK TESTS FAILED${RESET}"
+fi
+exit "$fail"
