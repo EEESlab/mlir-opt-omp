@@ -109,6 +109,7 @@ static ScopeImpl buildRootScope(const llvm::StringMap<Value> &ctx) {
 namespace {
 
 Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope);
+Expected<Value> evalExprOrBare(const Expr &expr, ScopeImpl &scope);
 Expected<bool>  evalPredicate(const Predicate &pred, ScopeImpl &scope);
 Expected<PlanAction> evalAction(const Action &action, ScopeImpl &scope);
 
@@ -196,6 +197,19 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
       return Value{l};
     },
     [&](const CallExpr &e) -> Expected<Value> {
+      // ident(<flag>): the flag is a bare token (e.g. work_loop), not a scope
+      // variable. Emit the symbolic ident reference "%ident:<flag>"; the pass
+      // maps the flag to the ident_t.flags bitmask. Bare `ident` (an IdentExpr,
+      // handled elsewhere) stays "%ident" / default flags.
+      if (e.name == "ident") {
+        std::string flag;
+        if (e.args.size() == 1) {
+          auto r = evalExprOrBare(e.args[0], scope);
+          if (!r) return r.takeError();
+          flag = valueToString(*r);
+        }
+        return makeStr(flag.empty() ? "%ident" : "%ident:" + flag);
+      }
       std::vector<Value> args;
       for (auto &a : e.args) {
         auto r = evalExpr(a, scope);

@@ -1,0 +1,11 @@
+@LIT_SITE_CFG_IN_HEADER@
+
+config.llvm_tools_dir = lit_config.substitute("@LLVM_TOOLS_DIR@")
+config.omp_lower_obj_root = "@OMP_LOWER_BINARY_DIR@"
+config.omp_lower_tools_dir = "@OMP_LOWER_TOOLS_DIR@"
+
+import lit.llvm
+lit.llvm.initialize(lit_config, config)
+
+# Let the main config (lit.cfg.py) do the real work.
+lit_config.load_config(config, "@OMP_LOWER_SOURCE_DIR@/test/lit.cfg.py")

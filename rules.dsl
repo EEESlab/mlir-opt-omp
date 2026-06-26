@@ -20,20 +20,20 @@
 
       construct barrier {
         invoke {
-          call "__kmpc_barrier"(ident, global_tid);
+          call "__kmpc_barrier"(ident(barrier_expl), global_tid);
         }
       }
 
       construct wsloop when schedule == static {
         pre {
-          call "__kmpc_for_static_init_4"(ident, global_tid, 34, last, lower, upper, stride, step, 1);
+          call "__kmpc_for_static_init_4"(ident(work_loop), global_tid, 34, last, lower, upper, stride, step, 1);
         }
         invoke {
           emit loop_body;
         }
         post {
-          call "__kmpc_for_static_fini"(ident, global_tid);
-          when not nowait => call "__kmpc_barrier"(ident, global_tid);
+          call "__kmpc_for_static_fini"(ident(work_loop), global_tid);
+          when not nowait => call "__kmpc_barrier"(ident(barrier_impl_for), global_tid);
         }
       }
     }

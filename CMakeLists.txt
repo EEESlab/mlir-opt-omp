@@ -9,6 +9,9 @@ include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
 
+# Default options passed to `lit` by the check-omp target.
+set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
+
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -98,3 +101,10 @@ target_link_libraries(mlir-opt-omp PRIVATE
   MLIRTransformUtils
   MLIRSupport
 )
+
+# ---------------------------------------------------------------------------
+# Regression test suite (lit + FileCheck)
+# ---------------------------------------------------------------------------
+set(OMP_LOWER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(OMP_LOWER_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+add_subdirectory(test)
