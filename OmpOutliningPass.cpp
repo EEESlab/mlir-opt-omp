@@ -16,7 +16,8 @@
 // 2. WSLOOP LOWERING — for each omp.wsloop surviving inside outlined funcs:
 //    - Extract context (schedule, nowait, bounds) from the omp.loop_nest
 //    - Call dsl::Evaluator::buildPlan(runtime, "wsloop", ctx) to get the plan
-//    - Emit runtime calls and an explicit loop, driven by the plan's invoke block
+//    - Emit plan.pre (runtime init call OR `emit thread_bounds` → block chunk),
+//      then an explicit loop, then plan.post
 
 #include "OmpOutliningPass.h"
 #include "OmpLoweringOps.h"
@@ -235,7 +236,7 @@ static Value getIdentAddr(ModuleOp module, OpBuilder &builder, Location loc,
 // ---------------------------------------------------------------------------
 
 static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
-                              llvm::StringRef runtimeName) {
+                              const dsl::LoweringPlan &barrierPlan) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -579,7 +580,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     termOp->erase();
   }
 
-  // Lower omp.barrier inside the outlined function — runtime-aware.
+  // Lower omp.barrier inside the outlined function — DSL-driven.
+  // The barrier plan (one per runtime) is built once in runOnOperation;
+  // here we only resolve the symbolic args (%ident, %gtid) at each call site.
   SmallVector<Operation *> barriers;
   for (auto &block : outlinedFn.getBody())
     for (auto &innerOp : block)
@@ -587,24 +590,39 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         barriers.push_back(&innerOp);
   for (auto *barrierOp : barriers) {
     OpBuilder bb(barrierOp);
-    if (runtimeName == "libgomp") {
-      auto decl = getOrInsertDecl(module, "GOMP_barrier", {}, bb);
-      func::CallOp::create(bb, barrierOp->getLoc(), decl, ValueRange{});
-    } else if (runtimeName == "pmsis") {
-      auto decl = getOrInsertDecl(module, "ext_pi_cl_team_barrier", {}, bb);
-      func::CallOp::create(bb, barrierOp->getLoc(), decl, ValueRange{});
-    } else {
-      // __kmpc_barrier(ident, gtid)
-      Value identAddr = getIdentAddr(module, bb, barrierOp->getLoc(), ctx);
-      Value gtidVal = LLVM::UndefOp::create(bb, barrierOp->getLoc(), i32Ty(ctx));
-      auto &fnEntry = outlinedFn.getBody().front();
-      if (fnEntry.getNumArguments() >= 2)
-        gtidVal = LLVM::LoadOp::create(bb, barrierOp->getLoc(), i32Ty(ctx),
-                                        fnEntry.getArgument(0));
-      SmallVector<Type> bt = {ptrTy(ctx), i32Ty(ctx)};
-      auto decl = getOrInsertDecl(module, "__kmpc_barrier", bt, bb);
-      func::CallOp::create(bb, barrierOp->getLoc(), decl,
-                            ValueRange{identAddr, gtidVal});
+    Location bloc = barrierOp->getLoc();
+
+    auto resolveArg = [&](const dsl::Value &v) -> Value {
+      if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
+        llvm::StringRef s = sv->value;
+        if (s == "%ident")
+          return getIdentAddr(module, bb, bloc, ctx);
+        if (s == "%gtid") {
+          // Microtask convention: first arg is ptr to i32 gtid.
+          auto &fnEntry = outlinedFn.getBody().front();
+          if (fnEntry.getNumArguments() >= 2)
+            return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
+                                         fnEntry.getArgument(0));
+          return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
+        }
+      }
+      if (auto *iv = std::get_if<dsl::IntVal>(&v))
+        return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
+          IntegerAttr::get(i32Ty(ctx), iv->value));
+      return LLVM::UndefOp::create(bb, bloc, ptrTy(ctx));
+    };
+
+    for (auto &action : barrierPlan.invoke) {
+      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+        SmallVector<Value> args;
+        SmallVector<Type>  types;
+        for (auto &av : ca->args) {
+          Value v = resolveArg(av);
+          args.push_back(v); types.push_back(v.getType());
+        }
+        auto decl = getOrInsertDecl(module, ca->callee, types, bb);
+        func::CallOp::create(bb, bloc, decl, args);
+      }
     }
     barrierOp->erase();
   }
@@ -694,12 +712,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         Value v;
         if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
           llvm::StringRef s = sa.getValue();
-          if (s == "ident" || s == "%ident")
+          if (s == "%ident")
             v = identVal;
-          else if (s == "global_tid" || s == "%tid")
+          else if (s == "%gtid")
             v = gtidAtCallSite
               ? gtidAtCallSite
               : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
+          else if (s == "num_threads" && op.getNumThreads())
+            v = op.getNumThreads();
           else
             v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
         } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
@@ -776,10 +796,11 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
 
       // Build call args from DSL invoke args, resolving symbolic names:
-      //   "body"    → fnPtrCast  (the outlined function pointer)
-      //   "env_ptr" → structAlloca (the capture struct pointer)
-      //   integer   → i32 constant
-      //   other str → undef ptr
+      //   "body"        → fnPtrCast  (the outlined function pointer)
+      //   "env_ptr"     → structAlloca (the capture struct pointer)
+      //   "num_threads" → op.getNumThreads() (SSA operand from omp.parallel)
+      //   integer       → i32 constant
+      //   other str     → undef ptr
       for (auto attr : op.getInvoke()) {
         auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
         if (!ca) continue;
@@ -791,6 +812,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
               v = fnPtrCast;
             else if (s == "env_ptr")
               v = structAlloca;
+            else if (s == "num_threads" && op.getNumThreads())
+              v = op.getNumThreads();
             else
               v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
           } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
@@ -972,13 +995,13 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   auto resolveCallArg = [&](const dsl::Value &v) -> Value {
     if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
       llvm::StringRef s = sv->value;
-      if (s == "%ident" || s == "ident")      return identAddr;
-      if (s == "%tid"   || s == "global_tid") return gtidVal;
-      if (s == "%lb"    || s == "lower")      return plb;
-      if (s == "%ub"    || s == "upper")      return pub;
-      if (s == "%step"  || s == "step")       return step;    // actual loop step
-      if (s == "%stride" || s == "stride")    return pstride; // output ptr for runtime
-      if (s == "last"   || s == "plast")      return plast;
+      if (s == "%ident")  return identAddr;
+      if (s == "%gtid")    return gtidVal;
+      if (s == "%lb")     return plb;
+      if (s == "%ub")     return pub;
+      if (s == "%step")   return step;    // actual loop step
+      if (s == "%stride") return pstride; // output ptr for runtime
+      if (s == "%last")   return plast;
       return LLVM::UndefOp::create(builder, loc, ptrT);
     }
     if (auto *iv = std::get_if<dsl::IntVal>(&v))
@@ -987,34 +1010,72 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     return LLVM::UndefOp::create(builder, loc, ptrT);
   };
 
-  // Determine loop lowering strategy from DSL invoke callee names.
-  bool isGOMP    = false;
-  bool isPMSIS   = false;
-  for (auto &action : plan.invoke) {
-    if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-      if (ca->callee.find("GOMP_loop") != std::string::npos) isGOMP  = true;
-      if (ca->callee == "core_bounds")                        isPMSIS = true;
-    }
-  }
+  // Read DSL properties that drive loop lowering strategy.
+  auto getStrProp = [&](llvm::StringRef key) -> std::string {
+    auto it = plan.properties.find(key.str());
+    if (it == plan.properties.end()) return "";
+    if (auto *sv = std::get_if<dsl::StrVal>(&it->second)) return sv->value;
+    return "";
+  };
 
-  if (isPMSIS || isGOMP) {
-    // -------------------------------------------------------------------------
-    // Static per-core wsloop: each thread computes its own [lb_core, ub_core)
-    // sub-range and runs a sequential loop over it — no runtime loop API.
-    // Shared by PMSIS (pi_core_id / pi_cl_nb_cores) and libgomp
-    // (omp_get_thread_num / omp_get_num_threads).  The exact distribution
-    // formula (DIVMOD, matching GCC's _omp_fn ABI) is documented at the
-    // computation site below.
-    // -------------------------------------------------------------------------
-    Value coreId;
-    Value numCores;
-    if (isPMSIS) {
-      coreId   = emitNoArgI32Call(module, builder, loc, "ext_pi_core_id");
-      numCores = emitNoArgI32Call(module, builder, loc, "ext_pi_cl_nb_cores");
-    } else {
-      coreId   = emitNoArgI32Call(module, builder, loc, "omp_get_thread_num");
-      numCores = emitNoArgI32Call(module, builder, loc, "omp_get_num_threads");
+  // Emit each PlanCall in a block (e.g. plan.pre / plan.post) at the
+  // current insertion point of `b`. Symbolic args are resolved via
+  // resolveCallArg above.
+  auto emitPlanCalls = [&](const std::vector<dsl::PlanAction> &actions,
+                           OpBuilder &b) {
+    for (auto &action : actions) {
+      auto *ca = std::get_if<dsl::PlanCall>(&action);
+      if (!ca) continue;
+      SmallVector<Value> args;
+      SmallVector<Type>  types;
+      for (auto &av : ca->args) {
+        Value v = resolveCallArg(av);
+        args.push_back(v); types.push_back(v.getType());
+      }
+      auto decl = getOrInsertDecl(module, ca->callee, types, b);
+      func::CallOp::create(b, loc, decl, args);
     }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Process plan.pre: emit each PlanCall directly; if `emit thread_bounds`
+  // is encountered, materialise per-thread [lbThread, ubThread) inline via a
+  // contiguous block-chunk formula.  The runtime path (e.g. iomp
+  // __kmpc_for_static_init_4) has only PlanCalls in pre; the inline path
+  // (PMSIS, libgomp) has only `emit thread_bounds`.  Whether `emit
+  // thread_bounds` was seen drives the loop bounds choice below.
+  // ---------------------------------------------------------------------------
+  Value lbThread, ubThread;
+  bool haveInlineBounds = false;
+  for (auto &action : plan.pre) {
+    if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+      SmallVector<Value> args;
+      SmallVector<Type>  types;
+      for (auto &av : ca->args) {
+        Value v = resolveCallArg(av);
+        args.push_back(v); types.push_back(v.getType());
+      }
+      auto decl = getOrInsertDecl(module, ca->callee, types, builder);
+      func::CallOp::create(builder, loc, decl, args);
+      continue;
+    }
+    auto *pe = std::get_if<dsl::PlanEmit>(&action);
+    if (!pe || pe->name != "thread_bounds") continue;
+
+    // Block work-distribution (one contiguous chunk per thread):
+    //   trip  = ceil((ub - lb) / step)        -- iteration count
+    //   chunk = ceil(trip / num_threads)      -- block size per thread
+    //   lbThread = lb + threadId * chunk * step           (inclusive start)
+    //   ubThread = min(lbThread + chunk * step, ub)         (exclusive end, clamped)
+    // This avoids the per-thread DIVMOD (SDiv + SRem) of the balanced scheme:
+    // a single ceiling-division computes the chunk and the upper bound is
+    // clamped with a select.  The helper function names come from the DSL
+    // properties thread_id_function / num_thread_function, so this code path
+    // serves any runtime that exposes such helpers.
+    std::string threadIdFn  = getStrProp("thread_id_function");
+    std::string numThreadFn = getStrProp("num_thread_function");
+    Value threadId   = emitNoArgI32Call(module, builder, loc, threadIdFn);
+    Value numThreads = emitNoArgI32Call(module, builder, loc, numThreadFn);
 
     // trip = (ub - lb + step - 1) / step  [ceiling division of iteration count]
     Value range    = LLVM::SubOp::create(builder, loc, ub, lb);
@@ -1022,254 +1083,114 @@ static void lowerWsloop(omp::WsloopOp wsOp,
                        LLVM::SubOp::create(builder, loc, step, one32));
     Value trip     = LLVM::SDivOp::create(builder, loc, rangeS, step);
 
-    // Exact DIVMOD work-distribution (mirrors GCC's _omp_fn lowering):
-    //   q  = trip / num_cores   -- base chunk size for every thread
-    //   tt = trip % num_cores   -- first `tt` threads get one extra iteration
-    //
-    // thread_start = q * coreId + min(coreId, tt)
-    // thread_end   = thread_start + q + (coreId < tt ? 1 : 0)
-    //
-    // This tiles [0, trip) with no overlap and no gap, matching the GCC ABI
-    // exactly.  The old ceiling-div formula used (trip + numCores - 1) /
-    // numCores as the chunk, which over-counts for threads beyond index `tt`
-    // and produces wrong ranges whenever trip % num_cores != 0.
-    Value q  = LLVM::SDivOp::create(builder, loc, trip, numCores);
-    Value tt = LLVM::SRemOp::create(builder, loc, trip, numCores);
+    // chunk = ceil(trip / num_threads)
+    Value tripPlusNC = LLVM::AddOp::create(builder, loc, trip,
+                         LLVM::SubOp::create(builder, loc, numThreads, one32));
+    Value chunk    = LLVM::SDivOp::create(builder, loc, tripPlusNC, numThreads);
 
-    // minCoreIdTt = min(coreId, tt)
-    Value ltTt       = LLVM::ICmpOp::create(builder, loc,
-                         LLVM::ICmpPredicate::slt, coreId, tt);
-    Value minCoreIdTt = LLVM::SelectOp::create(builder, loc, ltTt, coreId, tt);
+    // lbThread = lb + threadId * chunk * step
+    Value threadChunk  = LLVM::MulOp::create(builder, loc, threadId, chunk);
+    Value threadOff    = LLVM::MulOp::create(builder, loc, threadChunk, step);
+    lbThread           = LLVM::AddOp::create(builder, loc, lb, threadOff);
 
-    // thread_start (in iteration space, 0-based)
-    Value qMulId     = LLVM::MulOp::create(builder, loc, q, coreId);
-    Value threadStart = LLVM::AddOp::create(builder, loc, qMulId, minCoreIdTt);
+    // ubThread = lbThread + chunk * step, then clamp to ub
+    Value chunkStep  = LLVM::MulOp::create(builder, loc, chunk, step);
+    Value lbThreadEnd  = LLVM::AddOp::create(builder, loc, lbThread, chunkStep);
+    Value clampCond  = LLVM::ICmpOp::create(builder, loc,
+                         LLVM::ICmpPredicate::sgt, lbThreadEnd, ub);
+    ubThread           = LLVM::SelectOp::create(builder, loc, clampCond, ub, lbThreadEnd);
+    haveInlineBounds = true;
+  }
 
-    // thread_end = thread_start + q + (coreId < tt ? 1 : 0)
-    Value extraIter  = LLVM::SelectOp::create(builder, loc, ltTt, one32, zero32);
-    Value threadEnd  = LLVM::AddOp::create(builder, loc,
-                         LLVM::AddOp::create(builder, loc, threadStart, q),
-                         extraIter);
-
-    // Map iteration indices back to the original index space.
-    // lbCore = lb + thread_start * step  (inclusive start)
-    // ubCore = lb + thread_end   * step  (exclusive end — exact, no clamp needed)
-    Value lbCore = LLVM::AddOp::create(builder, loc, lb,
-                     LLVM::MulOp::create(builder, loc, threadStart, step));
-    Value ubCore = LLVM::AddOp::create(builder, loc, lb,
-                     LLVM::MulOp::create(builder, loc, threadEnd, step));
-
-    // Build sequential loop: lb_core to ubCore (exclusive) step step.
-    Block *preBlock   = builder.getInsertionBlock();
-    Block *afterBlock = preBlock->splitBlock(builder.getInsertionPoint());
-    Block *loopHeader = new Block();
-    Block *loopBody   = new Block();
-    Block *loopLatch  = new Block();
-
-    auto &parentRegion = *preBlock->getParent();
-    parentRegion.getBlocks().insertAfter(preBlock->getIterator(), loopHeader);
-    parentRegion.getBlocks().insertAfter(loopHeader->getIterator(), loopBody);
-    parentRegion.getBlocks().insertAfter(loopBody->getIterator(), loopLatch);
-
-    builder.setInsertionPointToEnd(preBlock);
-    Value pi = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-    LLVM::StoreOp::create(builder, loc, lbCore, pi);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
-
-    builder.setInsertionPointToEnd(loopHeader);
-    Value curI = LLVM::LoadOp::create(builder, loc, iterTy, pi);
-    Value cond = LLVM::ICmpOp::create(builder, loc,
-      LLVM::ICmpPredicate::slt, curI, ubCore);  // exclusive upper bound
-    LLVM::CondBrOp::create(builder, loc, cond,
-      loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
-
-    // Move the loop nest body into loopBody.
-    // The nest region may have multiple blocks (from inner loops).
-    // Move all blocks: first block's ops go into loopBody,
-    // remaining blocks are spliced in between loopBody and loopLatch.
-    auto &nestRegion = loopNest.getRegion();
-    auto &nestFirst = nestRegion.front();
-    // Replace outer IV with curI.
-    nestFirst.getArgument(0).replaceAllUsesWith(curI);
-
-    // Erase omp.yield/omp.terminator from the last block.
-    auto &nestLast = nestRegion.back();
-    for (auto &innerOp : llvm::make_early_inc_range(nestLast.getOperations()))
-      if (innerOp.getName().getStringRef() == "omp.yield" ||
-          innerOp.getName().getStringRef() == "omp.terminator")
-        innerOp.erase();
-
-    if (nestRegion.hasOneBlock()) {
-      // Single block: move all ops into loopBody.
-      builder.setInsertionPointToEnd(loopBody);
-      SmallVector<Operation *> opsToMove;
-      for (auto &innerOp : nestFirst.getOperations())
-        opsToMove.push_back(&innerOp);
-      for (auto *innerOp : opsToMove)
-        innerOp->moveBefore(loopBody, loopBody->end());
-      builder.setInsertionPointToEnd(loopBody);
-      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-    } else {
-      // Multiple blocks (inner loops from CIR): splice ALL blocks before loopLatch
-      // first, then move first block's ops into loopBody.
-      // This preserves branch targets since blocks are already in the region.
-      SmallVector<Block *> blocksToMove;
-      for (auto &blk : nestRegion)
-        if (&blk != &nestFirst) blocksToMove.push_back(&blk);
-      for (auto *blk : blocksToMove)
-        blk->moveBefore(loopLatch);
-
-      // Now move nestFirst's ops into loopBody (branch targets are now valid).
-      builder.setInsertionPointToEnd(loopBody);
-      SmallVector<Operation *> firstOps;
-      for (auto &innerOp : nestFirst.getOperations())
-        firstOps.push_back(&innerOp);
-      for (auto *innerOp : firstOps)
-        innerOp->moveBefore(loopBody, loopBody->end());
-
-      // Add branch from last moved block to loopLatch.
-      Block *lastBlock = blocksToMove.back();
-      builder.setInsertionPointToEnd(lastBlock);
-      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-    }
-
-    builder.setInsertionPointToEnd(loopLatch);
-    Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
-    LLVM::StoreOp::create(builder, loc, nextI, pi);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
-
-    // After loop: emit post-loop calls from DSL (barriers etc).
-    builder.setInsertionPointToStart(afterBlock);
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        if (ca->callee == "core_bounds") continue;
-        if (ca->callee.find("body") != std::string::npos) continue;
-        if (ca->callee == "GOMP_loop_static_start") continue; // not applicable to this distribution path
-        if (ca->callee == "GOMP_loop_end") continue;          // not applicable to this distribution path
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveCallArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-        func::CallOp::create(builder, loc, decl, args);
-      }
-    }
-
+  // Choose loop bounds and comparison predicate based on how pre populated them.
+  // Inline block-chunking produces exclusive ubThread → use slt.
+  // Runtime init (e.g. __kmpc_for_static_init_4) writes inclusive ub into pub
+  // (we initialised pub with ub - step) → use sle.
+  Value loopStart, loopEnd;
+  LLVM::ICmpPredicate cmpPred;
+  if (haveInlineBounds) {
+    loopStart = lbThread;
+    loopEnd   = ubThread;
+    cmpPred   = LLVM::ICmpPredicate::slt;
   } else {
-    // -------------------------------------------------------------------------
-    // iomp wsloop: __kmpc_for_static_init_4 / explicit loop pattern
-    // -------------------------------------------------------------------------
+    loopStart = LLVM::LoadOp::create(builder, loc, iterTy, plb);
+    loopEnd   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
+    cmpPred   = LLVM::ICmpPredicate::sle;
+  }
 
-    // Separate invoke actions into pre-loop (init), body (skip), post-loop.
-    SmallVector<const dsl::PlanCall *> preCalls, postCalls;
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        bool isBody = ca->callee.find("body") != std::string::npos;
-        bool isInit = ca->callee.find("init") != std::string::npos;
-        if (isBody) continue;
-        if (isInit) preCalls.push_back(ca);
-        else        postCalls.push_back(ca);
-      }
-    }
+  // -------------------------------------------------------------------------
+  // Build the sequential loop.
+  // -------------------------------------------------------------------------
+  Block *preBlock   = builder.getInsertionBlock();
+  Block *afterBlock = preBlock->splitBlock(builder.getInsertionPoint());
+  Block *loopHeader = new Block();
+  Block *loopBody   = new Block();
+  Block *loopLatch  = new Block();
 
-    // Emit pre-loop calls.
-    for (auto *ca : preCalls) {
-      SmallVector<Value> args;
-      SmallVector<Type>  types;
-      for (auto &av : ca->args) {
-        Value v = resolveCallArg(av);
-        args.push_back(v); types.push_back(v.getType());
-      }
-      auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-      func::CallOp::create(builder, loc, decl, args);
-    }
+  auto &parentRegion = *preBlock->getParent();
+  parentRegion.getBlocks().insertAfter(preBlock->getIterator(), loopHeader);
+  parentRegion.getBlocks().insertAfter(loopHeader->getIterator(), loopBody);
+  parentRegion.getBlocks().insertAfter(loopBody->getIterator(), loopLatch);
 
-    // Load adjusted bounds (written by __kmpc_for_static_init_4).
-    // plb/pub contain this thread's iteration range (inclusive).
-    // pstride contains the runtime stride (num_threads for static) — NOT used
-    // for loop increment. We increment by the original loop step instead.
-    Value adjLb   = LLVM::LoadOp::create(builder, loc, iterTy, plb);
-    Value adjUb   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
+  builder.setInsertionPointToEnd(preBlock);
+  Value pi = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
+  LLVM::StoreOp::create(builder, loc, loopStart, pi);
+  LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-    // Build explicit loop blocks.
-    Block *preBlock   = builder.getInsertionBlock();
-    Block *afterBlock = preBlock->splitBlock(builder.getInsertionPoint());
-    Block *loopHeader = new Block();
-    Block *loopBody   = new Block();
-    Block *loopLatch  = new Block();
+  builder.setInsertionPointToEnd(loopHeader);
+  Value curI = LLVM::LoadOp::create(builder, loc, iterTy, pi);
+  Value cond = LLVM::ICmpOp::create(builder, loc, cmpPred, curI, loopEnd);
+  LLVM::CondBrOp::create(builder, loc, cond,
+    loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
 
-    auto &parentRegion = *preBlock->getParent();
-    parentRegion.getBlocks().insertAfter(preBlock->getIterator(), loopHeader);
-    parentRegion.getBlocks().insertAfter(loopHeader->getIterator(), loopBody);
-    parentRegion.getBlocks().insertAfter(loopBody->getIterator(), loopLatch);
+  // Move the loop nest body into loopBody.
+  // The nest region may have multiple blocks (from inner loops).
+  auto &nestRegion = loopNest.getRegion();
+  auto &nestFirst  = nestRegion.front();
+  nestFirst.getArgument(0).replaceAllUsesWith(curI);
+  for (auto &innerOp : llvm::make_early_inc_range(nestRegion.back().getOperations()))
+    if (innerOp.getName().getStringRef() == "omp.yield" ||
+        innerOp.getName().getStringRef() == "omp.terminator")
+      innerOp.erase();
 
-    builder.setInsertionPointToEnd(preBlock);
-    Value pi = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-    LLVM::StoreOp::create(builder, loc, adjLb, pi);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  if (nestRegion.hasOneBlock()) {
+    builder.setInsertionPointToEnd(loopBody);
+    SmallVector<Operation *> opsToMove;
+    for (auto &innerOp : nestFirst.getOperations())
+      opsToMove.push_back(&innerOp);
+    for (auto *innerOp : opsToMove)
+      innerOp->moveBefore(loopBody, loopBody->end());
+    builder.setInsertionPointToEnd(loopBody);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+  } else {
+    // Multiple blocks (inner loops from CIR): splice ALL blocks before
+    // loopLatch first, then move first block's ops into loopBody — this
+    // preserves branch targets since blocks are already in the region.
+    SmallVector<Block *> blocksToMove;
+    for (auto &blk : nestRegion)
+      if (&blk != &nestFirst) blocksToMove.push_back(&blk);
+    for (auto *blk : blocksToMove)
+      blk->moveBefore(loopLatch);
 
-    builder.setInsertionPointToEnd(loopHeader);
-    Value curI = LLVM::LoadOp::create(builder, loc, iterTy, pi);
-    Value cond = LLVM::ICmpOp::create(builder, loc,
-      LLVM::ICmpPredicate::sle, curI, adjUb);
-    LLVM::CondBrOp::create(builder, loc, cond,
-      loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+    builder.setInsertionPointToEnd(loopBody);
+    SmallVector<Operation *> firstOps;
+    for (auto &innerOp : nestFirst.getOperations())
+      firstOps.push_back(&innerOp);
+    for (auto *innerOp : firstOps)
+      innerOp->moveBefore(loopBody, loopBody->end());
 
-    // Move the loop nest body into loopBody.
-    auto &ioNestRegion = loopNest.getRegion();
-    auto &ioNestFirst  = ioNestRegion.front();
-    ioNestFirst.getArgument(0).replaceAllUsesWith(curI);
-    // Erase omp.yield/omp.terminator from last block.
-    for (auto &innerOp : llvm::make_early_inc_range(ioNestRegion.back().getOperations()))
-      if (innerOp.getName().getStringRef() == "omp.yield" ||
-          innerOp.getName().getStringRef() == "omp.terminator")
-        innerOp.erase();
-    if (ioNestRegion.hasOneBlock()) {
-      builder.setInsertionPointToEnd(loopBody);
-      SmallVector<Operation *> opsToMove;
-      for (auto &innerOp : ioNestFirst.getOperations())
-        opsToMove.push_back(&innerOp);
-      for (auto *innerOp : opsToMove)
-        innerOp->moveBefore(loopBody, loopBody->end());
-      builder.setInsertionPointToEnd(loopBody);
-      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-    } else {
-      SmallVector<Block *> extraBlocks;
-      for (auto &blk : ioNestRegion)
-        if (&blk != &ioNestFirst) extraBlocks.push_back(&blk);
-      for (auto *blk : extraBlocks)
-        blk->moveBefore(loopLatch);
-      builder.setInsertionPointToEnd(loopBody);
-      SmallVector<Operation *> firstOps;
-      for (auto &innerOp : ioNestFirst.getOperations())
-        firstOps.push_back(&innerOp);
-      for (auto *innerOp : firstOps)
-        innerOp->moveBefore(loopBody, loopBody->end());
-      builder.setInsertionPointToEnd(extraBlocks.back());
-      LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
-    }
+    builder.setInsertionPointToEnd(blocksToMove.back());
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
+  }
 
-    builder.setInsertionPointToEnd(loopLatch);
-    // Increment by original loop step, not by pstride (which is the runtime stride).
-    Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
-    LLVM::StoreOp::create(builder, loc, nextI, pi);
-    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  builder.setInsertionPointToEnd(loopLatch);
+  Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
+  LLVM::StoreOp::create(builder, loc, nextI, pi);
+  LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-    // Emit post-loop calls.
-    builder.setInsertionPointToStart(afterBlock);
-    for (auto *ca : postCalls) {
-      SmallVector<Value> args;
-      SmallVector<Type>  types;
-      for (auto &av : ca->args) {
-        Value v = resolveCallArg(av);
-        args.push_back(v); types.push_back(v.getType());
-      }
-      auto decl = getOrInsertDecl(module, ca->callee, types, builder);
-      func::CallOp::create(builder, loc, decl, args);
-    }
-  } // end iomp path
+  // Emit post-loop calls (e.g. fini, optional barrier).
+  builder.setInsertionPointToStart(afterBlock);
+  emitPlanCalls(plan.post, builder);
 
   wsOp.erase();
 }
@@ -1316,6 +1237,18 @@ struct OmpOutliningPass
     }
     dsl::Evaluator evaluator(*program);
 
+    // Pre-compute the barrier plan once; the same plan is reused for every
+    // omp.barrier inside outlined parallel functions.
+    llvm::StringMap<dsl::Value> barrierCtx;
+    barrierCtx["ident"]      = dsl::makeStr("%ident");
+    barrierCtx["global_tid"] = dsl::makeStr("%gtid");
+    auto barrierPlan = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
+    if (!barrierPlan) {
+      module.emitError("omp-outline: barrier DSL evaluation failed: ")
+        << llvm::toString(barrierPlan.takeError());
+      return signalPassFailure();
+    }
+
     // Step 1: outline parallel constructs.
     SmallVector<ConstructOp> constructs;
     module.walk([&](ConstructOp op) {
@@ -1323,7 +1256,7 @@ struct OmpOutliningPass
     });
     int counter = 0;
     for (auto op : constructs)
-      outlineConstruct(op, module, counter, runtimeName);
+      outlineConstruct(op, module, counter, *barrierPlan);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;
@@ -1334,14 +1267,13 @@ struct OmpOutliningPass
 
       llvm::StringMap<dsl::Value> ctx;
       ctx["ident"]      = dsl::makeStr("%ident");
-      ctx["global_tid"] = dsl::makeStr("%tid");
+      ctx["global_tid"] = dsl::makeStr("%gtid");
       ctx["lower"]      = dsl::makeStr("%lb");
       ctx["upper"]      = dsl::makeStr("%ub");
       ctx["step"]       = dsl::makeStr("%step");
-      ctx["last"]       = dsl::makeStr("last");
+      ctx["last"]       = dsl::makeStr("%last");
       ctx["chunk"]      = dsl::makeInt(1);
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
-      ctx["body"]       = dsl::makeStr("body");
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
       if (wsOp.getScheduleKind()) {

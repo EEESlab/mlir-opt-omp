@@ -25,9 +25,13 @@
       }
 
       construct wsloop when schedule == static {
-        invoke {
+        pre {
           call "__kmpc_for_static_init_4"(ident, global_tid, 34, last, lower, upper, stride, step, 1);
-          call body(lower, upper, step);
+        }
+        invoke {
+          emit loop_body;
+        }
+        post {
           call "__kmpc_for_static_fini"(ident, global_tid);
           when not nowait => call "__kmpc_barrier"(ident, global_tid);
         }
@@ -41,14 +45,20 @@ runtime libgomp {
     capture_strategy = "packed";
     pre {}
     invoke {
-      call "GOMP_parallel"(body, env_ptr, 0, 0);
+      when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, 0);
+      otherwise             => call "GOMP_parallel"(body, env_ptr, 0, 0);
     }
   }
   construct wsloop when schedule == static {
+    thread_id_function  = "omp_get_thread_num";
+    num_thread_function = "omp_get_num_threads";
+    pre {
+      emit thread_bounds;
+    }
     invoke {
-      call "GOMP_loop_static_start"(lower, upper, step, chunk, lower, upper);
-      call body(lower, upper, step);
-      call "GOMP_loop_end"();
+      emit loop_body;
+    }
+    post {
       when not nowait => call "GOMP_barrier"();
     }
   }
@@ -75,9 +85,15 @@ runtime pmsis {
     }
   }
   construct wsloop {
+    thread_id_function  = "ext_pi_core_id";
+    num_thread_function = "ext_pi_cl_nb_cores";
+    pre {
+      emit thread_bounds;
+    }
     invoke {
-      call "core_bounds"(lower, upper, step);
-      call body(lower, upper, step);
+      emit loop_body;
+    }
+    post {
       when not nowait => call "ext_pi_cl_team_barrier"();
     }
   }
