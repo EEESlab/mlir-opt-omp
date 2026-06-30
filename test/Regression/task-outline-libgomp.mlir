@@ -17,12 +17,10 @@ func.func @task_if(%arg0: !llvm.ptr, %cond: i1) {
 // The body is outlined into a closure taking a single data pointer.
 // CHECK: func.func {{.*}}@outlined_task_{{[0-9]+}}(%{{.*}}: !llvm.ptr)
 
-// GOMP_task must be declared with all 10 params (GCC 11+ ABI); the trailing
-// !llvm.ptr is `detach`. A 9-param decl would mean the call drops detach and
-// libgomp reads an uninitialised 10th argument.
-// CHECK-DAG: func.func private @GOMP_task(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i8, i32, !llvm.ptr, i32, !llvm.ptr)
-
 // The if-clause (i1) is widened to i8 (C _Bool) and the task is scheduled.
+// The call carries all 10 GOMP_task params (GCC 11+ ABI); the trailing
+// !llvm.ptr is `detach`. A 9-arg call would be an ABI mismatch (libgomp would
+// read an uninitialised 10th argument).
 // CHECK-LABEL: func.func @task_if
 // CHECK:       llvm.zext %{{.*}} : i1 to i8
-// CHECK:       call @GOMP_task
+// CHECK:       call @GOMP_task({{.*}}) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i8, i32, !llvm.ptr, i32, !llvm.ptr) -> ()
