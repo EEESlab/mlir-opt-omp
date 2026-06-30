@@ -26,6 +26,9 @@ func.func @nested(%arg0: !llvm.ptr) {
 // CHECK: func.func {{.*}}@outlined_parallel_{{[0-9]+}}(%{{.*}}: !llvm.ptr)
 // CHECK:   call @GOMP_task
 
+// GOMP_task carries all 10 params (GCC 11+ ABI); trailing !llvm.ptr is `detach`.
+// CHECK-DAG: func.func private @GOMP_task(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i8, i32, !llvm.ptr, i32, !llvm.ptr)
+
 // The original function forks the parallel region.
 // CHECK-LABEL: func.func @nested
 // CHECK:       call @GOMP_parallel

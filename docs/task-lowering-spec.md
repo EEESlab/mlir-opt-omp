@@ -54,8 +54,14 @@ void GOMP_task (void (*fn)(void *data),
                 bool  if_clause,
                 unsigned flags,
                 void **depend,
-                int   priority);
+                int   priority,
+                void *detach);
 ```
+
+> **ABI note:** the trailing `detach` parameter was added in GCC 11 (OpenMP 5.0
+> `detach` clause support). Omitting it makes `GOMP_task` read an uninitialised
+> 10th argument when linked against libgomp ≥ 11, which can corrupt memory or
+> hang. We always pass `detach = null` (no detach clause supported yet).
 
 Key behaviour: with `cpyfn == NULL`, libgomp allocates `arg_size` bytes aligned
 to `arg_align`, `memcpy`s `data` into that task-private block, and later calls
@@ -77,6 +83,7 @@ ABI mapping used by the tool (Linux x86-64 / LP64):
 | `flags`           | `unsigned`       | `i32` (`0`) |
 | `depend`          | `void**`         | `ptr` (`null`) |
 | `priority`        | `int`            | `i32` (`0`) |
+| `detach`          | `void*`          | `ptr` (`null`) |
 
 ### 2.2 iomp — `__kmpc_omp_task_alloc` + `__kmpc_omp_task`
 
@@ -132,11 +139,11 @@ construct task {
     when has(if_clause) =>
       call "GOMP_task"(body, env_ptr, null,
                        env_size, env_align,
-                       if_clause, 0, null, 0);
+                       if_clause, 0, null, 0, null);
     otherwise =>
       call "GOMP_task"(body, env_ptr, null,
                        env_size, env_align,
-                       true, 0, null, 0);
+                       true, 0, null, 0, null);
   }
 }
 ```
@@ -287,7 +294,7 @@ func.func @task_if(%arg0: !llvm.ptr, %cond: i1) {
   %fn  = ... @outlined_task_0 as ptr
   %nl  = llvm.zero : !llvm.ptr
   %z32 = ... 0 : i32
-  call @GOMP_task(%fn, %env, %nl, %sz, %al, %if8, %z32, %nl, %z32)
+  call @GOMP_task(%fn, %env, %nl, %sz, %al, %if8, %z32, %nl, %z32, %nl)
   return
 }
 ```
@@ -324,8 +331,9 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 
 ## 8. Non-goals / deferred
 
-- **`depend`, `priority`, `untied`, `mergeable`, `final`** clauses — currently
-  hard-wired (`depend = null`, `priority = 0`, `flags = 0`). Additive later.
+- **`depend`, `priority`, `detach`, `untied`, `mergeable`, `final`** clauses —
+  currently hard-wired (`depend = null`, `priority = 0`, `detach = null`,
+  `flags = 0`). Additive later.
 - **`taskwait` / `taskgroup` / `taskloop`** — separate constructs, out of scope.
 - **LLP64 targets** — the `long = i64`, `_Bool = i8` mapping assumes LP64
   (the wsl/workstation Linux targets). Revisit only for a Windows/LLP64 libgomp.

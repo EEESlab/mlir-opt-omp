@@ -74,11 +74,11 @@ runtime libgomp {
       when has(if_clause) =>
         call "GOMP_task"(body, env_ptr, null,
                          env_size, env_align,
-                         if_clause, 0, null, 0);
+                         if_clause, 0, null, 0, null);
       otherwise =>
         call "GOMP_task"(body, env_ptr, null,
                          env_size, env_align,
-                         true, 0, null, 0);
+                         true, 0, null, 0, null);
     }
   }
 }
