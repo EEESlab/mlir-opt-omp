@@ -74,7 +74,8 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
                      OpBuilder &builder,
                      Location loc,
                      Region *srcRegion = nullptr,
-                     Value numThreads = nullptr) {
+                     Value numThreads = nullptr,
+                     Value ifClause = nullptr) {
   MLIRContext *ctx = builder.getContext();
 
   SmallVector<NamedAttribute> propPairs;
@@ -91,8 +92,14 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
     return ArrayAttr::get(ctx, attrs);
   };
 
+  // At most one clause operand is present: num_threads (parallel) or
+  // if_clause (task).  Both ride a single variadic operand list.
+  SmallVector<Value> clauseOperands;
+  if (numThreads) clauseOperands.push_back(numThreads);
+  if (ifClause)   clauseOperands.push_back(ifClause);
+
   auto constructOp = ConstructOp::create(builder, loc,
-    numThreads,
+    clauseOperands,
     builder.getStringAttr(plan.runtime),
     builder.getStringAttr(plan.construct),
     propDict,
@@ -189,6 +196,33 @@ extractBarrierContext(omp::BarrierOp /*op*/) {
   return ctx;
 }
 
+static llvm::StringMap<dsl::Value>
+extractTaskContext(omp::TaskOp op) {
+  llvm::StringMap<dsl::Value> ctx;
+
+  // Resolved to the outlined function pointer in OmpOutliningPass.
+  ctx["body"]     = dsl::makeStr("body");
+  ctx["captures"] = dsl::makeList({});
+
+  // if_clause is a sentinel: its presence (non-null) selects the
+  // `when has(if_clause)` invoke branch; the actual SSA value is carried as
+  // the ConstructOp if_clause operand and resolved at the call site.
+  if (op.getIfExpr())
+    ctx["if_clause"] = dsl::makeStr("if_clause");
+  else
+    ctx["if_clause"] = dsl::makeNull();
+
+  // Closure/packed sentinels used by the libgomp lowering.
+  ctx["packed"]    = dsl::makeStr("packed");
+  ctx["env_ptr"]   = dsl::makeStr("env_ptr");
+  // Capture-struct size/alignment placeholders, materialised at the call site
+  // from the actual struct type (see OmpOutliningPass).
+  ctx["env_size"]  = dsl::makeStr("env_size");
+  ctx["env_align"] = dsl::makeStr("env_align");
+
+  return ctx;
+}
+
 // ===========================================================================
 // The pass
 // ===========================================================================
@@ -236,7 +270,15 @@ struct OmpToOmpLowerPass
     SmallVector<omp::ParallelOp> parallels;
     SmallVector<omp::WsloopOp>   wsloops;
     SmallVector<omp::BarrierOp>  barriers;
+    SmallVector<omp::TaskOp>     tasks;
     module.walk([&](omp::ParallelOp op) { parallels.push_back(op); });
+    // Collect every task, including those nested in a parallel (the common
+    // `parallel { ... task ... }` pattern) or in another task.  Parallels are
+    // processed first, moving their body — with any nested task ops — into a
+    // ConstructOp region; the task op pointers stay valid and are converted
+    // afterwards into nested ConstructOps.  Pre-order walk guarantees an outer
+    // task is processed before a task nested inside it.
+    module.walk([&](omp::TaskOp op) { tasks.push_back(op); });
     // Only collect wsloops and barriers that are NOT nested inside a parallel.
     // Those inside a parallel are part of its body region and will be handled
     // by the outlining pass after the parallel body is moved.
@@ -254,7 +296,8 @@ struct OmpToOmpLowerPass
                        llvm::StringRef construct,
                        llvm::StringMap<dsl::Value> ctx,
                        Region *region = nullptr,
-                       Value numThreads = nullptr) -> bool {
+                       Value numThreads = nullptr,
+                       Value ifClause = nullptr) -> bool {
       auto plan = evaluator.buildPlan(runtimeName, construct, ctx);
       if (!plan) {
         op.emitError("DSL evaluation failed: ")
@@ -263,9 +306,31 @@ struct OmpToOmpLowerPass
         return false;
       }
       OpBuilder builder(op);
-      emitConstructOp(*plan, builder, op.getLoc(), region, numThreads);
+      emitConstructOp(*plan, builder, op.getLoc(), region, numThreads, ifClause);
       op.erase();
       return true;
+    };
+
+    // Inject firstprivate source vars as explicit uses inside a construct
+    // region so collectCaptures finds them (shared with parallel handling).
+    auto injectFirstprivateUses = [&](auto op) {
+      Region &region = op.getRegion();
+      if (region.empty()) return;
+      Block &entryBlock = region.front();
+      OpBuilder injector(&entryBlock, entryBlock.begin());
+      auto privateSyms = op.getPrivateSyms();
+      for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
+        bool isFirstprivate = false;
+        if (privateSyms) {
+          auto symRef = llvm::cast<SymbolRefAttr>((*privateSyms)[idx]);
+          if (auto recipe = SymbolTable::lookupNearestSymbolFrom<
+                  omp::PrivateClauseOp>(op, symRef))
+            isFirstprivate = !recipe.getCopyRegion().empty();
+        }
+        if (!isFirstprivate) continue;
+        UnrealizedConversionCastOp::create(injector, op.getLoc(),
+          TypeRange{privateVar.getType()}, ValueRange{privateVar});
+      }
     };
 
     // Process parallels first, passing their region for later outlining.
@@ -275,32 +340,24 @@ struct OmpToOmpLowerPass
       // explicit uses inside the region so collectCaptures finds them.
       // Only inject for firstprivate vars (which need the source value
       // copied); purely private vars just need a fresh alloca per thread.
-      Region &parallelRegion = op.getRegion();
-      if (!parallelRegion.empty()) {
-        Block &entryBlock = parallelRegion.front();
-        OpBuilder injector(&entryBlock, entryBlock.begin());
-        auto privateSyms = op.getPrivateSyms();
-        for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
-          // Look up the privatizer recipe to check if it's firstprivate.
-          bool isFirstprivate = false;
-          if (privateSyms) {
-            auto symRef = llvm::cast<SymbolRefAttr>((*privateSyms)[idx]);
-            if (auto recipe = SymbolTable::lookupNearestSymbolFrom<
-                    omp::PrivateClauseOp>(op, symRef))
-              isFirstprivate = !recipe.getCopyRegion().empty();
-          }
-          if (!isFirstprivate) continue;
-          // Create a use of privateVar inside the region so collectCaptures
-          // picks it up as a capture.
-          UnrealizedConversionCastOp::create(injector, op.getLoc(),
-            TypeRange{privateVar.getType()}, ValueRange{privateVar});
-        }
-      }
+      injectFirstprivateUses(op);
       Value numThreads;
       if (op.getNumThreadsDimsCount() > 0)
         numThreads = op.getNumThreads(0);
       if (!process(op, "parallel", extractParallelContext(op),
                    &op.getRegion(), numThreads)) return;
+    }
+
+    // Tasks behave like parallel for outlining (closure/packed body), but
+    // carry an optional if_clause operand and no num_threads.  In OpenMP,
+    // task data captures are firstprivate by default, so inject the same
+    // firstprivate uses before moving the region.
+    for (auto op : tasks) {
+      if (!op->getBlock()) continue;
+      injectFirstprivateUses(op);
+      Value ifClause = op.getIfExpr();
+      if (!process(op, "task", extractTaskContext(op),
+                   &op.getRegion(), /*numThreads=*/nullptr, ifClause)) return;
     }
 
     for (auto op : wsloops) {

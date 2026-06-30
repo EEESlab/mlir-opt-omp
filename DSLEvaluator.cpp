@@ -176,6 +176,10 @@ Expected<Value> evalBuiltin(const std::string &name, std::vector<Value> args) {
 Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
   return std::visit(llvm::makeVisitor(
     [&](const IdentExpr &e) -> Expected<Value> {
+      // `null` is a literal, not a scope variable (the lexer has no NULL
+      // keyword, so it arrives as an identifier).  Used e.g. as a GOMP_task
+      // call argument; lowers to a null pointer.
+      if (e.name == "null") return makeNull();
       return scope.get(e.name);
     },
     [&](const StringExpr &e) -> Expected<Value> {

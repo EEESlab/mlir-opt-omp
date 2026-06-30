@@ -67,6 +67,20 @@ runtime libgomp {
       call "GOMP_barrier"();
     }
   }
+  construct task {
+    outline_signature = closure(env_ptr);
+    capture_strategy  = "packed";
+    invoke {
+      when has(if_clause) =>
+        call "GOMP_task"(body, env_ptr, null,
+                         env_size, env_align,
+                         if_clause, 0, null, 0, null);
+      otherwise =>
+        call "GOMP_task"(body, env_ptr, null,
+                         env_size, env_align,
+                         true, 0, null, 0, null);
+    }
+  }
 }
 
 
