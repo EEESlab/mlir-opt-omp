@@ -30,10 +30,13 @@
 #   DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 #   ./run_performance.sh path/to/kernel-omp.c         # a single kernel
 #   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
+#   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
 #
 # CSV output (under $OUTDIR, default ./results):
 #   results_performance.csv      one row per kernel + a GEOMEAN summary row
 #   <kernel>-omp/performance/...  the four binaries and their raw timing logs
+#   results_performance.png       speedup bar chart (only when PLOT=true; needs
+#                                 python3 + matplotlib — see plot_speedup.py)
 # =============================================================================
 
 set -uo pipefail
@@ -50,6 +53,7 @@ THREADS="${THREADS:-16}"             # thread count for the parallel cells
 REPS="${REPS:-5}"                    # timed runs per cell (>=3; min+max dropped)
 VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
 OUTDIR="${OUTDIR:-$PWD/results}"
+PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
 
 # Performance times the kernel with the cycle-accurate TSC timer. This is
 # mutually exclusive with -DPOLYBENCH_DUMP_ARRAYS, hence its own CFLAGS.
@@ -173,6 +177,37 @@ emit_na() {
     echo "$1;NA;NA;NA;NA;NA;NA;NA;NA" >> "$CSV"
 }
 
+# is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
+is_true() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
+# missing python/matplotlib is a warning, not a failure (the CSV is the result).
+render_plot() {
+    local script="$SCRIPT_DIR/plot_speedup.py"
+    local png="$OUTDIR/results_performance.png"
+    local py
+    py="$(command -v python3 || command -v python)" || {
+        echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
+        return
+    }
+    if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
+        echo -e "${YELLOW}[plot] matplotlib not installed" \
+                "(pip install matplotlib numpy) — skipping plot${RESET}" >&2
+        return
+    fi
+    echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2
+    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME"; then
+        echo "  Plot  — $png"
+    else
+        echo -e "${YELLOW}[plot] plot_speedup.py failed — see output above${RESET}" >&2
+    fi
+}
+
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_performance.csv"
@@ -232,3 +267,6 @@ echo "    opt/nat seq  ref_seq/opt_seq  — sequential runtime, native vs this t
 echo "    A ratio > 1.0 means lower runtime (faster); < 1.0 means higher (slower)."
 echo ""
 echo "  Done — $CSV"
+
+# --- Optional speedup plot -------------------------------------------------
+is_true "$PLOT" && render_plot

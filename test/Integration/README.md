@@ -132,6 +132,26 @@ The suite summary uses the **geometric mean** of each ratio across all kernels
 RUNTIME=libgomp DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 ./run_performance.sh linear-algebra/blas/gemm/gemm-omp.c   # single kernel
 SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
+PLOT=true SUITE=full ./run_performance.sh              # + speedup chart
+```
+
+### Speedup chart
+
+Set `PLOT=true` (config.env or inline) to render a bar chart of the
+**self-relative parallel speedup** per kernel once the run finishes — native
+(`ref_seq/ref_par`) vs our tool (`opt_seq/opt_par`), i.e. the `speedup_native`
+and `speedup_opt` columns. It covers whatever ran (`bundled`, `full`, or an
+explicit `KERNELS` list) and lands at `results/results_performance.png`. The
+native bar is labelled by runtime — *Clang frontend* (`iomp`) or *GCC frontend*
+(`libgomp`).
+
+The rendering is done by [`plot_speedup.py`](plot_speedup.py) and needs
+`python3` + `matplotlib`/`numpy` (`pip install matplotlib numpy`); if they are
+missing the run still succeeds and only the plot is skipped. You can also run it
+by hand on any existing CSV, e.g. for a vector figure:
+
+```sh
+python3 plot_speedup.py results/results_performance.csv fig.pdf --runtime libgomp
 ```
 
 > The perf script defaults to `DATASET=LARGE_DATASET` (correctness defaults to
@@ -165,6 +185,7 @@ All variables, with their defaults, are documented in
 | `KERNELS`      | explicit space-separated kernel list (overrides `SUITE`) |
 | `REPS`         | (perf) timed runs per cell — min+max dropped         |
 | `VARIANCE_ACCEPTED` | (perf) warn if a cell's relative std-dev exceeds this % |
+| `PLOT`         | (perf) `true` → render `results_performance.png` (needs matplotlib) |
 
 Strict FP flags (`-ffp-contract=off`, no auto-vectorisation) are enabled by
 default and must match between ref and opt — without them FMA contraction and
