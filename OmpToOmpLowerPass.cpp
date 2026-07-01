@@ -156,12 +156,20 @@ extractParallelContext(omp::ParallelOp op) {
   // iomp runtime identifiers
   ctx["ident"]      = dsl::makeStr("%ident");
   ctx["global_tid"] = dsl::makeStr("%gtid");
-  ctx["ptr_tid"]    = dsl::makeStr("ptr_tid");
-  ctx["ptr_btid"]   = dsl::makeStr("ptr_btid");
 
-  // capture strategy enum values used as bare identifiers in DSL
-  ctx["by_pointer"] = dsl::makeStr("by_pointer");
-  ctx["packed"]     = dsl::makeStr("packed");
+  // Removed: ptr_tid/ptr_btid were only decorative args of the microtask
+  // outline_signature, now emptied to `microtask()` in rules.dsl, so nothing
+  // references them anymore.
+  // ctx["ptr_tid"]    = dsl::makeStr("ptr_tid");
+  // ctx["ptr_btid"]   = dsl::makeStr("ptr_btid");
+
+  // Removed: capture_strategy values are quoted string literals in the DSL, so
+  // these bare tokens are never looked up.
+  // ctx["by_pointer"] = dsl::makeStr("by_pointer");
+  // ctx["packed"]     = dsl::makeStr("packed");
+
+  // Passed as a real argument by the libgomp/pmsis parallel
+  // invoke (GOMP_parallel / ext_pi_cl_team_fork).
   ctx["env_ptr"]    = dsl::makeStr("env_ptr");
 
   return ctx;
@@ -175,7 +183,9 @@ extractWsloopContext(omp::WsloopOp op) {
   ctx["lower"]      = dsl::makeStr("%lb");
   ctx["upper"]      = dsl::makeStr("%ub");
   ctx["step"]       = dsl::makeStr("%step");
-  ctx["chunk"]      = dsl::makeInt(1);
+  // Removed: no construct references a bare `chunk`; the static schedule's chunk
+  // size flows from the runtime-level `let default_chunk` in rules.dsl.
+  // ctx["chunk"]      = dsl::makeInt(1);
   ctx["nowait"]     = dsl::makeBool(op.getNowait());
 
   // schedule
@@ -212,8 +222,10 @@ extractTaskContext(omp::TaskOp op) {
   else
     ctx["if_clause"] = dsl::makeNull();
 
-  // Closure/packed sentinels used by the libgomp lowering.
-  ctx["packed"]    = dsl::makeStr("packed");
+  // Removed: capture_strategy is a quoted literal in the DSL, so the bare
+  // `packed` token is never looked up.  env_ptr, by contrast, is  used
+  // by the libgomp task invoke (GOMP_task(body, env_ptr, ...)).
+  // ctx["packed"]    = dsl::makeStr("packed");
   ctx["env_ptr"]   = dsl::makeStr("env_ptr");
   // Capture-struct size/alignment placeholders, materialised at the call site
   // from the actual struct type (see OmpOutliningPass).
