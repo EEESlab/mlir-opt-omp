@@ -1,7 +1,8 @@
 // OmpToOmpLowerPass.cpp
 //
-// Converts omp.parallel / omp.wsloop / omp.barrier ops to
-// omp_lower.construct ops by evaluating the user-provided DSL file.
+// Converts omp.parallel / omp.task / omp.barrier ops to omp_lower.construct
+// ops by evaluating the user-provided DSL file.  Wsloops are left in place
+// (nested inside their parallel) and lowered later by OmpOutliningPass.
 
 #include "OmpToOmpLowerPass.h"
 #include "OmpLoweringOps.h"
@@ -175,28 +176,11 @@ extractParallelContext(omp::ParallelOp op) {
   return ctx;
 }
 
-static llvm::StringMap<dsl::Value>
-extractWsloopContext(omp::WsloopOp op) {
-  llvm::StringMap<dsl::Value> ctx;
-  ctx["ident"]      = dsl::makeStr("%ident");
-  ctx["global_tid"] = dsl::makeStr("%gtid");
-  ctx["lower"]      = dsl::makeStr("%lb");
-  ctx["upper"]      = dsl::makeStr("%ub");
-  ctx["step"]       = dsl::makeStr("%step");
-  // Removed: no construct references a bare `chunk`; the static schedule's chunk
-  // size flows from the runtime-level `let default_chunk` in rules.dsl.
-  // ctx["chunk"]      = dsl::makeInt(1);
-  ctx["nowait"]     = dsl::makeBool(op.getNowait());
-
-  // schedule
-  ctx["schedule"] = dsl::makeStr("static");
-  if (op.getScheduleKind()) {
-    auto sk = omp::stringifyClauseScheduleKind(*op.getScheduleKind());
-    ctx["schedule"] = dsl::makeStr(sk.str());
-  }
-
-  return ctx;
-}
+// NOTE: wsloops are always nested inside a parallel (valid OpenMP never emits a
+// top-level worksharing loop), so they are moved into the parallel's ConstructOp
+// region here and lowered later by OmpOutliningPass, which builds the full
+// wsloop context (last/stride/chunk) itself.  There is deliberately no
+// extractWsloopContext / wsloop handling in this pass.
 
 static llvm::StringMap<dsl::Value>
 extractBarrierContext(omp::BarrierOp /*op*/) {
@@ -280,7 +264,6 @@ struct OmpToOmpLowerPass
 
     // Collect ops before modifying the IR
     SmallVector<omp::ParallelOp> parallels;
-    SmallVector<omp::WsloopOp>   wsloops;
     SmallVector<omp::BarrierOp>  barriers;
     SmallVector<omp::TaskOp>     tasks;
     module.walk([&](omp::ParallelOp op) { parallels.push_back(op); });
@@ -291,13 +274,11 @@ struct OmpToOmpLowerPass
     // afterwards into nested ConstructOps.  Pre-order walk guarantees an outer
     // task is processed before a task nested inside it.
     module.walk([&](omp::TaskOp op) { tasks.push_back(op); });
-    // Only collect wsloops and barriers that are NOT nested inside a parallel.
-    // Those inside a parallel are part of its body region and will be handled
-    // by the outlining pass after the parallel body is moved.
-    module.walk([&](omp::WsloopOp op) {
-      if (!op->getParentOfType<omp::ParallelOp>())
-        wsloops.push_back(op);
-    });
+    // Only collect barriers that are NOT nested inside a parallel.  Those inside
+    // a parallel are part of its body region and will be handled by the
+    // outlining pass after the parallel body is moved.  Wsloops are always
+    // nested inside a parallel and are lowered entirely by the outlining pass,
+    // so they are not collected here.
     module.walk([&](omp::BarrierOp op) {
       if (!op->getParentOfType<omp::ParallelOp>())
         barriers.push_back(op);
@@ -370,11 +351,6 @@ struct OmpToOmpLowerPass
       Value ifClause = op.getIfExpr();
       if (!process(op, "task", extractTaskContext(op),
                    &op.getRegion(), /*numThreads=*/nullptr, ifClause)) return;
-    }
-
-    for (auto op : wsloops) {
-      if (!op->getBlock()) continue;
-      if (!process(op, "wsloop", extractWsloopContext(op))) return;
     }
 
     for (auto op : barriers) {

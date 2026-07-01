@@ -1378,7 +1378,9 @@ struct OmpOutliningPass
       ctx["upper"]      = dsl::makeStr("%ub");
       ctx["step"]       = dsl::makeStr("%step");
       ctx["last"]       = dsl::makeStr("%last");
-      ctx["chunk"]      = dsl::makeInt(1);
+      // Removed: no construct references a bare `chunk`; the static schedule's
+      // chunk size flows from the runtime-level `let default_chunk` in rules.dsl.
+      // ctx["chunk"]      = dsl::makeInt(1);
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
