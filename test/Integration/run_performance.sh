@@ -21,12 +21,20 @@
 # together with its standard deviation. A cell whose relative std-dev exceeds
 # VARIANCE_ACCEPTED% is flagged (noisy machine / background load).
 #
+# RUNTIME=pmsis (PULP/gvsoc) builds the same 2x2 matrix but through the
+# PolyBench-PULP harness Makefile (PULP_APP_DIR): ref = the PULP-SDK gcc
+# (plain / OMP_NATIVE=1), opt = our riscv32 kernel.o (OMP_OPT=1). Cycles come
+# from the 'Cycles = N' line in the gvsoc run log — one run per cell, the
+# simulator is deterministic — and four binary-size columns are appended to
+# the CSV. Only runs on machines with the GAP SDK + gvsoc installed.
+#
 # All shared setup (config, tools, kernel lists, the compile pipeline) lives in
 # common.sh — same config.env as run_correctness.sh.
 #
 # Usage:
 #   ./run_performance.sh                              # all kernels, defaults
 #   RUNTIME=libgomp ./run_performance.sh              # pick the runtime
+#   RUNTIME=pmsis ./run_performance.sh                # PULP/gvsoc (needs GAP SDK)
 #   DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 #   ./run_performance.sh path/to/kernel-omp.c         # a single kernel
 #   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
@@ -113,6 +121,56 @@ ratio() {
         'BEGIN { if (b+0 == 0) print "NA"; else printf "%.4f", a / b }'
 }
 
+# --- Per-kernel driver: pulp/gvsoc -----------------------------------------
+# One gvsoc run per cell (build+run are fused in the harness 'make', and the
+# simulator is deterministic, so REPS does not apply). Also records the size
+# of the linked ELF for each cell.
+run_kernel_pulp() {
+    local src="$1" name="$2"
+    local d="$OUTDIR/$name/performance"
+    mkdir -p "$d"
+
+    echo -e "${BOLD}── $name${RESET}" >&2
+
+    local -A CYC SIZ
+    local cell res i=1
+    for cell in ref_seq ref_par opt_seq opt_par; do
+        echo "  [$i/4] $cell (gvsoc build+run)..." >&2
+        : > "$d/$cell.log"
+        if ! res="$(pulp_cell "$src" "$cell" "$d" "$d/$cell.log")"; then
+            echo "  ERROR: $cell failed" >&2; emit_na "$name"; return
+        fi
+        CYC[$cell]="${res%%;*}"; SIZ[$cell]="${res##*;}"
+        [ "${CYC[$cell]}" = "NA" ] && \
+            echo -e "    ${YELLOW}WARNING: no 'Cycles =' line in $d/$cell.log${RESET}" >&2
+        echo -e "    ${BOLD}$cell: ${CYC[$cell]} cyc${RESET} (elf ${SIZ[$cell]} B)" >&2
+        i=$((i + 1))
+    done
+
+    # --- derived metrics (NA-propagating) -----------------------------------
+    local SP_NATIVE=NA SP_OPT=NA OPT_VS_NAT_PAR=NA OPT_VS_NAT_SEQ=NA
+    if [ "${CYC[ref_seq]}" != "NA" ] && [ "${CYC[ref_par]}" != "NA" ] &&
+       [ "${CYC[opt_seq]}" != "NA" ] && [ "${CYC[opt_par]}" != "NA" ]; then
+        SP_NATIVE=$(ratio "${CYC[ref_seq]}" "${CYC[ref_par]}")
+        SP_OPT=$(ratio    "${CYC[opt_seq]}" "${CYC[opt_par]}")
+        OPT_VS_NAT_PAR=$(ratio "${CYC[ref_par]}" "${CYC[opt_par]}")
+        OPT_VS_NAT_SEQ=$(ratio "${CYC[ref_seq]}" "${CYC[opt_seq]}")
+    fi
+
+    {
+        echo ""
+        printf "  %-22s %18s %18s\n" "" "native (ref)" "our tool (opt)"
+        printf "  %-22s %18s %18s\n" "seq cycles" "${CYC[ref_seq]}" "${CYC[opt_seq]}"
+        printf "  %-22s %18s %18s\n" "par cycles" "${CYC[ref_par]}" "${CYC[opt_par]}"
+        printf "  %-22s %18s %18s\n" "self speedup seq→par" "${SP_NATIVE}x" "${SP_OPT}x"
+        printf "  %-22s %18s\n" "opt vs native (par)" "${OPT_VS_NAT_PAR}x"
+        printf "  %-22s %18s\n" "opt vs native (seq)" "${OPT_VS_NAT_SEQ}x"
+        echo ""
+    } >&2
+
+    echo "${name};${CYC[ref_seq]};${CYC[ref_par]};${CYC[opt_seq]};${CYC[opt_par]};${SP_NATIVE};${SP_OPT};${OPT_VS_NAT_PAR};${OPT_VS_NAT_SEQ};${SIZ[ref_seq]};${SIZ[ref_par]};${SIZ[opt_seq]};${SIZ[opt_par]}" >> "$CSV"
+}
+
 # --- Per-kernel driver -----------------------------------------------------
 run_kernel() {
     local kernel="$1" src
@@ -121,6 +179,12 @@ run_kernel() {
         return
     fi
     local name; name="$(basename "${src%-omp.c}")-omp"
+
+    if [ "$TARGET" = "pulp" ]; then
+        run_kernel_pulp "$src" "$name"
+        return
+    fi
+
     local d="$OUTDIR/$name/performance"
     mkdir -p "$d"
 
@@ -170,19 +234,32 @@ run_kernel() {
 }
 
 emit_na() {
-    echo "$1;NA;NA;NA;NA;NA;NA;NA;NA" >> "$CSV"
+    local row="$1;NA;NA;NA;NA;NA;NA;NA;NA"
+    [ "$TARGET" = "pulp" ] && row="$row;NA;NA;NA;NA"
+    echo "$row" >> "$CSV"
 }
 
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_performance.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
+[ "$TARGET" = "pulp" ] && \
+    CSV_HEADER="$CSV_HEADER;size_ref_seq;size_ref_par;size_opt_seq;size_opt_par"
 
 echo "=== MLIR OpenMP PERFORMANCE COMPARISON ==="
-echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
-echo "ref cc : $REF_CC    reps: $REPS    timer: cycle-accurate TSC"
-echo "polybench: $POLYBENCH"
-echo "rules: $RULES"
+if [ "$TARGET" = "pulp" ]; then
+    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET    suite: $SUITE"
+    echo "app dir: $PULP_APP_DIR"
+    echo "ref: pulp-sdk gcc (make / OMP_NATIVE=1)    opt: CIR/MLIR kernel.o (OMP_OPT=1)"
+    echo "timer: 'Cycles =' from the gvsoc log — 1 run/cell (simulator is deterministic)"
+    echo "polybench: $POLYBENCH"
+    echo "rules: $RULES"
+else
+    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
+    echo "ref cc : $REF_CC    reps: $REPS    timer: cycle-accurate TSC"
+    echo "polybench: $POLYBENCH"
+    echo "rules: $RULES"
+fi
 echo ""
 
 echo "$CSV_HEADER" > "$CSV"
@@ -214,7 +291,12 @@ echo "GEOMEAN;;;;;${GM_NATIVE};${GM_OPT};${GM_VS_PAR};${GM_VS_SEQ}" >> "$CSV"
 
 # --- Console table ---------------------------------------------------------
 echo ""
-echo -e "${BOLD}=== SUMMARY (${DATASET}, ${THREADS}T, runtime=${RUNTIME}) ===${RESET}"
+if [ "$TARGET" = "pulp" ]; then
+    SUMMARY_LABEL="${DATASET}, ${PULP_PLATFORM}, runtime=${RUNTIME}"
+else
+    SUMMARY_LABEL="${DATASET}, ${THREADS}T, runtime=${RUNTIME}"
+fi
+echo -e "${BOLD}=== SUMMARY (${SUMMARY_LABEL}) ===${RESET}"
 printf "${BOLD}  %-20s %10s %10s %12s %12s${RESET}\n" \
     "kernel" "nat s→p" "opt s→p" "opt/nat par" "opt/nat seq"
 awk -F';' 'NR > 1 && $1 != "GEOMEAN" {

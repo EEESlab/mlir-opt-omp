@@ -26,8 +26,14 @@ A third, lighter driver covers the task construct:
 
 In both, the two compilers are:
 
-- **ref** — a stock OpenMP compiler (clang for `iomp`, gcc for `libgomp`)
+- **ref** — a stock OpenMP compiler (clang for `iomp`, gcc for `libgomp`, the
+  PULP-SDK gcc for `pmsis`)
 - **opt** — the full CIR/MLIR pipeline through `mlir-opt-omp`
+
+Three runtimes are supported by the same drivers and the same `config.env`:
+`iomp` and `libgomp` compile and run on the host; `pmsis` cross-compiles for
+PULP/GAP8 and runs on the **gvsoc** simulator (see
+[PULP / gvsoc](#pulp--gvsoc-runtimepmsis) below).
 
 This is the slow, whole-pipeline layer (needs clang-cir, cir-opt, mlir tools,
 an OpenMP runtime and a PolyBench checkout). For fast per-pass IR checks see
@@ -146,6 +152,52 @@ results/
   <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
 
+## PULP / gvsoc (`RUNTIME=pmsis`)
+
+The same two drivers also target PULP/GAP8 through the **gvsoc** simulator.
+This only runs on machines with the GAP SDK + gvsoc installed — per-machine
+setups live in `config.env.pulp-workstation.example` and
+`config.env.pulp-tagliavini.example` (copy one to `config.env`).
+
+Instead of compiling host binaries, each cell is one invocation of the
+PolyBench-PULP harness Makefile (`PULP_APP_DIR`), which builds **and** runs on
+gvsoc in one shot:
+
+|              | sequential                  | parallel                            |
+|--------------|-----------------------------|-------------------------------------|
+| native (ref) | `make ... KERNEL_SRC=k.c`   | `make ... OMP_NATIVE=1` (SDK OpenMP)|
+| our tool(opt)| `kernel.o` (no omp) + `make ... OMP_OPT=1` | `kernel.o` (omp) + `make ... OMP_OPT=1` |
+
+For the opt cells, `common.sh` cross-compiles the kernel to
+`$PULP_APP_DIR/kernel.o` first: clang→CIR → `mlir-opt-omp`
+(`--omp-lower-runtime=pmsis`) → LLVM IR → `$PULP_LLC` (riscv32, `+xpulpv`).
+`PULP_OPT`/`PULP_LLC` point at a RISC-V-capable LLVM install, which may differ
+from the host tools.
+
+Differences from the native runtimes:
+
+- **Cycles** are scraped from the `Cycles = N` line the harness prints on the
+  gvsoc console; each cell runs **once** (`REPS` ignored — the simulator is
+  deterministic). `THREADS` is ignored too (core count is fixed by the harness
+  `NUM_CORES`).
+- **Correctness** compares the `==BEGIN/END DUMP_ARRAYS==` sections extracted
+  from the two gvsoc console logs (ref = `OMP_NATIVE=1`, opt = `OMP_OPT=1`).
+- **Performance** appends four `size_*` columns (bytes of the linked ELF,
+  `$PULP_BUILD_BIN`) to `results_performance.csv`; the speedup/geomean columns
+  are unchanged.
+- `DATASET` defaults to `MINI_DATASET` (GAP8 memory) and — like
+  `PULP_POLYBENCH_DEFS` — **must match what the harness Makefile defines** for
+  the native builds, otherwise ref and opt are not comparable.
+
+```sh
+RUNTIME=pmsis ./run_correctness.sh                 # needs config.env for pulp
+RUNTIME=pmsis ./run_performance.sh
+RUNTIME=pmsis PULP_VERBOSE=1 ./run_performance.sh linear-algebra/blas/gemm/gemm-omp.c
+```
+
+Per-cell build/run logs are kept under `results/<kernel>-omp/...` (`run.log`,
+`ref_seq.log`, ...), together with the final `.ll` of the opt kernels.
+
 ## Configuration reference
 
 All variables, with their defaults, are documented in
@@ -158,7 +210,11 @@ All variables, with their defaults, are documented in
 | `POLYBENCH`    | PolyBench-OpenMP checkout root                       |
 | `RULES`        | DSL file (defaults to the repo's `rules.dsl`)        |
 | `INC_OMP`      | OpenMP headers for the clang→CIR front-end           |
-| `RUNTIME`      | `iomp` or `libgomp`                                  |
+| `RUNTIME`      | `iomp`, `libgomp` or `pmsis` (PULP/gvsoc)            |
+| `PULP_APP_DIR` | (pmsis) PolyBench-PULP harness dir (PULP-SDK Makefile) |
+| `PULP_OPT` / `PULP_LLC` | (pmsis) riscv32-capable LLVM `opt`/`llc`    |
+| `PULP_SDK_ENV` | (pmsis) GAP SDK env script to source (optional)      |
+| `PULP_PLATFORM`| (pmsis) `gvsoc` (default) or `board`                 |
 | `DATASET`      | PolyBench dataset size macro                         |
 | `THREADS`      | thread count for parallel runs                       |
 | `SUITE`        | `bundled` (vendored kernels) or `full`              |
