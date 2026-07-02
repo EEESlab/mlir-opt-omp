@@ -1176,10 +1176,10 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     // This avoids the per-thread DIVMOD (SDiv + SRem) of the balanced scheme:
     // a single ceiling-division computes the chunk and the upper bound is
     // clamped with a select.  The helper function names come from the DSL
-    // properties thread_id_function / num_thread_function, so this code path
+    // properties thread_id_function / num_threads_function, so this code path
     // serves any runtime that exposes such helpers.
     std::string threadIdFn  = getStrProp("thread_id_function");
-    std::string numThreadFn = getStrProp("num_thread_function");
+    std::string numThreadFn = getStrProp("num_threads_function");
     Value threadId   = emitNoArgI32Call(module, builder, loc, threadIdFn);
     Value numThreads = emitNoArgI32Call(module, builder, loc, numThreadFn);
 
@@ -1378,7 +1378,9 @@ struct OmpOutliningPass
       ctx["upper"]      = dsl::makeStr("%ub");
       ctx["step"]       = dsl::makeStr("%step");
       ctx["last"]       = dsl::makeStr("%last");
-      ctx["chunk"]      = dsl::makeInt(1);
+      // Removed: no construct references a bare `chunk`; the static schedule's
+      // chunk size flows from the runtime-level `let default_chunk` in rules.dsl.
+      // ctx["chunk"]      = dsl::makeInt(1);
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
