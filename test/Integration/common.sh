@@ -44,7 +44,7 @@ if [ -f "$COMMON_DIR/config.env" ]; then
     for __v in LLVM_BIN OMP_TOOL_BIN CLANG GCC OPT LLC CIR_OPT MLIR_OPT \
                MLIR_TRANSLATE MLIR_OPT_OMP POLYBENCH POLYBENCH_UTIL RULES \
                INC_OMP OUTDIR RUNTIME DATASET THREADS SUITE KERNELS REPS \
-               VARIANCE_ACCEPTED POLYBENCH_LFLAGS CLANG_STRICT_FP GCC_STRICT_FP \
+               VARIANCE_ACCEPTED PLOT POLYBENCH_LFLAGS CLANG_STRICT_FP GCC_STRICT_FP \
                OMP_PLACES OMP_PROC_BIND; do
         [ -n "${!__v+x}" ] && __preset="$__preset $__v=$(printf '%q' "${!__v}")"
     done
