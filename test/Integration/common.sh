@@ -138,6 +138,11 @@ case "$RUNTIME" in
         ;;
 esac
 
+# Runtime tag appended to every result artifact (CSV, plot, per-kernel dirs) so
+# runs against different runtimes don't overwrite each other — an iomp run only
+# replaces a previous iomp run, never a libgomp one.
+RUNTIME_TAG="_${RUNTIME}"
+
 # --- Kernel lists ----------------------------------------------------------
 # Bundled in this repo (paths relative to $POLYBENCH).
 BUNDLED_KERNELS=(

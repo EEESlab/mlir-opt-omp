@@ -32,11 +32,14 @@
 #   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
 #   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
 #
-# CSV output (under $OUTDIR, default ./results):
-#   results_performance.csv      one row per kernel + a GEOMEAN summary row
-#   <kernel>-omp/performance/...  the four binaries and their raw timing logs
-#   results_performance.png       speedup bar chart (only when PLOT=true; needs
-#                                 python3 + matplotlib — see plot_speedup.py)
+# CSV output (under $OUTDIR, default ./results). Every artifact carries a
+# _<runtime> tag (e.g. _iomp, _libgomp) so runs against different runtimes
+# don't overwrite each other:
+#   results_performance_<runtime>.csv   one row per kernel + a GEOMEAN row
+#   <kernel>-omp/performance_<runtime>/...  the four binaries and raw timing logs
+#   results_performance_<runtime>.png   speedup bar chart (only when PLOT=true;
+#                                       needs python3 + matplotlib — see
+#                                       plot_speedup.py)
 # =============================================================================
 
 set -uo pipefail
@@ -125,7 +128,7 @@ run_kernel() {
         return
     fi
     local name; name="$(basename "${src%-omp.c}")-omp"
-    local d="$OUTDIR/$name/performance"
+    local d="$OUTDIR/$name/performance$RUNTIME_TAG"
     mkdir -p "$d"
 
     echo -e "${BOLD}── $name${RESET}" >&2
@@ -189,7 +192,7 @@ is_true() {
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
 render_plot() {
     local script="$SCRIPT_DIR/plot_speedup.py"
-    local png="$OUTDIR/results_performance.png"
+    local png="$OUTDIR/results_performance$RUNTIME_TAG.png"
     local py
     py="$(command -v python3 || command -v python)" || {
         echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
@@ -210,7 +213,7 @@ render_plot() {
 
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_performance.csv"
+CSV="$OUTDIR/results_performance$RUNTIME_TAG.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
 
 echo "=== MLIR OpenMP PERFORMANCE COMPARISON ==="

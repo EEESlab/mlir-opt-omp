@@ -45,7 +45,7 @@ run_kernel() {
     fi
     local name; name="$(basename "${src%-omp.c}")-omp"
     local base="$OUTDIR/$name"
-    local ref_dir="$base/ref" opt_dir="$base/opt"
+    local ref_dir="$base/ref$RUNTIME_TAG" opt_dir="$base/opt$RUNTIME_TAG"
     mkdir -p "$ref_dir" "$opt_dir"
 
     echo "── $name"
@@ -75,7 +75,7 @@ run_kernel() {
 
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_correctness.csv"
+CSV="$OUTDIR/results_correctness$RUNTIME_TAG.csv"
 
 echo "=== MLIR OpenMP CORRECTNESS CHECK ==="
 echo "runtime: $RUNTIME    dataset: $DATASET    threads: $THREADS    suite: $SUITE"
