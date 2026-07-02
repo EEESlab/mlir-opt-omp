@@ -58,6 +58,11 @@ VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
 OUTDIR="${OUTDIR:-$PWD/results}"
 PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
 
+# Runtime tag appended to every performance artifact (CSV, plot, per-kernel
+# dirs) so runs against different runtimes don't overwrite each other — an
+# iomp run only replaces a previous iomp run, never a libgomp one.
+RUNTIME_TAG="_${RUNTIME}"
+
 # Performance times the kernel with the cycle-accurate TSC timer. This is
 # mutually exclusive with -DPOLYBENCH_DUMP_ARRAYS, hence its own CFLAGS.
 POLYBENCH_CFLAGS="-DPOLYBENCH_TIME -DPOLYBENCH_CYCLE_ACCURATE_TIMER $POLYBENCH_ROOT_CFLAGS"
