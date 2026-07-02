@@ -84,15 +84,13 @@ points to a file).
 
 ## Output
 
-Everything lands under `$OUTDIR` (default `./results/`). Every artifact carries
-a `_<runtime>` tag (`_iomp`, `_libgomp`, ...) so runs against different runtimes
-don't overwrite each other:
+Everything lands under `$OUTDIR` (default `./results/`):
 
 ```
 results/
-  results_correctness_<runtime>.csv    # kernel;PASS|FAIL|ERROR
-  <kernel>-omp/ref_<runtime>/{<bin>,dump.txt}
-  <kernel>-omp/opt_<runtime>/{<bin>,<bin>.ll,dump.txt}   # final LLVM IR kept for debugging
+  results_correctness.csv         # kernel;PASS|FAIL|ERROR
+  <kernel>-omp/ref/{<bin>,dump.txt}
+  <kernel>-omp/opt/{<bin>,<bin>.ll,dump.txt}   # final LLVM IR kept for debugging
 ```
 
 The script exits non-zero if any kernel is not PASS, so it can gate CI.
