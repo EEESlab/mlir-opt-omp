@@ -54,7 +54,7 @@ if [ -f "$COMMON_DIR/config.env" ]; then
                OMP_PLACES OMP_PROC_BIND WARN_SUPPRESS \
                PULP_APP_DIR PULP_PLATFORM PULP_MAKE PULP_MAKE_ARGS PULP_OPT \
                PULP_LLC PULP_OPT_FLAGS PULP_LLC_FLAGS PULP_BUILD_BIN \
-               PULP_POLYBENCH_DEFS PULP_SDK_ENV PULP_VERBOSE; do
+               PULP_POLYBENCH_DEFS PULP_SDK_ENV PULP_TOOLCHAIN_BIN PULP_VERBOSE; do
         [ -n "${!__v+x}" ] && __preset="$__preset $__v=$(printf '%q' "${!__v}")"
     done
     # shellcheck disable=SC1091
@@ -168,13 +168,29 @@ unset __DATASET_EXPLICIT
 # OMP_NATIVE=1 builds the kernel with the SDK's native OpenMP; OMP_OPT=1 links
 # the kernel.o we cross-compile through mlir-opt-omp (runtime=pmsis) instead.
 if [ "${TARGET}" = "pulp" ]; then
+    # GAP RISC-V GCC toolchain used by the PULP-SDK make (prepended to PATH),
+    # e.g. .../gap_riscv_toolchain_ubuntu/INSTALL/bin.
+    PULP_TOOLCHAIN_BIN="${PULP_TOOLCHAIN_BIN:-}"
+    [ -n "$PULP_TOOLCHAIN_BIN" ] && PATH="$PULP_TOOLCHAIN_BIN:$PATH"
+
     # Optional: a script to source for the GAP SDK environment
-    # (e.g. $GAP_SDK/configs/gapuino_v3.sh). Alternatively source it yourself
-    # before running the driver.
+    # (e.g. $GAP_SDK/configs/gap8_v3.sh). Alternatively source it yourself
+    # before running the driver. SDK scripts routinely reference unset
+    # variables, so relax `set -u` around the source.
     if [ -n "${PULP_SDK_ENV:-}" ]; then
+        __had_u=0; case "$-" in *u*) __had_u=1;; esac
+        set +u
         # shellcheck disable=SC1090
         . "$PULP_SDK_ENV" || { echo "ERROR: could not source PULP_SDK_ENV=$PULP_SDK_ENV" >&2; exit 2; }
+        [ "$__had_u" = 1 ] && set -u
+        unset __had_u
     fi
+
+    # The SDK env and the toolchain may have prepended their own dirs; put the
+    # LLVM/CIR tools and mlir-opt-omp back in front so ours always win.
+    [ -n "$LLVM_BIN" ]     && PATH="$LLVM_BIN:$PATH"
+    [ -n "$OMP_TOOL_BIN" ] && PATH="$OMP_TOOL_BIN:$PATH"
+    export PATH
 
     PULP_APP_DIR="${PULP_APP_DIR:-}"
     if [ -z "$PULP_APP_DIR" ] || [ ! -f "$PULP_APP_DIR/Makefile" ]; then

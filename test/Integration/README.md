@@ -214,6 +214,7 @@ All variables, with their defaults, are documented in
 | `PULP_APP_DIR` | (pmsis) PolyBench-PULP harness dir (PULP-SDK Makefile) |
 | `PULP_OPT` / `PULP_LLC` | (pmsis) riscv32-capable LLVM `opt`/`llc`    |
 | `PULP_SDK_ENV` | (pmsis) GAP SDK env script to source (optional)      |
+| `PULP_TOOLCHAIN_BIN` | (pmsis) GAP RISC-V GCC toolchain bin dir (PATH) |
 | `PULP_PLATFORM`| (pmsis) `gvsoc` (default) or `board`                 |
 | `DATASET`      | PolyBench dataset size macro                         |
 | `THREADS`      | thread count for parallel runs                       |
