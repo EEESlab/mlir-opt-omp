@@ -40,14 +40,14 @@
 #   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
 #   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
 #
-# CSV output (under $OUTDIR, default ./results). Every artifact carries a
-# _<runtime> tag (e.g. _iomp, _libgomp, _pmsis) so runs against different
-# runtimes don't overwrite each other:
-#   results_performance_<runtime>.csv   one row per kernel + a GEOMEAN row
-#   <kernel>-omp/performance_<runtime>/...  the four binaries and raw timing logs
-#   results_performance_<runtime>.png   speedup bar chart (only when PLOT=true;
-#                                       needs python3 + matplotlib — see
-#                                       plot_speedup.py)
+# Output lands under $OUTDIR/<runtime> (default ./results/<runtime>), one
+# folder per runtime (iomp, libgomp, pmsis) so runs against different runtimes
+# never overwrite each other:
+#   results_performance.csv        one row per kernel + a GEOMEAN row
+#   <kernel>-omp/performance/...   the four binaries and raw timing logs
+#   results_performance.png        speedup bar chart (only when PLOT=true;
+#                                  needs python3 + matplotlib — see
+#                                  plot_speedup.py)
 # =============================================================================
 
 set -uo pipefail
@@ -63,13 +63,10 @@ DATASET_DEFAULT="LARGE_DATASET"
 THREADS="${THREADS:-16}"             # thread count for the parallel cells
 REPS="${REPS:-5}"                    # timed runs per cell (>=3; min+max dropped)
 VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
-OUTDIR="${OUTDIR:-$PWD/results}"
+# Results are split per runtime — results/<runtime>/... — so an iomp run only
+# replaces a previous iomp run, never a libgomp/pmsis one.
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
 PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
-
-# Runtime tag appended to every performance artifact (CSV, plot, per-kernel
-# dirs) so runs against different runtimes don't overwrite each other — an
-# iomp run only replaces a previous iomp run, never a libgomp/pmsis one.
-RUNTIME_TAG="_${RUNTIME}"
 
 # Performance times the kernel with the cycle-accurate TSC timer. This is
 # mutually exclusive with -DPOLYBENCH_DUMP_ARRAYS, hence its own CFLAGS.
@@ -139,7 +136,7 @@ ratio() {
 # of the linked ELF for each cell.
 run_kernel_pulp() {
     local src="$1" name="$2"
-    local d="$OUTDIR/$name/performance$RUNTIME_TAG"
+    local d="$OUTDIR/$name/performance"
     mkdir -p "$d"
 
     echo -e "${BOLD}── $name${RESET}" >&2
@@ -197,7 +194,7 @@ run_kernel() {
         return
     fi
 
-    local d="$OUTDIR/$name/performance$RUNTIME_TAG"
+    local d="$OUTDIR/$name/performance"
     mkdir -p "$d"
 
     echo -e "${BOLD}── $name${RESET}" >&2
@@ -263,7 +260,7 @@ is_true() {
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
 render_plot() {
     local script="$SCRIPT_DIR/plot_speedup.py"
-    local png="$OUTDIR/results_performance$RUNTIME_TAG.png"
+    local png="$OUTDIR/results_performance.png"
     local py
     py="$(command -v python3 || command -v python)" || {
         echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
@@ -284,7 +281,7 @@ render_plot() {
 
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_performance$RUNTIME_TAG.csv"
+CSV="$OUTDIR/results_performance.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
 [ "$TARGET" = "pulp" ] && \
     CSV_HEADER="$CSV_HEADER;size_ref_seq;size_ref_par;size_opt_seq;size_opt_par"

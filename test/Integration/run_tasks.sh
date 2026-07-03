@@ -40,9 +40,10 @@ trap 'rm -rf "$TMP"' EXIT
 fail=0
 
 # Where to keep the lowered IR for inspection. Mirrors the other drivers
-# (results/ is gitignored). One subdir per test; each pipeline stage is written
-# as a numbered file so the lowering can be read step by step.
-OUTDIR="${OUTDIR:-$PWD/results}"
+# (results/ is gitignored, split per runtime — this test is libgomp-only).
+# One subdir per test; each pipeline stage is written as a numbered file so
+# the lowering can be read step by step.
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
 DUMP_BASE="$OUTDIR/tasks"
 rm -rf "$DUMP_BASE"            # start clean so stale stages don't mislead
 mkdir -p "$DUMP_BASE"

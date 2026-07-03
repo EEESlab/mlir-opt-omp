@@ -90,13 +90,16 @@ points to a file).
 
 ## Output
 
-Everything lands under `$OUTDIR` (default `./results/`):
+Everything lands under `$OUTDIR/<runtime>` (default `./results/<runtime>/`),
+one folder per runtime — `iomp/`, `libgomp/`, `pmsis/` — so runs against
+different runtimes never overwrite each other:
 
 ```
 results/
-  results_correctness.csv         # kernel;PASS|FAIL|ERROR
-  <kernel>-omp/ref/{<bin>,dump.txt}
-  <kernel>-omp/opt/{<bin>,<bin>.ll,dump.txt}   # final LLVM IR kept for debugging
+  iomp/                           # (same layout under libgomp/ and pmsis/)
+    results_correctness.csv       # kernel;PASS|FAIL|ERROR
+    <kernel>-omp/ref/{<bin>,dump.txt}
+    <kernel>-omp/opt/{<bin>,<bin>.ll,dump.txt}   # final LLVM IR kept for debugging
 ```
 
 The script exits non-zero if any kernel is not PASS, so it can gate CI.
@@ -147,7 +150,7 @@ Set `PLOT=true` (config.env or inline) to render a bar chart of the
 **self-relative parallel speedup** per kernel once the run finishes — native
 (`ref_seq/ref_par`) vs our tool (`opt_seq/opt_par`), i.e. the `speedup_native`
 and `speedup_opt` columns. It covers whatever ran (`bundled`, `full`, or an
-explicit `KERNELS` list) and lands at `results/results_performance_<runtime>.png`. The
+explicit `KERNELS` list) and lands at `results/<runtime>/results_performance.png`. The
 native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
 
@@ -157,7 +160,7 @@ missing the run still succeeds and only the plot is skipped. You can also run it
 by hand on any existing CSV, e.g. for a vector figure:
 
 ```sh
-python3 plot_speedup.py results/results_performance_libgomp.csv fig.pdf --runtime libgomp
+python3 plot_speedup.py results/libgomp/results_performance.csv fig.pdf --runtime libgomp
 ```
 
 > The perf script defaults to `DATASET=LARGE_DATASET` (correctness defaults to
@@ -168,12 +171,11 @@ Output:
 
 ```
 results/
-  results_performance_<runtime>.csv    # per-kernel rows + a GEOMEAN summary row
-  <kernel>-omp/performance_<runtime>/  # the four binaries, their .ll, and *.log timings
+  <runtime>/                         # iomp/, libgomp/ or pmsis/
+    results_performance.csv          # per-kernel rows + a GEOMEAN summary row
+    results_performance.png          # speedup chart (when PLOT=true)
+    <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
-
-Every performance artifact carries the `_<runtime>` tag, so runs against
-different runtimes (`iomp`, `libgomp`, `pmsis`) don't overwrite each other.
 
 ## PULP / gvsoc (`RUNTIME=pmsis`)
 
@@ -220,7 +222,7 @@ RUNTIME=pmsis ./run_performance.sh
 RUNTIME=pmsis PULP_VERBOSE=1 ./run_performance.sh linear-algebra/blas/gemm/gemm-omp.c
 ```
 
-Per-cell build/run logs are kept under `results/<kernel>-omp/...` (`run.log`,
+Per-cell build/run logs are kept under `results/pmsis/<kernel>-omp/...` (`run.log`,
 `ref_seq.log`, ...), together with the final `.ll` of the opt kernels.
 
 ## Configuration reference
@@ -247,7 +249,7 @@ All variables, with their defaults, are documented in
 | `KERNELS`      | explicit space-separated kernel list (overrides `SUITE`) |
 | `REPS`         | (perf) timed runs per cell — min+max dropped         |
 | `VARIANCE_ACCEPTED` | (perf) warn if a cell's relative std-dev exceeds this % |
-| `PLOT`         | (perf) `true` → render `results_performance_<runtime>.png` (needs matplotlib) |
+| `PLOT`         | (perf) `true` → render `results/<runtime>/results_performance.png` (needs matplotlib) |
 
 Strict FP flags (`-ffp-contract=off`, no auto-vectorisation) are enabled by
 default and must match between ref and opt — without them FMA contraction and

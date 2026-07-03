@@ -39,7 +39,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Correctness-specific config -------------------------------------------
 THREADS="${THREADS:-16}"
 export OMP_NUM_THREADS="$THREADS"
-OUTDIR="${OUTDIR:-$PWD/results}"
+# Results are split per runtime — results/<runtime>/... — so an iomp run only
+# replaces a previous iomp run, never a libgomp/pmsis one.
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
 
 # Correctness dumps the arrays and diffs them.
 POLYBENCH_CFLAGS="-DPOLYBENCH_DUMP_ARRAYS $POLYBENCH_ROOT_CFLAGS"
