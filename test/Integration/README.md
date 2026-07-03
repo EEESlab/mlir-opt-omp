@@ -155,9 +155,18 @@ native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
 
 The rendering is done by [`plot_speedup.py`](plot_speedup.py) and needs
-`python3` + `matplotlib`/`numpy` (`pip install matplotlib numpy`); if they are
-missing the run still succeeds and only the plot is skipped. You can also run it
-by hand on any existing CSV, e.g. for a vector figure:
+`python3` + `matplotlib`/`numpy`; if they are missing the run still succeeds
+and only the plot is skipped. The recommended setup is a local venv (auto-picked
+when present; git-ignored):
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install matplotlib numpy
+```
+
+Python resolution order: `PLOT_PYTHON` (if set), then `./.venv/bin/python`,
+then `python3` from PATH. You can also run the script by hand on any existing
+CSV, e.g. for a vector figure:
 
 ```sh
 python3 plot_speedup.py results/libgomp/results_performance.csv fig.pdf --runtime libgomp

@@ -258,17 +258,28 @@ is_true() {
 
 # Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
+# Python resolution order: $PLOT_PYTHON, then the local venv ./.venv (create it
+# once with:  python3 -m venv .venv && .venv/bin/pip install matplotlib numpy),
+# then whatever python3 is on PATH.
 render_plot() {
     local script="$SCRIPT_DIR/plot_speedup.py"
     local png="$OUTDIR/results_performance.png"
     local py
-    py="$(command -v python3 || command -v python)" || {
-        echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
-        return
-    }
+    if [ -n "${PLOT_PYTHON:-}" ]; then
+        py="$PLOT_PYTHON"
+    elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+        py="$SCRIPT_DIR/.venv/bin/python"
+    else
+        py="$(command -v python3 || command -v python)" || {
+            echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
+            return
+        }
+    fi
     if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
-        echo -e "${YELLOW}[plot] matplotlib not installed" \
-                "(pip install matplotlib numpy) — skipping plot${RESET}" >&2
+        echo -e "${YELLOW}[plot] matplotlib not available in $py — skipping plot.${RESET}" >&2
+        echo -e "${YELLOW}[plot] set it up once with:${RESET}" >&2
+        echo -e "${YELLOW}[plot]   python3 -m venv $SCRIPT_DIR/.venv${RESET}" >&2
+        echo -e "${YELLOW}[plot]   $SCRIPT_DIR/.venv/bin/pip install matplotlib numpy${RESET}" >&2
         return
     fi
     echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2

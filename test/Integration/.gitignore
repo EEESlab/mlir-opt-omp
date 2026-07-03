@@ -3,3 +3,6 @@ config.env
 
 # Build/run artefacts.
 results/
+
+# Local python venv for the plot (see README "Speedup chart").
+.venv/
