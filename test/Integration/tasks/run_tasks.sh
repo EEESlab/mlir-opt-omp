@@ -5,11 +5,11 @@
 # Two checks, both ending in a real run against libgomp:
 #
 #   [1] MLIR  — a hand-written parallel { task { *p = 42 } } module
-#               (tasks/task_nested.mlir) lowered through mlir-opt-omp and run.
+#               (task_nested.mlir) lowered through mlir-opt-omp and run.
 #               Independent of the CIR front-end (does not need clang to emit
 #               omp.task), so it always exercises the lowering we own.
 #
-#   [2] C     — tasks/task_smoke.c compiled two ways and compared:
+#   [2] C     — task_smoke.c compiled two ways and compared:
 #                 ref : gcc -fopenmp
 #                 opt : clang->CIR->cir-opt->mlir-opt-omp->...->llc->link -lgomp
 #               This is the full front-end path; it depends on ClangIR emitting
@@ -20,7 +20,7 @@
 # visible after the parallel region's implicit barrier).  For [2] the ref and
 # opt outputs must also match.
 #
-# Tool locations come from common.sh (config.env / env vars).  libgomp only.
+# Tool locations come from ../common.sh (config.env / env vars).  libgomp only.
 #
 # Usage:
 #   ./run_tasks.sh
@@ -31,19 +31,20 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # This test targets libgomp; set before sourcing so common.sh picks the knobs.
 RUNTIME=libgomp
-# shellcheck source=common.sh
-. "$SCRIPT_DIR/common.sh"
+# shellcheck source=../common.sh
+. "$SCRIPT_DIR/../common.sh"
 
 EXPECTED="42"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-# Where to keep the lowered IR for inspection. Mirrors the other drivers
-# (results/ is gitignored, split per runtime — this test is libgomp-only).
+# Where to keep the lowered IR for inspection. Anchored to the Integration
+# dir so it lands next to the other drivers' results/ (gitignored, split per
+# runtime — this test is libgomp-only) no matter where the script is run from.
 # One subdir per test; each pipeline stage is written as a numbered file so
 # the lowering can be read step by step.
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
+OUTDIR="${OUTDIR:-$SCRIPT_DIR/../results}/$RUNTIME"
 DUMP_BASE="$OUTDIR/tasks"
 rm -rf "$DUMP_BASE"            # start clean so stale stages don't mislead
 mkdir -p "$DUMP_BASE"
@@ -111,7 +112,7 @@ echo ""
 
 # --- [1] hand-written MLIR -------------------------------------------------
 echo "── [1] MLIR: parallel { task }"
-if mlir_to_bin "$SCRIPT_DIR/tasks/task_nested.mlir" "$TMP/mlir_bin" \
+if mlir_to_bin "$SCRIPT_DIR/task_nested.mlir" "$TMP/mlir_bin" \
         "$DUMP_BASE/mlir_nested"; then
     got="$(OMP_NUM_THREADS=2 "$TMP/mlir_bin" 2>/dev/null || echo '<crash>')"
     echo "     output: '$got' (expected '$EXPECTED')"
@@ -127,7 +128,7 @@ echo ""
 
 # --- [2] C through the CIR front-end (ref vs opt) --------------------------
 echo "── [2] C: parallel { task }  (ref=gcc vs opt=CIR pipeline)"
-CSRC="$SCRIPT_DIR/tasks/task_smoke.c"
+CSRC="$SCRIPT_DIR/task_smoke.c"
 
 ref="<n/a>"
 if "$GCC" -O3 $GCC_STRICT_FP $WARN_SUPPRESS -fopenmp "$CSRC" -o "$TMP/c_ref"; then

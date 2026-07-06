@@ -107,7 +107,9 @@ The entry must load `shareds` from `task_t` before unpacking captures. This does
 ### 2.3 pmsis — embedded cluster
 
 PMSIS provides the fork/barrier team model (`ext_pi_cl_team_fork`,
-`ext_pi_cl_team_barrier`) but **no standard deferred-task API**. A task mapping
+`ext_pi_cl_team_barrier` — shims over the PMSIS API, see
+[`pmsis-interface-adapter.c`](pmsis-interface-adapter.c)) but **no standard
+deferred-task API**. A task mapping
 must be defined explicitly (e.g. a custom `ext_pi_cl_task_push` / wait pair, or
 declaring tasks unsupported on this target). No invented API is assumed here.
 
@@ -317,8 +319,8 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   checks the task is outlined into its own closure, the `GOMP_task` call lands
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
-- **`test/Integration/run_tasks.sh`** — two end-to-end checks against real
-  libgomp, both expecting `42`:
+- **`test/Integration/tasks/run_tasks.sh`** — two end-to-end checks against
+  real libgomp, both expecting `42`:
   - `tasks/task_nested.mlir` — hand-written `parallel { task { *p = 42 } }`
     lowered + linked + run. MLIR input, so independent of the CIR front-end.
   - `tasks/task_smoke.c` — same program in C, built with `gcc -fopenmp` (ref)

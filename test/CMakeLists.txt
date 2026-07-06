@@ -4,8 +4,8 @@
 # or:         llvm-lit -sv test/
 
 # The mlir-opt-omp executable is emitted in the build root (we deliberately do
-# not override LLVM_RUNTIME_OUTPUT_INTDIR, so the compile-*.sh scripts that
-# reference ../BUILD/mlir-opt-omp keep working).
+# not override LLVM_RUNTIME_OUTPUT_INTDIR, so the Integration configs that
+# point OMP_TOOL_BIN at the build directory keep working).
 set(OMP_LOWER_TOOLS_DIR ${CMAKE_BINARY_DIR})
 
 configure_lit_site_cfg(

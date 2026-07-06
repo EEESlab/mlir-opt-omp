@@ -1,0 +1,7 @@
+# compile-*.sh build artefacts.
+*.o
+*.ll
+*.cir
+*.mlir
+test
+test-ref

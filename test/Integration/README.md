@@ -8,10 +8,11 @@ PolyBench kernels and the same `config.env`:
 - **`run_performance.sh`** — times our tool against the native compiler and
   reports speedups (see [Performance](#performance) below).
 
-A third, lighter driver covers the task construct:
+A third, lighter driver covers the task construct (it lives in
+[`tasks/`](tasks/) together with its test cases):
 
-- **`run_tasks.sh`** — end-to-end smoke test for `omp.task` (libgomp), two
-  checks, both run against real libgomp and expecting `42`:
+- **`tasks/run_tasks.sh`** — end-to-end smoke test for `omp.task` (libgomp),
+  two checks, both run against real libgomp and expecting `42`:
   - **[1] MLIR** — a hand-written `parallel { task { *p = 42 } }` module
     ([`tasks/task_nested.mlir`](tasks/task_nested.mlir)) lowered through
     `mlir-opt-omp` + the MLIR/LLVM tools and linked `-lgomp`. Starts from MLIR,
@@ -22,7 +23,8 @@ A third, lighter driver covers the task construct:
     if your `clang-cir` lacks task support, [2] fails at the front-end while
     [1] still passes.
 
-  Run: `./run_tasks.sh`.
+  Run: `tasks/run_tasks.sh` (results land in `results/libgomp/tasks/`
+  regardless of the working directory).
 
 In both, the two compilers are:
 
@@ -150,7 +152,9 @@ Set `PLOT=true` (config.env or inline) to render a bar chart of the
 **self-relative parallel speedup** per kernel once the run finishes — native
 (`ref_seq/ref_par`) vs our tool (`opt_seq/opt_par`), i.e. the `speedup_native`
 and `speedup_opt` columns. It covers whatever ran (`bundled`, `full`, or an
-explicit `KERNELS` list) and lands at `results/<runtime>/results_performance.png`. The
+explicit `KERNELS` list) and lands at `results/<runtime>/results_performance_<sel>.png`,
+where `<sel>` names the selection — the suite (`_full`/`_bundled`) or, for an
+explicit `KERNELS` list, the kernel basename(s) (e.g. `_gemm-omp`). The
 native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
 
@@ -182,7 +186,8 @@ Output:
 results/
   <runtime>/                         # iomp/, libgomp/ or pmsis/
     results_performance.csv          # per-kernel rows + a GEOMEAN summary row
-    results_performance.png          # speedup chart (when PLOT=true)
+    results_performance_<sel>.png    # speedup chart (when PLOT=true); <sel> =
+                                     # suite (full/bundled) or kernel name(s)
     <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
 
@@ -209,6 +214,11 @@ For the opt cells, `common.sh` cross-compiles the kernel to
 (`--omp-lower-runtime=pmsis`) → LLVM IR → `$PULP_LLC` (riscv32, `+xpulpv`).
 `PULP_OPT`/`PULP_LLC` point at a RISC-V-capable LLVM install, which may differ
 from the host tools.
+
+The pmsis rules emit calls to a small `ext_pi_*` shim layer over the PMSIS
+API (fork/barrier/core-id); the harness provides and links those shims. A
+reference implementation is kept at
+[`docs/pmsis-interface-adapter.c`](../../docs/pmsis-interface-adapter.c).
 
 Differences from the native runtimes:
 
@@ -258,7 +268,7 @@ All variables, with their defaults, are documented in
 | `KERNELS`      | explicit space-separated kernel list (overrides `SUITE`) |
 | `REPS`         | (perf) timed runs per cell — min+max dropped         |
 | `VARIANCE_ACCEPTED` | (perf) warn if a cell's relative std-dev exceeds this % |
-| `PLOT`         | (perf) `true` → render `results/<runtime>/results_performance.png` (needs matplotlib) |
+| `PLOT`         | (perf) `true` → render `results/<runtime>/results_performance_<sel>.png` (needs matplotlib) |
 
 Strict FP flags (`-ffp-contract=off`, no auto-vectorisation) are enabled by
 default and must match between ref and opt — without them FMA contraction and

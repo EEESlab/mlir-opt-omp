@@ -45,9 +45,11 @@
 # never overwrite each other:
 #   results_performance.csv        one row per kernel + a GEOMEAN row
 #   <kernel>-omp/performance/...   the four binaries and raw timing logs
-#   results_performance.png        speedup bar chart (only when PLOT=true;
+#   results_performance_<sel>.png  speedup bar chart (only when PLOT=true;
 #                                  needs python3 + matplotlib — see
-#                                  plot_speedup.py)
+#                                  plot_speedup.py). <sel> is the kernel
+#                                  selection: the SUITE (full/bundled) or the
+#                                  explicit kernel name(s).
 # =============================================================================
 
 set -uo pipefail
@@ -256,6 +258,23 @@ is_true() {
     esac
 }
 
+# Suffix naming the kernel selection of this run, appended to the plot
+# filename: the SUITE name (full/bundled), or — when an explicit KERNELS list
+# (or a single-kernel argument) was given — the kernel basenames (the part
+# after the last '/', without the .c extension) joined by '_'.
+plot_suffix() {
+    if [ -n "${KERNELS:-}" ]; then
+        local k parts=()
+        for k in $KERNELS; do
+            k="${k##*/}"
+            parts+=("${k%.c}")
+        done
+        (IFS=_; printf '%s' "${parts[*]}")
+    else
+        printf '%s' "$SUITE"
+    fi
+}
+
 # Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
 # Python resolution order: $PLOT_PYTHON, then the local venv ./.venv (create it
@@ -263,7 +282,7 @@ is_true() {
 # then whatever python3 is on PATH.
 render_plot() {
     local script="$SCRIPT_DIR/plot_speedup.py"
-    local png="$OUTDIR/results_performance.png"
+    local png="$OUTDIR/results_performance_$(plot_suffix).png"
     local py
     if [ -n "${PLOT_PYTHON:-}" ]; then
         py="$PLOT_PYTHON"
@@ -318,6 +337,7 @@ echo "$CSV_HEADER" > "$CSV"
 select_kernels
 
 if [ $# -ge 1 ]; then
+    KERNELS="$1"   # so plot_suffix names the kernel, not the unused SUITE
     run_kernel "$1"
 else
     for k in "${KERNEL_LIST[@]}"; do
