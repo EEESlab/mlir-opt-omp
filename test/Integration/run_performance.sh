@@ -314,9 +314,40 @@ render_plot() {
     fi
 }
 
+# is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
+is_true() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
+# missing python/matplotlib is a warning, not a failure (the CSV is the result).
+render_plot() {
+    local script="$SCRIPT_DIR/plot_speedup.py"
+    local png="$OUTDIR/results_performance$RUNTIME_TAG.png"
+    local py
+    py="$(command -v python3 || command -v python)" || {
+        echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
+        return
+    }
+    if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
+        echo -e "${YELLOW}[plot] matplotlib not installed" \
+                "(pip install matplotlib numpy) — skipping plot${RESET}" >&2
+        return
+    fi
+    echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2
+    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME"; then
+        echo "  Plot  — $png"
+    else
+        echo -e "${YELLOW}[plot] plot_speedup.py failed — see output above${RESET}" >&2
+    fi
+}
+
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_performance.csv"
+CSV="$OUTDIR/results_performance$RUNTIME_TAG.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
 [ "$TARGET" = "pulp" ] && \
     CSV_HEADER="$CSV_HEADER;size_ref_seq;size_ref_par;size_opt_seq;size_opt_par"
