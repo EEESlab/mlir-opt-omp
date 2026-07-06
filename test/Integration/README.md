@@ -153,8 +153,9 @@ Set `PLOT=true` (config.env or inline) to render a bar chart of the
 (`ref_seq/ref_par`) vs our tool (`opt_seq/opt_par`), i.e. the `speedup_native`
 and `speedup_opt` columns. It covers whatever ran (`bundled`, `full`, or an
 explicit `KERNELS` list) and lands at `results/<runtime>/results_performance_<sel>.png`,
-where `<sel>` names the selection — the suite (`_full`/`_bundled`) or, for an
-explicit `KERNELS` list, the kernel basename(s) (e.g. `_gemm-omp`). The
+where `<sel>` names the selection — the suite (`full`/`bundled`) or, for an
+explicit `KERNELS` list, the kernel basename(s) — plus the dataset size, e.g.
+`_full_large` or `_gemm-omp_mini`. The
 native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
 
@@ -187,7 +188,8 @@ results/
   <runtime>/                         # iomp/, libgomp/ or pmsis/
     results_performance.csv          # per-kernel rows + a GEOMEAN summary row
     results_performance_<sel>.png    # speedup chart (when PLOT=true); <sel> =
-                                     # suite (full/bundled) or kernel name(s)
+                                     # suite (full/bundled) or kernel name(s),
+                                     # + dataset size (e.g. _full_large)
     <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
 

@@ -47,9 +47,10 @@
 #   <kernel>-omp/performance/...   the four binaries and raw timing logs
 #   results_performance_<sel>.png  speedup bar chart (only when PLOT=true;
 #                                  needs python3 + matplotlib — see
-#                                  plot_speedup.py). <sel> is the kernel
-#                                  selection: the SUITE (full/bundled) or the
-#                                  explicit kernel name(s).
+#                                  plot_speedup.py). <sel> = the kernel
+#                                  selection (the SUITE, full/bundled, or the
+#                                  explicit kernel name(s)) + the dataset size,
+#                                  e.g. _full_large or _gemm-omp_mini.
 # =============================================================================
 
 set -uo pipefail
@@ -258,21 +259,25 @@ is_true() {
     esac
 }
 
-# Suffix naming the kernel selection of this run, appended to the plot
-# filename: the SUITE name (full/bundled), or — when an explicit KERNELS list
-# (or a single-kernel argument) was given — the kernel basenames (the part
-# after the last '/', without the .c extension) joined by '_'.
+# Suffix naming what this run covered, appended to the plot filename:
+# the kernel selection — the SUITE name (full/bundled), or, when an explicit
+# KERNELS list (or a single-kernel argument) was given, the kernel basenames
+# (the part after the last '/', without the .c extension) joined by '_' —
+# followed by the dataset size (LARGE_DATASET -> large).
 plot_suffix() {
+    local sel
     if [ -n "${KERNELS:-}" ]; then
         local k parts=()
         for k in $KERNELS; do
             k="${k##*/}"
             parts+=("${k%.c}")
         done
-        (IFS=_; printf '%s' "${parts[*]}")
+        sel=$(IFS=_; printf '%s' "${parts[*]}")
     else
-        printf '%s' "$SUITE"
+        sel="$SUITE"
     fi
+    local ds="${DATASET%_DATASET}"
+    printf '%s_%s' "$sel" "${ds,,}"
 }
 
 # Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
