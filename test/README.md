@@ -60,7 +60,7 @@ mlir-opt-omp input.mlir --omp-lower-dsl=../rules.dsl --omp-lower-runtime=iomp \
 ## Integration tests (`Integration/`)
 
 End-to-end pipeline (C → CIR → MLIR → LLVM IR → object → linked binary) for each
-runtime. Three drivers share one compile pipeline (`Integration/common.sh`):
+runtime. Three drivers share one compile pipeline (`Integration/lib/common.sh`):
 
 - `run_correctness.sh` compiles every PolyBench kernel with both a stock OpenMP
   compiler and the `mlir-opt-omp` pipeline and diffs the array dumps, validating

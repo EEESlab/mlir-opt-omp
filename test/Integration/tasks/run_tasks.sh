@@ -20,7 +20,7 @@
 # visible after the parallel region's implicit barrier).  For [2] the ref and
 # opt outputs must also match.
 #
-# Tool locations come from ../common.sh (config.env / env vars).  libgomp only.
+# Tool locations come from ../lib/common.sh (config.env / env vars).  libgomp only.
 #
 # Usage:
 #   ./run_tasks.sh
@@ -31,8 +31,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # This test targets libgomp; set before sourcing so common.sh picks the knobs.
 RUNTIME=libgomp
-# shellcheck source=../common.sh
-. "$SCRIPT_DIR/../common.sh"
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
 
 EXPECTED="42"
 TMP="$(mktemp -d)"

@@ -1,7 +1,9 @@
 # Integration tests — end-to-end correctness & performance
 
-Two drivers share one compile pipeline (`common.sh`), against the same
-PolyBench kernels and the same `config.env`:
+Two drivers share the same setup (`lib/common.sh`, which pulls in the kernel
+lists from `lib/kernels.sh`, the host pipelines from `lib/native.sh` and — for
+`pmsis` — the PULP target from `lib/pulp.sh`), against the same PolyBench
+kernels and the same `config.env`:
 
 - **`run_correctness.sh`** — compiles each kernel twice and checks the two runs
   produce **bit-identical** array dumps.
@@ -159,7 +161,7 @@ explicit `KERNELS` list, the kernel basename(s) — plus the dataset size, e.g.
 native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
 
-The rendering is done by [`plot_speedup.py`](plot_speedup.py) and needs
+The rendering is done by [`lib/plot_speedup.py`](lib/plot_speedup.py) and needs
 `python3` + `matplotlib`/`numpy`; if they are missing the run still succeeds
 and only the plot is skipped. The recommended setup is a local venv (auto-picked
 when present; git-ignored):
@@ -174,7 +176,7 @@ then `python3` from PATH. You can also run the script by hand on any existing
 CSV, e.g. for a vector figure:
 
 ```sh
-python3 plot_speedup.py results/libgomp/results_performance.csv fig.pdf --runtime libgomp
+python3 lib/plot_speedup.py results/libgomp/results_performance.csv fig.pdf --runtime libgomp
 ```
 
 > The perf script defaults to `DATASET=LARGE_DATASET` (correctness defaults to
@@ -211,7 +213,8 @@ gvsoc in one shot:
 | native (ref) | `make ... KERNEL_SRC=k.c`   | `make ... OMP_NATIVE=1` (SDK OpenMP)|
 | our tool(opt)| `kernel.o` (no omp) + `make ... OMP_OPT=1` | `kernel.o` (omp) + `make ... OMP_OPT=1` |
 
-For the opt cells, `common.sh` cross-compiles the kernel to
+For the opt cells, `lib/pulp.sh` (sourced by `lib/common.sh` when `RUNTIME=pmsis`)
+cross-compiles the kernel to
 `$PULP_APP_DIR/kernel.o` first: clang→CIR → `mlir-opt-omp`
 (`--omp-lower-runtime=pmsis`) → LLVM IR → `$PULP_LLC` (riscv32, `+xpulpv`).
 `PULP_OPT`/`PULP_LLC` point at a RISC-V-capable LLVM install, which may differ

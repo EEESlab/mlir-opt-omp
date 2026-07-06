@@ -59,8 +59,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Perf wants a real workload by default; MINI is dominated by thread-spawn cost.
 # DATASET / config.env still override this (see common.sh).
 DATASET_DEFAULT="LARGE_DATASET"
-# shellcheck source=common.sh
-. "$SCRIPT_DIR/common.sh"
+# shellcheck source=lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
 
 # --- Performance-specific config -------------------------------------------
 THREADS="${THREADS:-16}"             # thread count for the parallel cells
@@ -286,7 +286,7 @@ plot_suffix() {
 # once with:  python3 -m venv .venv && .venv/bin/pip install matplotlib numpy),
 # then whatever python3 is on PATH.
 render_plot() {
-    local script="$SCRIPT_DIR/plot_speedup.py"
+    local script="$SCRIPT_DIR/lib/plot_speedup.py"
     local png="$OUTDIR/results_performance_$(plot_suffix).png"
     local py
     if [ -n "${PLOT_PYTHON:-}" ]; then
