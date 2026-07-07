@@ -159,6 +159,27 @@ static SmallVector<Value> collectCaptures(Region &region) {
   return captures;
 }
 
+// Partition captures into the three special-cased kinds shared by every
+// outlining path: privatizer captures, scalar-alloca captures, and ptr-alloca
+// captures.
+// Anything in none of these sets is captured as-is.  The order matters: each
+// test excludes values already claimed by an earlier set.
+static void classifyCaptures(ArrayRef<Value> captures, Region &region,
+                             llvm::SetVector<Value> &privateCaptures,
+                             llvm::SetVector<Value> &scalarAllocaCaptures,
+                             llvm::SetVector<Value> &ptrAllocaCaptures) {
+  for (auto cap : captures)
+    if (isPrivateCapture(cap, region))
+      privateCaptures.insert(cap);
+  for (auto cap : captures)
+    if (!privateCaptures.contains(cap) && isScalarAllocaCapture(cap, region))
+      scalarAllocaCaptures.insert(cap);
+  for (auto cap : captures)
+    if (!privateCaptures.contains(cap) && !scalarAllocaCaptures.contains(cap) &&
+        isPtrAllocaCapture(cap, region))
+      ptrAllocaCaptures.insert(cap);
+}
+
 static void replaceUsesInRegion(Region &region, Value oldVal, Value newVal) {
   for (auto &use : llvm::make_early_inc_range(oldVal.getUses()))
     if (region.isAncestor(use.getOwner()->getParentRegion()))
@@ -321,6 +342,316 @@ static Value getOrCreateIdent(ModuleOp module, OpBuilder &builder, Location loc,
 }
 
 // ---------------------------------------------------------------------------
+// Capture-layout helpers (shared by closure and task_entry paths)
+// ---------------------------------------------------------------------------
+// Both paths use the "packed" capture topology: the SAME struct
+// { field_0, ..., field_N-1 }.  They differ only in where it lives and how the
+// body reaches it:
+//   closure (libgomp) : struct on the caller stack; body gets a direct ptr.
+//   task_entry (iomp) : runtime-allocated; body reaches it via
+//                       load(task->shareds).
+// These three helpers factor out the field-type layout, the prolog unpack, and
+// the call-site populate so the two paths share one implementation.
+
+// Build the capture-struct field types (scalar-alloca capture → its element
+// type, packed by value; otherwise the captured value's own type) and return
+// the literal struct type.  `fieldTypes` is filled with the field types.
+static LLVM::LLVMStructType buildCaptureStruct(
+    MLIRContext *ctx, ArrayRef<Value> captures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    SmallVectorImpl<Type> &fieldTypes) {
+  for (auto cap : captures) {
+    if (scalarAllocaCaptures.contains(cap))
+      fieldTypes.push_back(cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
+    else
+      fieldTypes.push_back(cap.getType());
+  }
+  return LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+}
+
+// In the function prolog (builder `b`), unpack each capture from the struct at
+// `structBase`, rewrite its uses inside `fnBody`, and — if `loadedCaptures` is
+// non-null — record the per-capture unpacked value (used by the packed path's
+// firstprivate handling).  `one64` is a shared i64 constant 1 for the allocas.
+static void unpackCapturesFromBase(
+    OpBuilder &b, Location loc, Value one64, Value structBase,
+    LLVM::LLVMStructType structTy, ArrayRef<Value> captures,
+    const llvm::SetVector<Value> &privateCaptures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures, Region &fnBody,
+    SmallVectorImpl<Value> *loadedCaptures = nullptr) {
+  auto ptr = ptrTy(b.getContext());
+  for (size_t i = 0; i < captures.size(); i++) {
+    Value result;
+    if (privateCaptures.contains(captures[i])) {
+      // Private capture (loop IV etc.): fresh per-thread alloca, not read from
+      // the struct — each thread gets an independent copy.
+      auto srcAlloca = captures[i].getDefiningOp<LLVM::AllocaOp>();
+      result = LLVM::AllocaOp::create(b, loc, ptr, srcAlloca.getElemType(),
+        one64);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    } else if (scalarAllocaCaptures.contains(captures[i])) {
+      // Scalar packed by value: load the scalar from the struct, then stash it
+      // in a fresh alloca so existing load/store-of-alloca patterns keep working
+      // (mem2reg/SROA promote the single-store alloca to a register).
+      Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+      Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+        ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      Value scalar = LLVM::LoadOp::create(b, loc, elemTy, gep);
+      result = LLVM::AllocaOp::create(b, loc, ptr, elemTy, one64);
+      LLVM::StoreOp::create(b, loc, scalar, result);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    } else if (ptrAllocaCaptures.contains(captures[i])) {
+      // Pointer packed by value: same idea, the field holds the pointer.
+      Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+        ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      Value pv = LLVM::LoadOp::create(b, loc, ptr, gep);
+      result = LLVM::AllocaOp::create(b, loc, ptr, ptr, one64);
+      LLVM::StoreOp::create(b, loc, pv, result);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    } else {
+      // Plain capture: load the value from the struct.
+      Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+        ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      result = LLVM::LoadOp::create(b, loc, captures[i].getType(), gep);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    }
+    if (loadedCaptures) loadedCaptures->push_back(result);
+  }
+}
+
+// At the call site (builder `b`), store each capture into the struct at
+// `structBase`.  Mirrors unpackCapturesFromBase: a private slot is left undef,
+// a scalar/ptr alloca is loaded by value, a plain capture is stored as-is.
+static void storeCapturesToBase(
+    OpBuilder &b, Location loc, Value structBase,
+    LLVM::LLVMStructType structTy, ArrayRef<Value> captures,
+    ArrayRef<Type> fieldTypes,
+    const llvm::SetVector<Value> &privateCaptures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures) {
+  auto ptr = ptrTy(b.getContext());
+  for (size_t i = 0; i < captures.size(); i++) {
+    Value capVal;
+    if (privateCaptures.contains(captures[i]))
+      capVal = LLVM::UndefOp::create(b, loc, fieldTypes[i]);
+    else if (scalarAllocaCaptures.contains(captures[i])) {
+      Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+      capVal = LLVM::LoadOp::create(b, loc, elemTy, captures[i]);
+    } else if (ptrAllocaCaptures.contains(captures[i]))
+      capVal = LLVM::LoadOp::create(b, loc, ptr, captures[i]);
+    else
+      capVal = captures[i];
+    Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+      ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+    LLVM::StoreOp::create(b, loc, capVal, gep);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1a. IOMP TASK OUTLINING  (outline_signature = task_entry)
+// ---------------------------------------------------------------------------
+// Lowers an omp_lower.construct for an iomp task:
+//   - outlines the body into an entry function  i32(i32 gtid, ptr task) that
+//     loads task->shareds and unpacks the captures from it;
+//   - at the call site emits __kmpc_omp_task_alloc, populates task->shareds
+//     with the captures, then __kmpc_omp_task.
+// v1 limitations: no firstprivate/private clause wiring (captures only); no
+// if/final clause (always deferred); task_flags = 1 (tied).
+static void outlineTaskShareds(ConstructOp op, ModuleOp module, int &counter) {
+  Region &body = op.getBody();
+  if (body.empty()) return;
+
+  MLIRContext *ctx = op.getContext();
+  Location loc = op.getLoc();
+  auto ptr  = ptrTy(ctx);
+  auto i32t = i32Ty(ctx);
+  auto i64t = IntegerType::get(ctx, 64);
+
+  // Collect + classify captures (same scheme as the packed strategy).
+  SmallVector<Value> captures = collectCaptures(body);
+  llvm::SetVector<Value> privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures;
+  classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
+                   ptrAllocaCaptures);
+
+  // shareds struct: one field per capture (element type for a scalar-alloca
+  // capture, else the captured value's own type).
+  SmallVector<Type> fieldTypes;
+  auto sharedsTy =
+      buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
+
+  // kmp_task_t header: { void *shareds, routine, kmp_int32 part_id, data1,
+  // data2 } — 40 bytes on 64-bit; only field 0 (shareds) is accessed here, but
+  // the full size is passed to __kmpc_omp_task_alloc so the runtime's writes to
+  // the header stay in bounds.
+  auto kmpTaskTy =
+      LLVM::LLVMStructType::getLiteral(ctx, {ptr, ptr, i32t, ptr, ptr});
+
+  std::string fnName =
+      "outlined_" + op.getConstructName().str() + "_" + std::to_string(counter++);
+
+  // Build the entry function  i32(i32 gtid, ptr task).
+  OpBuilder builder(ctx);
+  if (auto parentFn = op->getParentOfType<func::FuncOp>())
+    builder.setInsertionPoint(parentFn);
+  else
+    builder.setInsertionPointToStart(module.getBody());
+
+  auto outlinedFn = func::FuncOp::create(loc, fnName,
+    FunctionType::get(ctx, {i32t, ptr}, {i32t}));
+  outlinedFn.setVisibility(SymbolTable::Visibility::Nested);
+  builder.insert(outlinedFn);
+
+  // Strip omp private_vars before moving the body (mirrors the parallel path).
+  body.walk([&](Operation *walkOp) {
+    if (auto wsOp = llvm::dyn_cast<omp::WsloopOp>(walkOp))
+      if (!wsOp.getPrivateVars().empty()) wsOp.getPrivateVarsMutable().clear();
+    if (auto parOp = llvm::dyn_cast<omp::ParallelOp>(walkOp))
+      if (!parOp.getPrivateVars().empty()) parOp.getPrivateVarsMutable().clear();
+  });
+
+  outlinedFn.getBody().takeBody(body);
+  Block &entry = outlinedFn.getBody().front();
+
+  // v1: no firstprivate wiring — record any block args that arrived with the
+  // region so unused ones can be dropped after capture unpacking.
+  SmallVector<BlockArgument> staleArgs(entry.getArguments().begin(),
+                                       entry.getArguments().end());
+
+  // Prepend the entry args: [gtid, task, ...stale privatizer args].
+  entry.insertArgument(0u, i32t, loc);                         // gtid
+  BlockArgument taskArg = entry.insertArgument(1u, ptr, loc);  // task
+
+  // Prolog: shareds = load &task->shareds, then unpack each capture from it.
+  if (!captures.empty()) {
+    OpBuilder prologue(&entry, entry.begin());
+    Value shGep = LLVM::GEPOp::create(prologue, loc, ptr, kmpTaskTy, taskArg,
+      ArrayRef<LLVM::GEPArg>{0, 0});
+    Value shareds = LLVM::LoadOp::create(prologue, loc, ptr, shGep);
+    Value one64 = LLVM::ConstantOp::create(prologue, loc, i64t,
+      IntegerAttr::get(i64t, 1));
+    unpackCapturesFromBase(prologue, loc, one64, shareds, sharedsTy, captures,
+      privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures,
+      outlinedFn.getBody());
+  }
+
+  // Drop stale privatizer block args (must be unused in v1).
+  for (auto arg : llvm::reverse(staleArgs))
+    if (arg.use_empty()) entry.eraseArgument(arg.getArgNumber());
+
+  // Remove injected privatizer marker casts.
+  SmallVector<Operation *> casts;
+  outlinedFn.getBody().walk([&](UnrealizedConversionCastOp c) {
+    if (c->use_empty()) casts.push_back(c);
+  });
+  for (auto *c : casts) c->erase();
+
+  // Finalize the function type to match the entry block.
+  outlinedFn.setFunctionType(
+      FunctionType::get(ctx, entry.getArgumentTypes(), {i32t}));
+
+  // Replace omp.terminator with `func.return %0 : i32`.
+  SmallVector<Operation *> terms;
+  for (auto &blk : outlinedFn.getBody())
+    for (auto &innerOp : blk)
+      if (innerOp.getName().getStringRef() == "omp.terminator")
+        terms.push_back(&innerOp);
+  for (auto *t : terms) {
+    OpBuilder tb(t);
+    Value zero = LLVM::ConstantOp::create(tb, t->getLoc(), i32t,
+      IntegerAttr::get(i32t, 0));
+    func::ReturnOp::create(tb, t->getLoc(), ValueRange{zero});
+    t->erase();
+  }
+
+  // ---- Call site ----
+  builder.setInsertionPoint(op);
+
+  // Every task invoke call uses both ident and global_tid (that is why the
+  // task construct has no `pre { emit ... }` block), so emit them eagerly:
+  // one ident global and one __kmpc_global_thread_num call shared by the two
+  // invoke calls.  gtid seeds off the default (KMPC-flagged) ident, matching
+  // the runtime's contract.
+  Value identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+  auto gtidDecl = getOrInsertDeclWithReturn(module,
+    "__kmpc_global_thread_num", {ptr}, i32t, builder);
+  Value gtid = func::CallOp::create(builder, loc, gtidDecl,
+    ValueRange{identVal}).getResult(0);
+
+  DataLayout dl(module);
+  uint64_t taskSize    = dl.getTypeSize(kmpTaskTy).getFixedValue();
+  uint64_t sharedsSize = dl.getTypeSize(sharedsTy).getFixedValue();
+  Value taskSizeV = LLVM::ConstantOp::create(builder, loc, i64t,
+    IntegerAttr::get(i64t, (int64_t)taskSize));
+  Value sharedsSizeV = LLVM::ConstantOp::create(builder, loc, i64t,
+    IntegerAttr::get(i64t, (int64_t)sharedsSize));
+
+  Value fnPtr = func::ConstantOp::create(builder, loc,
+    outlinedFn.getFunctionType(), FlatSymbolRefAttr::get(ctx, fnName));
+  Value fnPtrCast = UnrealizedConversionCastOp::create(builder, loc,
+    TypeRange{ptr}, ValueRange{fnPtr}).getResult(0);
+
+  // Emit the invoke calls in DSL order, threading the task_alloc result into
+  // the `task` token and populating shareds in between (Approach A).
+  Value taskResult;
+  for (auto attr : op.getInvoke()) {
+    auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
+    if (!ca) continue;
+    llvm::StringRef callee = ca.getCallee().getValue();
+    SmallVector<Value> args;
+    SmallVector<Type>  types;
+    for (auto argAttr : ca.getArgs()) {
+      Value v;
+      if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
+        llvm::StringRef s = sa.getValue();
+        uint32_t flags;
+        if (parseIdentRef(s, flags))
+          v = (flags == 0x02)
+                ? identVal
+                : getOrCreateIdent(module, builder, loc, ctx, flags);
+        else if (s == "%gtid")        v = gtid;
+        else if (s == "task_flags")
+          v = arith::ConstantOp::create(builder, loc, i32t,
+                IntegerAttr::get(i32t, 1)); // tied
+        else if (s == "task_size")    v = taskSizeV;
+        else if (s == "shareds_size") v = sharedsSizeV;
+        else if (s == "body")         v = fnPtrCast;
+        else if (s == "task")
+          v = taskResult ? taskResult
+                         : LLVM::UndefOp::create(builder, loc, ptr);
+        else
+          v = LLVM::UndefOp::create(builder, loc, ptr);
+      } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
+        v = arith::ConstantOp::create(builder, loc, i32t,
+          IntegerAttr::get(i32t, ia.getInt()));
+      } else {
+        v = LLVM::UndefOp::create(builder, loc, ptr);
+      }
+      args.push_back(v);
+      types.push_back(v.getType());
+    }
+
+    if (callee == "__kmpc_omp_task_alloc") {
+      auto decl = getOrInsertDeclWithReturn(module, callee, types, ptr, builder);
+      taskResult = func::CallOp::create(builder, loc, decl, args).getResult(0);
+      // Populate task->shareds with the captures.
+      if (!captures.empty()) {
+        Value sg = LLVM::GEPOp::create(builder, loc, ptr, kmpTaskTy, taskResult,
+          ArrayRef<LLVM::GEPArg>{0, 0});
+        Value sh = LLVM::LoadOp::create(builder, loc, ptr, sg);
+        storeCapturesToBase(builder, loc, sh, sharedsTy, captures, fieldTypes,
+          privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
+      }
+    } else {
+      auto decl = getOrInsertDeclWithReturn(module, callee, types, i32t, builder);
+      func::CallOp::create(builder, loc, decl, args);
+    }
+  }
+
+  op.erase();
+}
+
+// ---------------------------------------------------------------------------
 // 1. PARALLEL OUTLINING
 // ---------------------------------------------------------------------------
 
@@ -335,6 +666,16 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   std::string outlineSig   = getPropStr(op, "outline_signature");
   std::string captureStrat = getPropStr(op, "capture_strategy");
 
+  // iomp task uses a distinct ABI — the task_entry signature: an
+  // i32(i32 gtid, ptr task) entry whose captures live in a runtime-allocated
+  // shareds block, emitted via the __kmpc_omp_task_alloc/task two-call
+  // sequence.  The capture topology is still "packed" (one struct); only the
+  // signature differs, so we dispatch on it here.
+  if (outlineSig.find("task_entry") != std::string::npos) {
+    outlineTaskShareds(op, module, counter);
+    return;
+  }
+
   bool isMicrotask = outlineSig.find("microtask") != std::string::npos;
   bool isClosure   = outlineSig.find("closure")   != std::string::npos;
   bool isPacked    = captureStrat == "packed";
@@ -342,32 +683,21 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // Collect all values used inside the region but defined outside.
   SmallVector<Value> captures = collectCaptures(body);
 
-  // Compute private captures before takeBody (body region is consumed after).
-  llvm::SetVector<Value> privateCaptures;
-  for (auto cap : captures)
-    if (isPrivateCapture(cap, body))
-      privateCaptures.insert(cap);
-
-  // Compute scalar-alloca captures: allocas holding a scalar (int/float) whose
-  // first use in the region is a load.  For the packed/closure strategy these
-  // will be stored by value in the capture struct so the outlined function
-  // receives the scalar directly — eliminating the double indirection (struct
-  // field → alloca pointer → scalar) that would otherwise appear on every use
-  // inside the innermost loop and block LLVM's LICM from hoisting those loads.
-  llvm::SetVector<Value> scalarAllocaCaptures;
-  for (auto cap : captures)
-    if (!privateCaptures.contains(cap) && isScalarAllocaCapture(cap, body))
-      scalarAllocaCaptures.insert(cap);
-
-  // Compute ptr-alloca captures: allocas holding a pointer (e.g. array ptr)
-  // whose first use in the region is a load.  Pack the pointer VALUE directly
-  // into the struct field instead of the alloca address, saving one dereference
-  // per array access inside the outlined function.
-  llvm::SetVector<Value> ptrAllocaCaptures;
-  for (auto cap : captures)
-    if (!privateCaptures.contains(cap) && !scalarAllocaCaptures.contains(cap) &&
-        isPtrAllocaCapture(cap, body))
-      ptrAllocaCaptures.insert(cap);
+  // Classify captures before takeBody (the body region is consumed after).
+  // - private captures: privatizer-driven;
+  // - scalar-alloca captures: allocas holding a scalar (int/float) whose first
+  //   region use is a load.  For the packed/closure strategy these are stored
+  //   by value in the capture struct so the outlined function receives the
+  //   scalar directly — eliminating the double indirection (struct field →
+  //   alloca pointer → scalar) that would otherwise appear on every use inside
+  //   the innermost loop and block LLVM's LICM from hoisting those loads;
+  // - ptr-alloca captures: allocas holding a pointer (e.g. array ptr) whose
+  //   first region use is a load.  The pointer VALUE is packed directly into
+  //   the struct field instead of the alloca address, saving one dereference
+  //   per array access inside the outlined function.
+  llvm::SetVector<Value> privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures;
+  classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
+                   ptrAllocaCaptures);
 
   // Name the outlined function after the construct ("outlined_parallel_N",
   // "outlined_task_N", ...).  Parallel keeps its historical name.
@@ -446,17 +776,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     BlockArgument dataPtr = entry.getArgument(dataPtrIdx);
 
     // Build the capture struct type: { cap_0_type, cap_1_type, ... }
-    // Scalar-alloca captures use their element type as the field type (value
-    // semantics); all other captures use the captured value's own type (ptr).
     SmallVector<Type> fieldTypes;
-    for (auto cap : captures) {
-      if (scalarAllocaCaptures.contains(cap))
-        fieldTypes.push_back(
-            cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
-      else
-        fieldTypes.push_back(cap.getType());
-    }
-    auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+    auto structTy =
+        buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
 
     // In the function prolog, unpack each capture from the struct.
     if (!captures.empty()) {
@@ -466,58 +788,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         IntegerAttr::get(IntegerType::get(ctx, 64), 1));
       // Keep loaded values so privatizer handling can reuse them.
       SmallVector<Value> loadedCaptures;
-      for (size_t i = 0; i < captures.size(); i++) {
-        if (privateCaptures.contains(captures[i])) {
-          // Private capture (loop IV etc.): allocate fresh alloca per core.
-          // Don't load from struct — each core gets its own independent copy.
-          auto srcAlloca = captures[i].getDefiningOp<LLVM::AllocaOp>();
-          Value freshAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), srcAlloca.getElemType(), one64);
-          loadedCaptures.push_back(freshAlloca);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], freshAlloca);
-        } else if (scalarAllocaCaptures.contains(captures[i])) {
-          // Scalar-alloca capture packed by value: the struct field already
-          // holds the scalar (e.g. double), not a pointer to it.  Load the
-          // scalar directly from the struct — one load, no further dereference.
-          // All uses of the original alloca (previously a ptr) inside the body
-          // were load/store ops on that alloca; replace the alloca ptr with a
-          // fresh local alloca that is initialised with the unpacked scalar so
-          // existing load/store patterns in the body remain valid without any
-          // further IR surgery.
-          Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
-          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value scalarVal = LLVM::LoadOp::create(prologue, loc, elemTy, gep);
-          // Place the scalar into a fresh alloca so that any load/store uses
-          // of the original alloca inside the body continue to work.  LLVM's
-          // mem2reg/SROA will promote this single-store alloca to a register,
-          // making the value a true SSA constant visible to LICM.
-          Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), elemTy, one64);
-          LLVM::StoreOp::create(prologue, loc, scalarVal, privAlloca);
-          loadedCaptures.push_back(privAlloca);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
-        } else if (ptrAllocaCaptures.contains(captures[i])) {
-          // Ptr-alloca capture: the struct field holds the pointer value
-          // directly.  Unpack it into a fresh alloca so that existing
-          // load/store-of-alloca patterns in the body continue to work.
-          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value ptrVal = LLVM::LoadOp::create(prologue, loc, ptrTy(ctx), gep);
-          Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), ptrTy(ctx), one64);
-          LLVM::StoreOp::create(prologue, loc, ptrVal, privAlloca);
-          loadedCaptures.push_back(privAlloca);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
-        } else {
-          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value loaded = LLVM::LoadOp::create(prologue, loc,
-            captures[i].getType(), gep);
-          loadedCaptures.push_back(loaded);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], loaded);
-        }
-      }
+      unpackCapturesFromBase(prologue, loc, one64, dataPtr, structTy, captures,
+        privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures,
+        outlinedFn.getBody(), &loadedCaptures);
       // Handle privatizer args (firstprivate).
       // We already loaded the source ptrs from the struct above and stored
       // them in loadedCaptures[i]. Reuse those values — don't create new GEPs.
@@ -801,20 +1074,12 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       // -----------------------------------------------------------------------
       // PACKED / CLOSURE: build capture struct on the stack, pass ptr to it
       // -----------------------------------------------------------------------
-      // Scalar-alloca captures (e.g. alpha, beta) use their element type as the
-      // field type so the outlined function receives the scalar directly.  All
-      // other captures retain pointer semantics (field type == cap.getType()).
+      // Scalar/ptr-alloca captures are packed by value (see buildCaptureStruct
+      // / storeCapturesToBase); the struct type is also needed below for
+      // env_size / env_align (task).
       SmallVector<Type> fieldTypes;
-      for (auto cap : captures) {
-        if (scalarAllocaCaptures.contains(cap))
-          fieldTypes.push_back(
-              cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
-        else
-          fieldTypes.push_back(cap.getType());
-      }
-
-      // Capture-struct type — also needed below for env_size / env_align (task).
-      auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+      auto structTy =
+          buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
 
       // Build the capture struct (same for all packed runtimes).
       Value structAlloca;
@@ -824,30 +1089,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           IntegerAttr::get(IntegerType::get(ctx, 64), 1));
         structAlloca = LLVM::AllocaOp::create(builder, loc,
           ptrTy(ctx), structTy, one64);
-        for (size_t i = 0; i < captures.size(); i++) {
-          Value capVal;
-          if (privateCaptures.contains(captures[i])) {
-            // Private capture — slot not read in outlined fn; pass undef.
-            capVal = LLVM::UndefOp::create(builder, loc, fieldTypes[i]);
-          } else if (scalarAllocaCaptures.contains(captures[i])) {
-            // Scalar-alloca capture: load the scalar value from the alloca at
-            // the parallel call site and store the scalar into the struct field.
-            // The outlined function will unpack it with a single load — no
-            // second pointer dereference anywhere inside the parallel region.
-            Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
-            capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
-          } else if (ptrAllocaCaptures.contains(captures[i])) {
-            // Ptr-alloca capture: load the pointer value from the alloca and
-            // store the pointer directly into the struct field — eliminates one
-            // extra dereference (struct field → alloca → ptr → array).
-            capVal = LLVM::LoadOp::create(builder, loc, ptrTy(ctx), captures[i]);
-          } else {
-            capVal = captures[i];
-          }
-          Value gep = LLVM::GEPOp::create(builder, loc, ptrTy(ctx), structTy,
-            structAlloca, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          LLVM::StoreOp::create(builder, loc, capVal, gep);
-        }
+        storeCapturesToBase(builder, loc, structAlloca, structTy, captures,
+          fieldTypes, privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
       } else {
         structAlloca = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
       }

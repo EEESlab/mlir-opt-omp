@@ -41,6 +41,25 @@
           when not nowait => call "__kmpc_barrier"(ident(barrier_impl_for), global_tid);
         }
       }
+
+      construct task {
+        // No capture_strategy: the task has a single valid topology 
+        // (the same "packed" struct as the closure path,
+        // runtime-allocated and reached via load(task->shareds)), entailed by
+        // the ABI.  The signature is an ABI
+        // tag matched by .find("task_entry").
+        outline_signature = task_entry();
+        // No pre block: unlike parallel every task invoke call uses
+        // both ident and global_tid, so there is no optionality. 
+        invoke {
+          // `task` resolves to the __kmpc_omp_task_alloc result; the lowering
+          // also populates task->shareds with the captures (more documented in
+          // docs/task-lowering-spec.md). task_flags=1 (tied); if/final TBD.
+          call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
+                                       task_size, shareds_size, body);
+          call "__kmpc_omp_task"(ident, global_tid, task);
+        }
+      }
     }
 
 

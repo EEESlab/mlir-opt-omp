@@ -1,7 +1,8 @@
 # Specification: Clang-parity `ident_t` lowering for the iomp path
 
 Scope: iomp (`__kmpc_*`) lowering only. 
-Decisions: **flags are DSL-driven**; **psource uses the default placeholder string** (`;unknown;unknown;0;0;;`), with real source-location formatting deferred as a later, additive enhancement.
+
+Decisions: **flags are DSL-driven**; **psource uses the default placeholder string** (`;unknown;unknown;0;0;;`), with real source-location formatting deferred as a later development.
 
 ---
 
@@ -11,8 +12,6 @@ Make the `%struct.ident_t` values match what Clang/`OMPIRBuilder` produce.
 
 1. **Per-construct `flags`** — barriers and worksharing-loop calls must carry the correct `OpenMPLocationFlags` bits, not a fixed `KMPC`.
 2. **Non-null `psource` + correct `reserved_3` length** — every ident must point at a real source-location string (placeholder for now), with `reserved_3 = strlen`.
-
-The struct *type* (`{i32, i32, i32, i32, ptr}`) is already correct and does not change.
 
 ---
 
@@ -47,7 +46,7 @@ OMP_IDENT_WORK_DISTRIBUTE      = 0x800
 fields `{0, flags, reserve2, SrcLocStrSize, SrcLocStr}`; global is **private, constant, `unnamed_addr`, `align 8`**. Deduplicated via `IdentMap` keyed on `{SrcLocStr, (LocFlags<<31)|Reserve2Flags}` plus a module-globals scan.
 
 ### 3.4 The `psource` string
-:
+
 - Format: `;file;function;line;col;;` (`getOrCreateSrcLocStr(fn,file,line,col)`).
 - Default / no-debug-info fallback: **`;unknown;unknown;0;0;;`** (`getOrCreateDefaultSrcLocStr`), length **22** (null terminator not counted in `SrcLocStrSize`).
 - Interned in `SrcLocStrMap`; one global string reused by all idents with that text.

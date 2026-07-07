@@ -1,43 +1,28 @@
 # Specification: `omp.task` lowering across runtimes
 
-Scope: lowering of the OpenMP **task** construct (`omp.task`) to the three
-supported runtimes — **libgomp** (`GOMP_task`), **iomp** (`__kmpc_omp_task*`),
-and **pmsis** (embedded cluster API).
-
 Status:
 
 | Runtime | Status        |
 |---------|---------------|
-| libgomp | **implemented** (v1) |
-| iomp    | planned (phase 2) |
+| libgomp | **implemented** (v2) |
+| iomp    | **implemented** (v1: tied tasks; `if`/`final` and firstprivate deferred) |
 | pmsis   | planned (phase 3, API to be defined) |
 
-Decisions baked into v1: **closure/packed reuse** for libgomp, **DataLayout
-with fallback-16** for the env-struct alignment.
-
-v2 (libgomp): **nested tasks** — tasks inside a `parallel` (the realistic
-`parallel { ... task ... }` pattern) or inside another `task` — plus an
-end-to-end run-against-libgomp integration test.
+v1: **closure/packed reuse**, **DataLayout with fallback-16** for the env-struct alignment.
+v2: **nested tasks** — tasks inside a `parallel` or inside another `task` — plus an end-to-end run-against-libgomp integration test.
 
 ---
 
 ## 1. Goal
 
-Lower `omp.task` so that the captured environment is snapshotted and the task
-body runs through the selected runtime's task API, matching each runtime's ABI:
+Lower `omp.task` so that the captured environment is snapshotted and the task body runs through the selected runtime's task API, matching each runtime's ABI:
 
-1. The task body is **outlined** into a function whose signature matches the
-   runtime's task-entry convention.
-2. The captured variables are packaged per the runtime's calling convention
-   (a copied closure struct for libgomp, a `kmp_task_t` shareds block for iomp).
-3. The `if` clause selects the deferred-vs-undeferred path where the runtime
-   distinguishes them.
+1. The task body is **outlined** into a function whose signature matches the runtime's task-entry convention.
+2. The captured variables are packaged per the runtime's calling convention (a copied closure struct for libgomp, a `kmp_task_t` shareds block for iomp).
+3. The `if` clause selects the deferred-vs-undeferred path where the runtime distinguishes them.
 
-OpenMP semantics to honour: variables referenced in a task are **firstprivate
-by default**, i.e. captured *by value* at task-creation time. The existing
-capture-packing machinery (scalar/pointer allocas packed by value) already
-provides these snapshot semantics; explicit `private`/`firstprivate` recipes
-are handled via the shared firstprivate-injection step.
+OpenMP semantics: variables referenced in a task are **firstprivate by default**.
+The existing capture-packing already provides these snapshot semantics; explicit `private`/`firstprivate` recipes are handled via the shared firstprivate-injection step.
 
 ---
 
@@ -58,19 +43,11 @@ void GOMP_task (void (*fn)(void *data),
                 void *detach);
 ```
 
-> **ABI note:** the trailing `detach` parameter was added in GCC 11 (OpenMP 5.0
-> `detach` clause support). Omitting it makes `GOMP_task` read an uninitialised
-> 10th argument when linked against libgomp ≥ 11, which can corrupt memory or
-> hang. We always pass `detach = null` (no detach clause supported yet).
+Key behaviour: with `cpyfn == NULL`, libgomp allocates `arg_size` bytes aligned to `arg_align`, `memcpy`s `data` into that task-private block, and later calls `fn(copy)`. 
+This is true even for undeferred tasks (`if_clause == false` / `final`). 
+Therefore the outlined body is an ordinary closure `void (*)(void *)` and the only task-specific data is `arg_size` / `arg_align`.
 
-Key behaviour: with `cpyfn == NULL`, libgomp allocates `arg_size` bytes aligned
-to `arg_align`, `memcpy`s `data` into that task-private block, and later calls
-`fn(copy)`. This is true even for undeferred tasks (`if_clause == false` /
-`final`). Therefore the outlined body is an ordinary closure
-`void (*)(void *)` — **identical to the libgomp `parallel` closure** — and the
-only task-specific data is `arg_size` / `arg_align`.
-
-ABI mapping used by the tool (Linux x86-64 / LP64):
+ABI mapping used by the tool:
 
 | `GOMP_task` param | C type           | LLVM type |
 |-------------------|------------------|-----------|
@@ -123,7 +100,7 @@ declaring tasks unsupported on this target). No invented API is assumed here.
    emit an `omp_lower.construct` carrying the plan, the body region, and the
    `if`-clause SSA value as an operand.
 2. **OmpOutliningPass** — `outlineConstruct` outlines the body and emits the
-   runtime call. For libgomp this reuses the packed/closure path verbatim.
+   runtime call. For libgomp this reuses the packed/closure path.
 3. **PlanLoweringPass** — unchanged (region-bearing constructs are fully lowered
    by the outlining pass).
 
@@ -165,31 +142,46 @@ The `when has(if_clause)` / `otherwise` split is driven entirely by the
 evaluation context (see §5.1); both branches share the same call shape except
 for the boolean argument.
 
-### 4.2 iomp (planned)
+### 4.2 iomp (implemented — Approach A)
 
 ```
 construct task {
-  outline_signature = task_entry(gtid, task_t);   // kmp_int32(kmp_int32, void*)
-  capture_strategy  = "shareds";                  // captures live in task_t->shareds
-  pre {
-    emit ident;
-    emit global_tid;
-    // task = __kmpc_omp_task_alloc(ident, gtid, flags,
-    //                              sizeof(kmp_task_t), env_size, body);
-    // copy captures into task->shareds
-  }
+  outline_signature = task_entry();               // ABI tag (i32(i32 gtid, ptr task)), matched head-only
+  // no capture_strategy: the only valid topology (packed, runtime-allocated,
+  // reached via task->shareds) is entailed by task_entry, so it would be inert.
+  // no pre block: every invoke call uses both ident and global_tid (unlike
+  // parallel, where gtid is optional), so there is no optionality to gate.
+  // They are resolved on demand from the tokens below, as barrier/wsloop do.
   invoke {
-    when has(if_clause) =>   // if(0)/final → run inline
-      // begin_if0; call task->routine; complete_if0
-      ...;
-    otherwise =>
-      call "__kmpc_omp_task"(ident, global_tid, task);
+    call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
+                                 task_size, shareds_size, body);
+    call "__kmpc_omp_task"(ident, global_tid, task);
   }
 }
 ```
 
-This introduces a new `outline_signature` (`task_entry`) and a new
-`capture_strategy` (`shareds`) that the outlining pass must learn.
+New symbolic tokens (resolved in the outlining pass):
+
+| Token | Resolves to |
+|-------|-------------|
+| `task_entry` | new outline signature `i32(i32 gtid, ptr task)` — **the dispatch discriminator** (no `capture_strategy`: the packed, runtime-allocated topology reached via `task->shareds` is entailed by the ABI) |
+| `body` | the entry fn pointer (`kmp_routine_entry_t`) |
+| `task_flags` | i32 flags — **v1 = 1 (tied)**; `final`/`untied`/… later |
+| `task_size` | i64 `sizeof(kmp_task_t)` — `{ptr,ptr,i32,ptr,ptr}` = 40B header |
+| `shareds_size` | i64 `sizeof(capture struct)` |
+| `task` | the **result** of `__kmpc_omp_task_alloc` (Approach A, §5.3) |
+
+**Result binding (Approach A).** `task` is *not* a context variable: the
+outlining pass remembers the `__kmpc_omp_task_alloc` result, auto-inserts the
+shareds-population block after it, and resolves `task` to that result. The
+explicit `let task = call …` alternative (Approach B) is captured separately in
+[dsl-result-binding-proposal.md](dsl-result-binding-proposal.md) for when a
+second construct needs result threading.
+
+**v1 simplifications:** all captures go into shareds (no separate clang-style
+`privates` region); `flags = 1` (tied); the **`if` clause is deferred** — iomp
+`if(cond)` needs a *runtime* branch to `__kmpc_omp_task_begin_if0` /
+`__kmpc_omp_task_complete_if0`, unlike libgomp's plain boolean arg.
 
 ### 4.3 pmsis (planned)
 
@@ -257,12 +249,37 @@ tasks. (The shared `counter` is global, so the inner task's function is e.g.
   (the `__kmpc_fork_call` variadic special-case is skipped). Declaration arg
   types are inferred from the SSA values, yielding the §2.1 ABI.
 
-### 5.3 iomp/pmsis (planned)
+### 5.3 iomp (implemented — Approach A)
 
-iomp needs a new outlining branch for `task_entry(gtid, task_t)` /
-`capture_strategy = "shareds"`: allocate via `__kmpc_omp_task_alloc`, copy the
-captures into `task->shareds`, then `__kmpc_omp_task` (or the `if0`
-begin/complete pair). This cannot share the `void(void*)` closure path.
+A new outlining branch (`outlineTaskShareds`) keyed on `outline_signature`
+containing `task_entry` (the capture topology stays `packed`). It cannot share
+the `void(void*)` closure path. Concretely:
+
+- **Entry function** `i32(i32 gtid, ptr task)`: load `shareds` from the task
+  header (`GEP task[0,0]` → load ptr), then unpack each capture from the shareds
+  struct (same struct as the libgomp packed strategy, but the base pointer is
+  the loaded `shareds`, not the function arg). `omp.terminator` → `func.return`
+  of `i32 0`.
+- **Call site**, iterating *all* invoke calls (not just the first):
+  - `task_size` → `sizeof(kmp_task_t)` where the header struct is
+    `{ptr,ptr,i32,ptr,ptr}` (40 B) to match the runtime; `shareds_size` →
+    `sizeof(capture struct)`; `task_flags` → `i32 1`; `body` → entry fn ptr.
+  - Emit `__kmpc_omp_task_alloc(...)` and **bind its result** to the `task`
+    token (Approach A).
+  - **Populate shareds**: `GEP task[0,0]` → load `shareds`; for each capture
+    `GEP shareds[0,i]` + store. (C++-generated; inexpressible in the DSL.)
+  - Emit `__kmpc_omp_task(ident, gtid, task)`.
+- `ident` / `global_tid` are resolved on demand at the call site (default ident +
+  a memoised `__kmpc_global_thread_num`), the same resolve-on-reference model
+  barrier/wsloop use — not the parallel `emit`-gated pre block, since a task
+  always needs both.
+
+See [dsl-result-binding-proposal.md](dsl-result-binding-proposal.md) for the
+Approach B (`let = call`) alternative to the implicit `task` binding.
+
+### 5.4 pmsis (planned)
+
+Deferred until the embedded task API is chosen.
 
 ---
 
@@ -326,8 +343,11 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   - `tasks/task_smoke.c` — same program in C, built with `gcc -fopenmp` (ref)
     and through the full CIR / `mlir-opt-omp` pipeline (opt); outputs must
     match. Depends on ClangIR emitting `omp.task`.
-- Future (iomp): `__kmpc_omp_task_alloc` + `__kmpc_omp_task` emission, the
-  `task_entry(gtid, task_t)` signature, and the `if0` begin/complete path.
+- **`test/Regression/task-iomp.mlir`** — an iomp task: checks the
+  `i32(i32 gtid, ptr task) -> i32` entry and the `__kmpc_global_thread_num` /
+  `__kmpc_omp_task_alloc` / `__kmpc_omp_task` call sequence.
+- Future (iomp): the `if0` begin/complete (`if`/`final`) path; firstprivate via
+  shareds; an end-to-end run against `libomp`.
 
 ---
 
@@ -351,7 +371,10 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
    `null` DSL literal; regression tests. **(done)**
 2. **libgomp v2** — nested tasks (collect every `omp.task`); nested-task
    regression test; end-to-end `run_tasks.sh` integration test. **(done)**
-3. **iomp** — new `task_entry`/`shareds` outline branch; `task_alloc` +
-   `task`/`if0` lowering; flag tokens; tests.
+3. **iomp** — new `task_entry`/`shareds` outline branch
+   (`outlineTaskShareds`); `__kmpc_omp_task_alloc` (result bound to `task`,
+   Approach A) + shareds population + `__kmpc_omp_task`; `task-iomp.mlir`.
+   **(implemented — pending build/test)**. Follow-ups: `if`/`final` (`if0`
+   path), firstprivate via shareds, libomp end-to-end run.
 4. **pmsis** — define the embedded task API, then map (closure-style if
    available); tests.
