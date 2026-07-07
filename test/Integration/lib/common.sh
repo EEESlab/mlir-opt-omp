@@ -147,10 +147,6 @@ case "$RUNTIME" in
 esac
 unset __DATASET_EXPLICIT
 
-# Suffix appended to result artifact names (CSV/PNG/dirs) so runs of different
-# runtimes don't clobber each other's outputs.
-RUNTIME_TAG="_${RUNTIME}"
-
 # --- Load the pieces ---------------------------------------------------------
 # kernels.sh  kernel lists + select_kernels/resolve_src
 # native.sh   compile_opt/compile_ref (host pipelines)
