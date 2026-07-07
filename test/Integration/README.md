@@ -13,20 +13,22 @@ kernels and the same `config.env`:
 A third, lighter driver covers the task construct (it lives in
 [`tasks/`](tasks/) together with its test cases):
 
-- **`tasks/run_tasks.sh`** — end-to-end smoke test for `omp.task` (libgomp),
-  two checks, both run against real libgomp and expecting `42`:
+- **`tasks/run_tasks.sh`** — end-to-end smoke test for `omp.task` (libgomp or
+  iomp, selected by the first argument or `RUNTIME`), two checks, both run
+  against the real runtime library and expecting `42`:
   - **[1] MLIR** — a hand-written `parallel { task { *p = 42 } }` module
     ([`tasks/task_nested.mlir`](tasks/task_nested.mlir)) lowered through
-    `mlir-opt-omp` + the MLIR/LLVM tools and linked `-lgomp`. Starts from MLIR,
-    so it does not need the CIR front-end to emit `omp.task`.
+    `mlir-opt-omp` + the MLIR/LLVM tools and linked against the runtime
+    (libgomp or libomp). Starts from MLIR, so it does not need the CIR
+    front-end to emit `omp.task`.
   - **[2] C** — [`tasks/task_smoke.c`](tasks/task_smoke.c) compiled both with
-    `gcc -fopenmp` (ref) and through the full CIR / `mlir-opt-omp` pipeline
-    (opt); outputs must match. This path depends on ClangIR emitting `omp.task`;
-    if your `clang-cir` lacks task support, [2] fails at the front-end while
-    [1] still passes.
+    the stock OpenMP compiler (ref: gcc for libgomp, clang for iomp) and
+    through the full CIR / `mlir-opt-omp` pipeline (opt); outputs must match.
+    This path depends on ClangIR emitting `omp.task`; if your `clang-cir`
+    lacks task support, [2] fails at the front-end while [1] still passes.
 
-  Run: `tasks/run_tasks.sh` (results land in `results/libgomp/tasks/`
-  regardless of the working directory).
+  Run: `tasks/run_tasks.sh [libgomp|iomp]` (results land in
+  `results/<runtime>/tasks/` regardless of the working directory).
 
 In both, the two compilers are:
 

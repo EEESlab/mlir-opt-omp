@@ -337,7 +337,7 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
 - **`test/Integration/tasks/run_tasks.sh`** — two end-to-end checks against
-  real libgomp, both expecting `42`:
+  the real runtime (`./run_tasks.sh [libgomp|iomp]`), both expecting `42`:
   - `tasks/task_nested.mlir` — hand-written `parallel { task { *p = 42 } }`
     lowered + linked + run. MLIR input, so independent of the CIR front-end.
   - `tasks/task_smoke.c` — same program in C, built with `gcc -fopenmp` (ref)
@@ -347,7 +347,7 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   `i32(i32 gtid, ptr task) -> i32` entry and the `__kmpc_global_thread_num` /
   `__kmpc_omp_task_alloc` / `__kmpc_omp_task` call sequence.
 - Future (iomp): the `if0` begin/complete (`if`/`final`) path; firstprivate via
-  shareds; an end-to-end run against `libomp`.
+  shareds.
 
 ---
 
