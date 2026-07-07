@@ -1,3 +1,8 @@
+/* PMSIS interface adapter — resolves the ext_pi_* shims that kernels lowered
+ * with --omp-lower-runtime=pmsis call into the real PMSIS API. Copy of the
+ * canonical reference in docs/pmsis-interface-adapter.c; keep the two in
+ * sync. */
+
 #include <pmsis.h>
 
 void ext_pi_cl_team_barrier()
@@ -19,7 +24,6 @@ void ext_pi_cl_team_fork(int nb_cores, void (*entry)(void *), void *arg)
 {
   pi_cl_team_fork(nb_cores, entry, arg);
 }
-
 
 int ext_pi_cl_nb_cores()
 {

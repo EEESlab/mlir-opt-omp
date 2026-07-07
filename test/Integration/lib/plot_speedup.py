@@ -16,12 +16,13 @@
 # The reference (native) bar is labelled by runtime, matching the paper figures:
 #     iomp    -> "Clang frontend"
 #     libgomp -> "GCC frontend"
+#     pmsis   -> "PULP-SDK GCC"   (native OpenMP on GAP8/gvsoc)
 #
 # Usage:
 #     python3 plot_speedup.py <results.csv> [output.png] [options]
 #
 # Options:
-#     --runtime {iomp,libgomp}   picks the native bar's legend label
+#     --runtime {iomp,libgomp,pmsis}   picks the native bar's legend label
 #     --title "..."              optional chart title (default: none, paper style)
 #     --our-label "..."          override the "Our" legend label (default: "Our")
 #
@@ -47,6 +48,7 @@ import numpy as np  # noqa: E402
 REF_LABEL = {
     "iomp": "Clang frontend",
     "libgomp": "GCC frontend",
+    "pmsis": "PULP-SDK GCC",
 }
 
 # Bar styling: solid blue reference, hatched orange "Our".

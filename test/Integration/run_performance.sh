@@ -21,25 +21,36 @@
 # together with its standard deviation. A cell whose relative std-dev exceeds
 # VARIANCE_ACCEPTED% is flagged (noisy machine / background load).
 #
+# RUNTIME=pmsis (PULP/gvsoc) builds the same 2x2 matrix but through the
+# PolyBench-PULP harness Makefile (PULP_APP_DIR): ref = the PULP-SDK gcc
+# (plain / OMP_NATIVE=1), opt = our riscv32 kernel.o (OMP_OPT=1). Cycles come
+# from the 'Cycles = N' line in the gvsoc run log — one run per cell, the
+# simulator is deterministic — and four binary-size columns are appended to
+# the CSV. Only runs on machines with the GAP SDK + gvsoc installed.
+#
 # All shared setup (config, tools, kernel lists, the compile pipeline) lives in
 # common.sh — same config.env as run_correctness.sh.
 #
 # Usage:
 #   ./run_performance.sh                              # all kernels, defaults
 #   RUNTIME=libgomp ./run_performance.sh              # pick the runtime
+#   RUNTIME=pmsis ./run_performance.sh                # PULP/gvsoc (needs GAP SDK)
 #   DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 #   ./run_performance.sh path/to/kernel-omp.c         # a single kernel
 #   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
 #   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
 #
-# CSV output (under $OUTDIR, default ./results). Every artifact carries a
-# _<runtime> tag (e.g. _iomp, _libgomp) so runs against different runtimes
-# don't overwrite each other:
-#   results_performance_<runtime>.csv   one row per kernel + a GEOMEAN row
-#   <kernel>-omp/performance_<runtime>/...  the four binaries and raw timing logs
-#   results_performance_<runtime>.png   speedup bar chart (only when PLOT=true;
-#                                       needs python3 + matplotlib — see
-#                                       plot_speedup.py)
+# Output lands under $OUTDIR/<runtime> (default ./results/<runtime>), one
+# folder per runtime (iomp, libgomp, pmsis) so runs against different runtimes
+# never overwrite each other:
+#   results_performance.csv        one row per kernel + a GEOMEAN row
+#   <kernel>-omp/performance/...   the four binaries and raw timing logs
+#   results_performance_<sel>.png  speedup bar chart (only when PLOT=true;
+#                                  needs python3 + matplotlib — see
+#                                  plot_speedup.py). <sel> = the kernel
+#                                  selection (the SUITE, full/bundled, or the
+#                                  explicit kernel name(s)) + the dataset size,
+#                                  e.g. _full_large or _gemm-omp_mini.
 # =============================================================================
 
 set -uo pipefail
@@ -48,20 +59,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Perf wants a real workload by default; MINI is dominated by thread-spawn cost.
 # DATASET / config.env still override this (see common.sh).
 DATASET_DEFAULT="LARGE_DATASET"
-# shellcheck source=common.sh
-. "$SCRIPT_DIR/common.sh"
+# shellcheck source=lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
 
 # --- Performance-specific config -------------------------------------------
 THREADS="${THREADS:-16}"             # thread count for the parallel cells
 REPS="${REPS:-5}"                    # timed runs per cell (>=3; min+max dropped)
 VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
-OUTDIR="${OUTDIR:-$PWD/results}"
+# Results are split per runtime — results/<runtime>/... — so an iomp run only
+# replaces a previous iomp run, never a libgomp/pmsis one.
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
 PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
-
-# Runtime tag appended to every performance artifact (CSV, plot, per-kernel
-# dirs) so runs against different runtimes don't overwrite each other — an
-# iomp run only replaces a previous iomp run, never a libgomp one.
-RUNTIME_TAG="_${RUNTIME}"
 
 # Performance times the kernel with the cycle-accurate TSC timer. This is
 # mutually exclusive with -DPOLYBENCH_DUMP_ARRAYS, hence its own CFLAGS.
@@ -125,6 +133,56 @@ ratio() {
         'BEGIN { if (b+0 == 0) print "NA"; else printf "%.4f", a / b }'
 }
 
+# --- Per-kernel driver: pulp/gvsoc -----------------------------------------
+# One gvsoc run per cell (build+run are fused in the harness 'make', and the
+# simulator is deterministic, so REPS does not apply). Also records the size
+# of the linked ELF for each cell.
+run_kernel_pulp() {
+    local src="$1" name="$2"
+    local d="$OUTDIR/$name/performance"
+    mkdir -p "$d"
+
+    echo -e "${BOLD}── $name${RESET}" >&2
+
+    local -A CYC SIZ
+    local cell res i=1
+    for cell in ref_seq ref_par opt_seq opt_par; do
+        echo "  [$i/4] $cell (gvsoc build+run)..." >&2
+        : > "$d/$cell.log"
+        if ! res="$(pulp_cell "$src" "$cell" "$d" "$d/$cell.log")"; then
+            echo "  ERROR: $cell failed" >&2; emit_na "$name"; return
+        fi
+        CYC[$cell]="${res%%;*}"; SIZ[$cell]="${res##*;}"
+        [ "${CYC[$cell]}" = "NA" ] && \
+            echo -e "    ${YELLOW}WARNING: no 'Cycles =' line in $d/$cell.log${RESET}" >&2
+        echo -e "    ${BOLD}$cell: ${CYC[$cell]} cyc${RESET} (elf ${SIZ[$cell]} B)" >&2
+        i=$((i + 1))
+    done
+
+    # --- derived metrics (NA-propagating) -----------------------------------
+    local SP_NATIVE=NA SP_OPT=NA OPT_VS_NAT_PAR=NA OPT_VS_NAT_SEQ=NA
+    if [ "${CYC[ref_seq]}" != "NA" ] && [ "${CYC[ref_par]}" != "NA" ] &&
+       [ "${CYC[opt_seq]}" != "NA" ] && [ "${CYC[opt_par]}" != "NA" ]; then
+        SP_NATIVE=$(ratio "${CYC[ref_seq]}" "${CYC[ref_par]}")
+        SP_OPT=$(ratio    "${CYC[opt_seq]}" "${CYC[opt_par]}")
+        OPT_VS_NAT_PAR=$(ratio "${CYC[ref_par]}" "${CYC[opt_par]}")
+        OPT_VS_NAT_SEQ=$(ratio "${CYC[ref_seq]}" "${CYC[opt_seq]}")
+    fi
+
+    {
+        echo ""
+        printf "  %-22s %18s %18s\n" "" "native (ref)" "our tool (opt)"
+        printf "  %-22s %18s %18s\n" "seq cycles" "${CYC[ref_seq]}" "${CYC[opt_seq]}"
+        printf "  %-22s %18s %18s\n" "par cycles" "${CYC[ref_par]}" "${CYC[opt_par]}"
+        printf "  %-22s %18s %18s\n" "self speedup seq→par" "${SP_NATIVE}x" "${SP_OPT}x"
+        printf "  %-22s %18s\n" "opt vs native (par)" "${OPT_VS_NAT_PAR}x"
+        printf "  %-22s %18s\n" "opt vs native (seq)" "${OPT_VS_NAT_SEQ}x"
+        echo ""
+    } >&2
+
+    echo "${name};${CYC[ref_seq]};${CYC[ref_par]};${CYC[opt_seq]};${CYC[opt_par]};${SP_NATIVE};${SP_OPT};${OPT_VS_NAT_PAR};${OPT_VS_NAT_SEQ};${SIZ[ref_seq]};${SIZ[ref_par]};${SIZ[opt_seq]};${SIZ[opt_par]}" >> "$CSV"
+}
+
 # --- Per-kernel driver -----------------------------------------------------
 run_kernel() {
     local kernel="$1" src
@@ -133,7 +191,13 @@ run_kernel() {
         return
     fi
     local name; name="$(basename "${src%-omp.c}")-omp"
-    local d="$OUTDIR/$name/performance$RUNTIME_TAG"
+
+    if [ "$TARGET" = "pulp" ]; then
+        run_kernel_pulp "$src" "$name"
+        return
+    fi
+
+    local d="$OUTDIR/$name/performance"
     mkdir -p "$d"
 
     echo -e "${BOLD}── $name${RESET}" >&2
@@ -182,7 +246,9 @@ run_kernel() {
 }
 
 emit_na() {
-    echo "$1;NA;NA;NA;NA;NA;NA;NA;NA" >> "$CSV"
+    local row="$1;NA;NA;NA;NA;NA;NA;NA;NA"
+    [ "$TARGET" = "pulp" ] && row="$row;NA;NA;NA;NA"
+    echo "$row" >> "$CSV"
 }
 
 # is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
@@ -193,19 +259,51 @@ is_true() {
     esac
 }
 
+# Suffix naming what this run covered, appended to the plot filename:
+# the kernel selection — the SUITE name (full/bundled), or, when an explicit
+# KERNELS list (or a single-kernel argument) was given, the kernel basenames
+# (the part after the last '/', without the .c extension) joined by '_' —
+# followed by the dataset size (LARGE_DATASET -> large).
+plot_suffix() {
+    local sel
+    if [ -n "${KERNELS:-}" ]; then
+        local k parts=()
+        for k in $KERNELS; do
+            k="${k##*/}"
+            parts+=("${k%.c}")
+        done
+        sel=$(IFS=_; printf '%s' "${parts[*]}")
+    else
+        sel="$SUITE"
+    fi
+    local ds="${DATASET%_DATASET}"
+    printf '%s_%s' "$sel" "${ds,,}"
+}
+
 # Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
+# Python resolution order: $PLOT_PYTHON, then the local venv ./.venv (create it
+# once with:  python3 -m venv .venv && .venv/bin/pip install matplotlib numpy),
+# then whatever python3 is on PATH.
 render_plot() {
-    local script="$SCRIPT_DIR/plot_speedup.py"
-    local png="$OUTDIR/results_performance$RUNTIME_TAG.png"
+    local script="$SCRIPT_DIR/lib/plot_speedup.py"
+    local png="$OUTDIR/results_performance_$(plot_suffix).png"
     local py
-    py="$(command -v python3 || command -v python)" || {
-        echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
-        return
-    }
+    if [ -n "${PLOT_PYTHON:-}" ]; then
+        py="$PLOT_PYTHON"
+    elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+        py="$SCRIPT_DIR/.venv/bin/python"
+    else
+        py="$(command -v python3 || command -v python)" || {
+            echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
+            return
+        }
+    fi
     if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
-        echo -e "${YELLOW}[plot] matplotlib not installed" \
-                "(pip install matplotlib numpy) — skipping plot${RESET}" >&2
+        echo -e "${YELLOW}[plot] matplotlib not available in $py — skipping plot.${RESET}" >&2
+        echo -e "${YELLOW}[plot] set it up once with:${RESET}" >&2
+        echo -e "${YELLOW}[plot]   python3 -m venv $SCRIPT_DIR/.venv${RESET}" >&2
+        echo -e "${YELLOW}[plot]   $SCRIPT_DIR/.venv/bin/pip install matplotlib numpy${RESET}" >&2
         return
     fi
     echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2
@@ -218,14 +316,25 @@ render_plot() {
 
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_performance$RUNTIME_TAG.csv"
+CSV="$OUTDIR/results_performance.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
+[ "$TARGET" = "pulp" ] && \
+    CSV_HEADER="$CSV_HEADER;size_ref_seq;size_ref_par;size_opt_seq;size_opt_par"
 
 echo "=== MLIR OpenMP PERFORMANCE COMPARISON ==="
-echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
-echo "ref cc : $REF_CC    reps: $REPS    timer: cycle-accurate TSC"
-echo "polybench: $POLYBENCH"
-echo "rules: $RULES"
+if [ "$TARGET" = "pulp" ]; then
+    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET    suite: $SUITE"
+    echo "app dir: $PULP_APP_DIR"
+    echo "ref: pulp-sdk gcc (make / OMP_NATIVE=1)    opt: CIR/MLIR kernel.o (OMP_OPT=1)"
+    echo "timer: 'Cycles =' from the gvsoc log — 1 run/cell (simulator is deterministic)"
+    echo "polybench: $POLYBENCH"
+    echo "rules: $RULES"
+else
+    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
+    echo "ref cc : $REF_CC    reps: $REPS    timer: cycle-accurate TSC"
+    echo "polybench: $POLYBENCH"
+    echo "rules: $RULES"
+fi
 echo ""
 
 echo "$CSV_HEADER" > "$CSV"
@@ -233,6 +342,7 @@ echo "$CSV_HEADER" > "$CSV"
 select_kernels
 
 if [ $# -ge 1 ]; then
+    KERNELS="$1"   # so plot_suffix names the kernel, not the unused SUITE
     run_kernel "$1"
 else
     for k in "${KERNEL_LIST[@]}"; do
@@ -257,7 +367,12 @@ echo "GEOMEAN;;;;;${GM_NATIVE};${GM_OPT};${GM_VS_PAR};${GM_VS_SEQ}" >> "$CSV"
 
 # --- Console table ---------------------------------------------------------
 echo ""
-echo -e "${BOLD}=== SUMMARY (${DATASET}, ${THREADS}T, runtime=${RUNTIME}) ===${RESET}"
+if [ "$TARGET" = "pulp" ]; then
+    SUMMARY_LABEL="${DATASET}, ${PULP_PLATFORM}, runtime=${RUNTIME}"
+else
+    SUMMARY_LABEL="${DATASET}, ${THREADS}T, runtime=${RUNTIME}"
+fi
+echo -e "${BOLD}=== SUMMARY (${SUMMARY_LABEL}) ===${RESET}"
 printf "${BOLD}  %-20s %10s %10s %12s %12s${RESET}\n" \
     "kernel" "nat s→p" "opt s→p" "opt/nat par" "opt/nat seq"
 awk -F';' 'NR > 1 && $1 != "GEOMEAN" {
@@ -277,4 +392,6 @@ echo ""
 echo "  Done — $CSV"
 
 # --- Optional speedup plot -------------------------------------------------
-is_true "$PLOT" && render_plot
+# (an `if`, not `&&`: as the last command, a false PLOT must not turn into a
+# non-zero exit code for the whole script)
+if is_true "$PLOT"; then render_plot; fi
