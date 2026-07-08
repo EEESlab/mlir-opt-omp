@@ -824,12 +824,66 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   op.erase();
 }
 
+// Lower leaf omp ops (omp.barrier, omp.taskwait) that ride inside an outlined
+// function by applying a precomputed DSL plan.  These constructs have no body
+// and no captures; the plan's invoke calls use only the symbolic %ident/%gtid
+// args, resolved here from the microtask convention (arg 0 = ptr to i32 gtid).
+static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
+                               MLIRContext *ctx, llvm::StringRef opName,
+                               const dsl::LoweringPlan &plan) {
+  SmallVector<Operation *> targets;
+  for (auto &block : outlinedFn.getBody())
+    for (auto &innerOp : block)
+      if (innerOp.getName().getStringRef() == opName)
+        targets.push_back(&innerOp);
+  for (auto *leafOp : targets) {
+    OpBuilder bb(leafOp);
+    Location bloc = leafOp->getLoc();
+
+    auto resolveArg = [&](const dsl::Value &v) -> Value {
+      if (auto *sv = std::get_if<dsl::StrVal>(&v))
+        return resolveSymbolToken(
+            sv->value, bb, bloc,
+            [&](uint32_t flags) {
+              return getOrCreateIdent(module, bb, bloc, ctx, flags);
+            },
+            [&]() -> Value {
+              // Microtask convention: first arg is ptr to i32 gtid.
+              auto &fnEntry = outlinedFn.getBody().front();
+              if (fnEntry.getNumArguments() >= 2)
+                return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
+                                            fnEntry.getArgument(0));
+              return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
+            });
+      if (auto *iv = std::get_if<dsl::IntVal>(&v))
+        return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
+          IntegerAttr::get(i32Ty(ctx), iv->value));
+      return LLVM::UndefOp::create(bb, bloc, ptrTy(ctx));
+    };
+
+    for (auto &action : plan.invoke) {
+      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+        SmallVector<Value> args;
+        SmallVector<Type>  types;
+        for (auto &av : ca->args) {
+          Value v = resolveArg(av);
+          args.push_back(v); types.push_back(v.getType());
+        }
+        auto decl = getOrInsertDecl(module, ca->callee, types, bb);
+        func::CallOp::create(bb, bloc, decl, args);
+      }
+    }
+    leafOp->erase();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 1. PARALLEL OUTLINING
 // ---------------------------------------------------------------------------
 
 static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
-                              const dsl::LoweringPlan &barrierPlan) {
+                              const dsl::LoweringPlan &barrierPlan,
+                              const dsl::LoweringPlan *taskwaitPlan) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -1099,52 +1153,20 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     func::ReturnOp::create(tb, l);
   });
 
-  // Lower omp.barrier inside the outlined function — DSL-driven.
-  // The barrier plan (one per runtime) is built once in runOnOperation;
-  // here we only resolve the symbolic args (%ident, %gtid) at each call site.
-  SmallVector<Operation *> barriers;
-  for (auto &block : outlinedFn.getBody())
-    for (auto &innerOp : block)
-      if (innerOp.getName().getStringRef() == "omp.barrier")
-        barriers.push_back(&innerOp);
-  for (auto *barrierOp : barriers) {
-    OpBuilder bb(barrierOp);
-    Location bloc = barrierOp->getLoc();
-
-    auto resolveArg = [&](const dsl::Value &v) -> Value {
-      if (auto *sv = std::get_if<dsl::StrVal>(&v))
-        return resolveSymbolToken(
-            sv->value, bb, bloc,
-            [&](uint32_t flags) {
-              return getOrCreateIdent(module, bb, bloc, ctx, flags);
-            },
-            [&]() -> Value {
-              // Microtask convention: first arg is ptr to i32 gtid.
-              auto &fnEntry = outlinedFn.getBody().front();
-              if (fnEntry.getNumArguments() >= 2)
-                return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
-                                            fnEntry.getArgument(0));
-              return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
-            });
-      if (auto *iv = std::get_if<dsl::IntVal>(&v))
-        return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
-          IntegerAttr::get(i32Ty(ctx), iv->value));
-      return LLVM::UndefOp::create(bb, bloc, ptrTy(ctx));
-    };
-
-    for (auto &action : barrierPlan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, bb);
-        func::CallOp::create(bb, bloc, decl, args);
-      }
-    }
-    barrierOp->erase();
+  // Lower omp.barrier / omp.taskwait inside the outlined function — DSL-driven.
+  // The plans (one per runtime) are built once in runOnOperation; the helper
+  // only resolves the symbolic args (%ident, %gtid) at each call site.
+  lowerLeafConstruct(outlinedFn, module, ctx, "omp.barrier", barrierPlan);
+  if (taskwaitPlan) {
+    lowerLeafConstruct(outlinedFn, module, ctx, "omp.taskwait", *taskwaitPlan);
+  } else {
+    // No taskwait plan for the selected runtime: a taskwait inside a parallel
+    // cannot be lowered.  Flag it rather than silently dropping the wait.
+    outlinedFn.walk([&](Operation *innerOp) {
+      if (innerOp->getName().getStringRef() == "omp.taskwait")
+        innerOp->emitError(
+            "omp-outline: selected runtime has no `construct taskwait`");
+    });
   }
 
   // ---- Emit the runtime call at the call site ----
@@ -1756,6 +1778,24 @@ struct OmpOutliningPass
       return signalPassFailure();
     }
 
+    // Taskwait plan is optional: only runtimes that define `construct taskwait`
+    // (currently iomp) support it.  Build it when present; leave it null
+    // otherwise so runtimes without it are unaffected unless a taskwait op is
+    // actually used (that case is diagnosed in outlineConstruct).
+    std::optional<dsl::LoweringPlan> taskwaitPlan;
+    {
+      llvm::StringMap<dsl::Value> taskwaitCtx;
+      taskwaitCtx["ident"]      = dsl::makeStr("%ident");
+      taskwaitCtx["global_tid"] = dsl::makeStr("%gtid");
+      auto p = evaluator.buildPlan(runtimeName, "taskwait", taskwaitCtx);
+      if (p)
+        taskwaitPlan = std::move(*p);
+      else
+        llvm::consumeError(p.takeError());
+    }
+    const dsl::LoweringPlan *taskwaitPlanPtr =
+        taskwaitPlan ? &*taskwaitPlan : nullptr;
+
     // Step 1: outline parallel constructs.
     SmallVector<ConstructOp> constructs;
     module.walk([&](ConstructOp op) {
@@ -1763,7 +1803,7 @@ struct OmpOutliningPass
     });
     int counter = 0;
     for (auto op : constructs)
-      outlineConstruct(op, module, counter, *barrierPlan);
+      outlineConstruct(op, module, counter, *barrierPlan, taskwaitPlanPtr);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;

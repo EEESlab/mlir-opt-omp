@@ -35,6 +35,15 @@
         }
       }
 
+      construct taskwait {
+        // Wait on the completion of the current task's child tasks.  Like
+        // barrier: no body, no captures, a single call using ident + gtid.
+        // depend/nowait clauses are ignored in v1.
+        invoke {
+          call "__kmpc_omp_taskwait"(ident, global_tid);
+        }
+      }
+
       construct wsloop when schedule == static {
         pre {
           call "__kmpc_for_static_init_4"(ident(work_loop), global_tid, 34, last, lower, upper, stride, step, default_chunk);
@@ -107,6 +116,13 @@ runtime libgomp {
   construct barrier {
     invoke {
       call "GOMP_barrier"();
+    }
+  }
+  construct taskwait {
+    // Wait on the current task's child tasks.  Leaf construct like barrier:
+    // no body, no captures; GOMP_taskwait takes no arguments.
+    invoke {
+      call "GOMP_taskwait"();
     }
   }
   construct task {

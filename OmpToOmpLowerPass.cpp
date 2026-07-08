@@ -1,6 +1,6 @@
 // OmpToOmpLowerPass.cpp
 //
-// Converts omp.parallel / omp.task / omp.barrier ops to omp_lower.construct
+// Converts omp.parallel / omp.task / omp.barrier / omp.taskwait ops to omp_lower.construct
 // ops by evaluating the user-provided DSL file.  Wsloops are left in place
 // (nested inside their parallel) and lowered later by OmpOutliningPass.
 
@@ -192,6 +192,16 @@ extractBarrierContext(omp::BarrierOp /*op*/) {
   return ctx;
 }
 
+// taskwait is a leaf construct like barrier: no body, no captures, just a
+// call using ident + gtid (depend/nowait clauses ignored in v1).
+static llvm::StringMap<dsl::Value>
+extractTaskwaitContext(omp::TaskwaitOp /*op*/) {
+  llvm::StringMap<dsl::Value> ctx;
+  ctx["ident"]      = dsl::makeStr("%ident");
+  ctx["global_tid"] = dsl::makeStr("%gtid");
+  return ctx;
+}
+
 static llvm::StringMap<dsl::Value>
 extractTaskContext(omp::TaskOp op) {
   llvm::StringMap<dsl::Value> ctx;
@@ -281,6 +291,7 @@ struct OmpToOmpLowerPass
     // Collect ops before modifying the IR
     SmallVector<omp::ParallelOp> parallels;
     SmallVector<omp::BarrierOp>  barriers;
+    SmallVector<omp::TaskwaitOp> taskwaits;
     SmallVector<omp::TaskOp>     tasks;
     module.walk([&](omp::ParallelOp op) { parallels.push_back(op); });
     // Collect every task, including those nested in a parallel (the common
@@ -298,6 +309,12 @@ struct OmpToOmpLowerPass
     module.walk([&](omp::BarrierOp op) {
       if (!op->getParentOfType<omp::ParallelOp>())
         barriers.push_back(op);
+    });
+    // taskwait mirrors barrier: those inside a parallel ride into its body
+    // region and are lowered by the outlining pass; only collect the rest.
+    module.walk([&](omp::TaskwaitOp op) {
+      if (!op->getParentOfType<omp::ParallelOp>())
+        taskwaits.push_back(op);
     });
 
     // Build plan and replace each op with an omp_lower.construct
@@ -372,6 +389,11 @@ struct OmpToOmpLowerPass
     for (auto op : barriers) {
       if (!op->getBlock()) continue;
       if (!process(op, "barrier", extractBarrierContext(op))) return;
+    }
+
+    for (auto op : taskwaits) {
+      if (!op->getBlock()) continue;
+      if (!process(op, "taskwait", extractTaskwaitContext(op))) return;
     }
   }
 };

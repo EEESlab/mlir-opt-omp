@@ -355,7 +355,16 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 - **`depend`, `priority`, `detach`, `untied`, `mergeable`, `final`** clauses —
   currently hard-wired (`depend = null`, `priority = 0`, `detach = null`,
   `flags = 0`). Additive later.
-- **`taskwait` / `taskgroup` / `taskloop`** — separate constructs, out of scope.
+- **`taskwait`** — implemented for iomp and libgomp as a leaf construct,
+  mirroring `barrier`: no body, no captures. iomp emits
+  `__kmpc_omp_taskwait(ident, gtid)` with — like clang's `emitTaskwaitCall` — a
+  plain default `ident` (flags = `KMPC` = 0x02; there is no taskwait-specific
+  `OpenMPLocationFlags` bit); libgomp emits the no-argument `GOMP_taskwait()`.
+  The pass logic is runtime-agnostic (plan built from the DSL), so the
+  `taskwait` plan is optional: a `taskwait` under a runtime lacking the
+  construct is diagnosed, not dropped. `depend`/`nowait` ignored in v1; pmsis
+  (no standard task-wait API) is a follow-up.
+- **`taskgroup` / `taskloop`** — separate constructs, out of scope.
 - **LLP64 targets** — the `long = i64`, `_Bool = i8` mapping assumes LP64
   (the wsl/workstation Linux targets). Revisit only for a Windows/LLP64 libgomp.
 - **iomp `_Bool`/`zeroext` ABI nuances** and **pmsis task API** — see §2.2/§2.3.
