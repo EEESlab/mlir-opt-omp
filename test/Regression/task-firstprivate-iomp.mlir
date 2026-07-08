@@ -32,6 +32,7 @@ func.func @task_fp(%arg0: !llvm.ptr) {
 // parameter leaked past `ptr` (anchoring on `(` + forbidding `,`/`)` inside each
 // arg forces exactly two parameters):
 // CHECK: func.func {{.*}}@outlined_task_{{[0-9]+}}(%{{[^,)]*}}: i32, %{{[^,)]*}}: !llvm.ptr) -> i32
-// The firstprivate value is copied into a task-private alloca in the entry:
+// The firstprivate value is copied into a task-private alloca in the entry,
+// which returns i32:
 // CHECK:   llvm.alloca
-// CHECK:   func.return
+// CHECK:   return %{{.*}} : i32

@@ -9,8 +9,9 @@
 //
 // Fixing it means forcing scalar firstprivate sources to by-value packing in the
 // packed path too (as outlineTaskShareds now does for iomp), without disturbing
-// the parallel path.  Until then this is XFAIL: the by-value snapshot load is
-// absent at the call site.  Remove the XFAIL line once the packed path snapshots.
+// the parallel path.  Until then this test is expected to fail (see the directive
+// below): the by-value snapshot load is absent at the call site.  Drop that
+// directive once the packed path snapshots at the call site.
 //
 // XFAIL: *
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
