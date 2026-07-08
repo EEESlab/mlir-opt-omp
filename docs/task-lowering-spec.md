@@ -335,13 +335,19 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   checks the task is outlined into its own closure, the `GOMP_task` call lands
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
-- **`test/Integration/tasks/run_tasks.sh`** — two end-to-end checks against
-  the real runtime (`./run_tasks.sh [libgomp|iomp]`), both expecting `42`:
+- **`test/Integration/tasks/run_tasks.sh`** — four end-to-end checks against
+  the real runtime (`./run_tasks.sh [libgomp|iomp]`), all expecting `42`:
   - `tasks/task_nested.mlir` — hand-written `parallel { task { *p = 42 } }`
     lowered + linked + run. MLIR input, so independent of the CIR front-end.
   - `tasks/task_smoke.c` — same program in C, built with `gcc -fopenmp` (ref)
     and through the full CIR / `mlir-opt-omp` pipeline (opt); outputs must
     match. Depends on ClangIR emitting `omp.task`.
+  - `tasks/taskwait_nested.mlir` — hand-written `parallel { task; taskwait;
+    read-back }` where the taskwait is *load-bearing* (the task's write is read
+    back after the taskwait, inside the region), exercising `GOMP_taskwait` /
+    `__kmpc_omp_taskwait` end to end. MLIR input, front-end independent.
+  - `tasks/taskwait_smoke.c` — the same load-bearing taskwait in C, ref vs opt
+    (like `task_smoke.c`). Depends on ClangIR emitting `omp.taskwait`.
 - **`test/Regression/task-iomp.mlir`** — an iomp task: checks the
   `i32(i32 gtid, ptr task) -> i32` entry and the `__kmpc_global_thread_num` /
   `__kmpc_omp_task_alloc` / `__kmpc_omp_task` call sequence.

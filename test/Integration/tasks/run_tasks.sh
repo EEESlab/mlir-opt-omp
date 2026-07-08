@@ -17,6 +17,16 @@
 #               omp.task.  If your clang-cir lacks task support, [2] fails at the
 #               front-end while [1] still passes.
 #
+#   [3] MLIR  — a hand-written parallel { task; taskwait; read-back } module
+#               (taskwait_nested.mlir) where the taskwait is load-bearing: the
+#               value the task writes is read back later in the same region,
+#               after the taskwait.  Exercises GOMP_taskwait / __kmpc_omp_taskwait
+#               end to end.  Front-end independent, like [1].
+#
+#   [4] C     — taskwait_smoke.c: the same load-bearing taskwait as [3] compiled
+#               ref vs opt (like [2]).  Depends on ClangIR emitting omp.taskwait;
+#               if it does not, [4] fails at the front-end while [3] still passes.
+#
 # A test PASSes iff the program prints 42 (the task's write to the shared int is
 # visible after the parallel region's implicit barrier).  For [2] the ref and
 # opt outputs must also match.
@@ -154,6 +164,58 @@ fi
 
 echo "     ref='$ref'  opt='$opt'  (expected '$EXPECTED')"
 if [ "$ref" = "$EXPECTED" ] && [ "$opt" = "$EXPECTED" ]; then
+    echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+else
+    echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+fi
+echo ""
+
+# --- [3] hand-written MLIR: taskwait is load-bearing -----------------------
+# The task writes 42; the region reads it back AFTER omp.taskwait and copies it
+# into the printed output.  Without the taskwait the read may observe 0 (a
+# deferred task), so this exercises GOMP_taskwait / __kmpc_omp_taskwait end to
+# end.  Front-end independent, like [1].
+echo "── [3] MLIR: parallel { task; taskwait; read-back }"
+if mlir_to_bin "$SCRIPT_DIR/taskwait_nested.mlir" "$TMP/taskwait_bin" \
+        "$DUMP_BASE/mlir_taskwait"; then
+    got="$(OMP_NUM_THREADS=2 "$TMP/taskwait_bin" 2>/dev/null || echo '<crash>')"
+    echo "     output: '$got' (expected '$EXPECTED')"
+    if [ "$got" = "$EXPECTED" ]; then
+        echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+    else
+        echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+    fi
+else
+    echo -e "     ${RED}${BOLD}ERROR${RESET}: lowering/build failed"; fail=1
+fi
+echo ""
+
+# --- [4] C taskwait through the CIR front-end (ref vs opt) ------------------
+# Same load-bearing taskwait as [3], but via the full C front-end path so ref
+# (stock compiler) and opt (CIR pipeline) outputs are compared.  Depends on
+# ClangIR emitting omp.taskwait; if it does not, this fails at the front-end
+# while [3] still covers the lowering.
+echo "── [4] C: parallel { task; taskwait; read-back }  (ref=$REF_CC vs opt=CIR pipeline)"
+TWSRC="$SCRIPT_DIR/taskwait_smoke.c"
+
+tw_ref="<n/a>"
+if "$REF_CC" -O3 $REF_FP $WARN_SUPPRESS -fopenmp $REF_OMP_INC \
+        "$TWSRC" -o "$TMP/tw_ref"; then
+    tw_ref="$(OMP_NUM_THREADS=4 "$TMP/tw_ref" 2>/dev/null || echo '<crash>')"
+else
+    echo -e "     ${RED}ERROR${RESET}: ref ($REF_CC) build failed"; fail=1
+fi
+
+tw_opt="<n/a>"
+if c_to_mlir "$TWSRC" "$TMP/tw_s1.mlir" "$DUMP_BASE/c_taskwait" \
+        && mlir_to_bin "$TMP/tw_s1.mlir" "$TMP/tw_opt" "$DUMP_BASE/c_taskwait"; then
+    tw_opt="$(OMP_NUM_THREADS=4 "$TMP/tw_opt" 2>/dev/null || echo '<crash>')"
+else
+    echo -e "     ${RED}ERROR${RESET}: opt (CIR pipeline) build failed"; fail=1
+fi
+
+echo "     ref='$tw_ref'  opt='$tw_opt'  (expected '$EXPECTED')"
+if [ "$tw_ref" = "$EXPECTED" ] && [ "$tw_opt" = "$EXPECTED" ]; then
     echo -e "     ${GREEN}${BOLD}PASS${RESET}"
 else
     echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
