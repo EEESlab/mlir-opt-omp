@@ -1779,9 +1779,9 @@ struct OmpOutliningPass
     }
 
     // Taskwait plan is optional: only runtimes that define `construct taskwait`
-    // (currently iomp) support it.  Build it when present; leave it null
-    // otherwise so runtimes without it are unaffected unless a taskwait op is
-    // actually used (that case is diagnosed in outlineConstruct).
+    // (iomp and libgomp; not pmsis) support it.  Build it when present; leave it
+    // null otherwise so runtimes without it are unaffected unless a taskwait op
+    // is actually used (that case is diagnosed in outlineConstruct).
     std::optional<dsl::LoweringPlan> taskwaitPlan;
     {
       llvm::StringMap<dsl::Value> taskwaitCtx;
