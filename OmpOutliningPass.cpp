@@ -620,9 +620,11 @@ static void replaceTerminatorsWithReturn(
 // An omp.taskwait nested in the task body is lowered here too (via the shared
 // leaf helper) when the runtime provides a taskwait plan; %gtid is the entry's
 // arg 0 (an i32 value, unlike the microtask ptr-to-i32 convention).
-// v1 limitations: no firstprivate/private clause wiring (captures only); no
-// if/final clause (always deferred); task_flags = 1 (tied); depend/nowait
-// on taskwait ignored; omp.barrier is illegal in a task region and diagnosed.
+// Supports implicit captures and explicit firstprivate clauses (copy-in into a
+// task-private slot, mirroring the packed path).  v1 limitations: pure `private`
+// clauses are not wired (diagnosed, not miscompiled); no if/final clause (always
+// deferred); task_flags = 1 (tied); depend/nowait on taskwait ignored;
+// omp.barrier is illegal in a task region and diagnosed.
 static void
 lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module, MLIRContext *ctx,
                    llvm::StringRef opName, const dsl::LoweringPlan &plan,
@@ -644,6 +646,33 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
   llvm::SetVector<Value> privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures;
   classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
                    ptrAllocaCaptures);
+
+  // firstprivate snapshot timing: a firstprivate source must be captured *by
+  // value* so its value is snapshotted into shareds at task creation, not read
+  // through a captured pointer at task entry (which would observe a mutation
+  // made between creation and a deferred execution — the whole point of
+  // firstprivate).  The sources are the leading captures (injected first by
+  // OmpToOmpLowerPass, one per privatizer block arg); classifyCaptures leaves
+  // them as plain captures because their first in-region use is the injected
+  // marker cast, not a load.  Force scalar-alloca sources into the by-value
+  // bucket here so storeCapturesToBase loads them at the call site.  (Non-alloca
+  // ptr sources can't be packed by value this way and keep the read-at-entry
+  // behaviour — a documented limitation.)
+  size_t numPriv = body.empty() ? 0 : body.front().getNumArguments();
+  for (size_t i = 0; i < numPriv && i < captures.size(); i++) {
+    Value src = captures[i];
+    if (privateCaptures.contains(src) || scalarAllocaCaptures.contains(src) ||
+        ptrAllocaCaptures.contains(src))
+      continue;
+    if (auto a = src.getDefiningOp<LLVM::AllocaOp>()) {
+      Type et = a.getElemType();
+      if (LLVM::isCompatibleType(et) &&
+          !llvm::isa<LLVM::LLVMPointerType>(et) &&
+          !llvm::isa<LLVM::LLVMArrayType>(et) &&
+          !llvm::isa<LLVM::LLVMStructType>(et))
+        scalarAllocaCaptures.insert(src);
+    }
+  }
 
   // shareds struct: one field per capture (element type for a scalar-alloca
   // capture, else the captured value's own type).
@@ -676,8 +705,10 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
   builder.insert(outlinedFn);
 
   // Move the body into the entry function.  staleArgs receives any privatizer
-  // block args that arrived with the region; v1 does no firstprivate wiring, so
-  // unused ones are dropped after capture unpacking.
+  // block args that arrived with the region.  A firstprivate arg gets a
+  // task-private copy below (its uses are rewritten); the leftover (now-dead)
+  // args are dropped after capture unpacking so the entry keeps its
+  // i32(i32 gtid, ptr task) ABI.
   SmallVector<BlockArgument> staleArgs;
   Block &entry = takeOutlinedBody(body, outlinedFn, staleArgs);
 
@@ -693,14 +724,49 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
     Value shareds = LLVM::LoadOp::create(prologue, loc, ptr, shGep);
     Value one64 = LLVM::ConstantOp::create(prologue, loc, i64t,
       IntegerAttr::get(i64t, 1));
+    SmallVector<Value> loadedCaptures;
     unpackCapturesFromBase(prologue, loc, one64, shareds, sharedsTy, captures,
       privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures,
-      outlinedFn.getBody());
+      outlinedFn.getBody(), &loadedCaptures);
+
+    // firstprivate copy-in — same scheme as the packed/closure path.  The
+    // privatizer source ptrs were injected at the start of the region by
+    // OmpToOmpLowerPass, so collectCaptures placed them first: loadedCaptures[i]
+    // is the source ptr for staleArgs[i].  For each, allocate a task-private
+    // slot, copy *source into it, and rewrite the block arg's uses to it.
+    // (Shares the packed path's assumption that the privatizer args line up 1:1
+    // with the leading captures, which holds for firstprivate-only clauses.)
+    for (size_t i = 0; i < staleArgs.size() && i < loadedCaptures.size(); i++) {
+      BlockArgument dstArg = staleArgs[i];
+      Value srcPtr = loadedCaptures[i];
+      if (!llvm::isa<LLVM::LLVMPointerType>(srcPtr.getType())) continue;
+      // Element type inferred from a load of the block arg inside the body.
+      Type elemTy;
+      outlinedFn.getBody().walk([&](LLVM::LoadOp loadOp) {
+        if (!elemTy && loadOp.getAddr() == dstArg)
+          elemTy = loadOp.getRes().getType();
+      });
+      if (!elemTy || !LLVM::isCompatibleType(elemTy)) continue;
+      Value privAlloca =
+        LLVM::AllocaOp::create(prologue, loc, ptr, elemTy, one64);
+      Value srcVal = LLVM::LoadOp::create(prologue, loc, elemTy, srcPtr);
+      LLVM::StoreOp::create(prologue, loc, srcVal, privAlloca);
+      replaceUsesInRegion(outlinedFn.getBody(), dstArg, privAlloca);
+    }
   }
 
-  // Drop stale privatizer block args (must be unused in v1).
-  for (auto arg : llvm::reverse(staleArgs))
-    if (arg.use_empty()) entry.eraseArgument(arg.getArgNumber());
+  // Drop privatizer block args now made dead by the copy-in.  Any that survive
+  // with live uses are an unsupported clause shape (a pure `private` clause, or
+  // a firstprivate whose element type could not be inferred): diagnose it rather
+  // than silently emit a wrong-ABI entry (trailing params the runtime never
+  // passes).
+  for (auto arg : llvm::reverse(staleArgs)) {
+    if (arg.use_empty())
+      entry.eraseArgument(arg.getArgNumber());
+    else
+      op.emitError("omp-outline: iomp task has an unsupported private/"
+                   "firstprivate clause; entry ABI would break");
+  }
 
   // Remove injected privatizer marker casts.
   eraseDeadCasts(outlinedFn);

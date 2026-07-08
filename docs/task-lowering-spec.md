@@ -5,7 +5,7 @@ Status:
 | Runtime | Status        |
 |---------|---------------|
 | libgomp | **implemented** (v2) |
-| iomp    | **implemented** (v1: tied tasks; `if`/`final` and firstprivate deferred) |
+| iomp    | **implemented** (tied tasks + explicit firstprivate; `if`/`final` deferred) |
 | pmsis   | planned (phase 3, API to be defined) |
 
 v1: **closure/packed reuse**, **DataLayout with fallback-16** for the env-struct alignment.
@@ -177,8 +177,10 @@ explicit `let task = call …` alternative (Approach B) is captured separately i
 second construct needs result threading.
 
 **v1 simplifications:** all captures go into shareds (no separate clang-style
-`privates` region); `flags = 1` (tied); the **`if` clause is deferred** — iomp
-`if(cond)` needs a *runtime* branch to `__kmpc_omp_task_begin_if0` /
+`privates` region); **explicit firstprivate** is copied into a task-private slot
+in the entry prolog (see §5.3), but a pure `private` clause is not wired (it is
+diagnosed, not miscompiled); `flags = 1` (tied); the **`if` clause is deferred**
+— iomp `if(cond)` needs a *runtime* branch to `__kmpc_omp_task_begin_if0` /
 `__kmpc_omp_task_complete_if0`, unlike libgomp's plain boolean arg.
 
 ### 4.3 pmsis (planned)
@@ -258,6 +260,26 @@ the `void(void*)` closure path. Concretely:
   struct (same struct as the libgomp packed strategy, but the base pointer is
   the loaded `shareds`, not the function arg). `omp.terminator` → `func.return`
   of `i32 0`.
+- **Explicit firstprivate**: the privatizer source ptrs are injected as leading
+  captures by `OmpToOmpLowerPass` (shared with parallel), so after unpacking,
+  `loadedCaptures[i]` is the source slot for the *i*-th privatizer block arg. For
+  each, the prolog allocates a task-private slot, copies the source into it, and
+  rewrites the block arg's uses to it. The leftover (now-dead) block args are
+  dropped so the entry keeps its two-parameter ABI; a block arg that survives
+  with live uses (a pure `private` clause, or a firstprivate whose element type
+  can't be inferred) is diagnosed rather than emitted as a wrong-ABI entry.
+- **Snapshot timing**: a firstprivate value must be captured *by value* so it is
+  snapshotted into shareds at task **creation**, not read through a captured
+  pointer at task **entry** — otherwise a deferred task that runs after the
+  source was mutated (the canonical `firstprivate(i)` spawn loop) observes the
+  wrong value. `classifyCaptures` leaves the source as a plain (pointer) capture
+  because its first in-region use is the injected marker cast, so
+  `outlineTaskShareds` re-classifies scalar-**alloca** sources into the by-value
+  bucket, making `storeCapturesToBase` load and snapshot them at the call site.
+  Non-alloca (e.g. by-pointer argument) sources cannot be snapshotted this way
+  and keep the read-at-entry behaviour — a documented limitation. The libgomp
+  packed path still snapshots at entry for tasks (harmless for `parallel`); see
+  `task-firstprivate-snapshot-libgomp.mlir` (XFAIL).
 - **Call site**, iterating *all* invoke calls (not just the first):
   - `task_size` → `sizeof(kmp_task_t)` where the header struct is
     `{ptr,ptr,i32,ptr,ptr}` (40 B) to match the runtime; `shareds_size` →
@@ -335,7 +357,7 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   checks the task is outlined into its own closure, the `GOMP_task` call lands
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
-- **`test/Integration/tasks/run_tasks.sh`** — four end-to-end checks against
+- **`test/Integration/tasks/run_tasks.sh`** — five end-to-end checks against
   the real runtime (`./run_tasks.sh [libgomp|iomp]`), all expecting `42`:
   - `tasks/task_nested.mlir` — hand-written `parallel { task { *p = 42 } }`
     lowered + linked + run. MLIR input, so independent of the CIR front-end.
@@ -348,11 +370,21 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
     `__kmpc_omp_taskwait` end to end. MLIR input, front-end independent.
   - `tasks/taskwait_smoke.c` — the same load-bearing taskwait in C, ref vs opt
     (like `task_smoke.c`). Depends on ClangIR emitting `omp.taskwait`.
+  - `tasks/task_firstprivate.mlir` — a task with an *explicit* firstprivate
+    clause; prints `42` iff the firstprivate copy-in ran. Passes on both
+    libgomp (packed path) and iomp (`outlineTaskShareds` copy-in).
 - **`test/Regression/task-iomp.mlir`** — an iomp task: checks the
   `i32(i32 gtid, ptr task) -> i32` entry and the `__kmpc_global_thread_num` /
   `__kmpc_omp_task_alloc` / `__kmpc_omp_task` call sequence.
-- Future (iomp): the `if0` begin/complete (`if`/`final`) path; firstprivate via
-  shareds.
+- **`test/Regression/task-firstprivate-{iomp,libgomp}.mlir`** — a task with an
+  explicit firstprivate clause: checks the copy-in (a task-private `llvm.alloca`)
+  and that no firstprivate parameter leaks into the outlined signature.
+- **`test/Regression/task-firstprivate-snapshot-{iomp,libgomp}.mlir`** — the
+  snapshot-timing property: the scalar firstprivate source is loaded by value at
+  the call site (task creation), not dereferenced at entry. Passes for iomp;
+  XFAIL for libgomp (packed path still snapshots at entry).
+- Future (iomp): the `if0` begin/complete (`if`/`final`) path; pure `private`
+  clause wiring.
 
 ---
 
@@ -394,7 +426,10 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 3. **iomp** — new `task_entry`/`shareds` outline branch
    (`outlineTaskEntry`); `__kmpc_omp_task_alloc` (result bound to `task`,
    Approach A) + shareds population + `__kmpc_omp_task`; `task-iomp.mlir`.
-   **(implemented — pending build/test)**. Follow-ups: `if`/`final` (`if0`
-   path), firstprivate via shareds, libomp end-to-end run.
+   **(done)**. Explicit firstprivate copy-in + `task-firstprivate-*.mlir` and
+   the `task_firstprivate.mlir` integration case, and scalar firstprivate
+   snapshot-at-creation timing. **(done)**. Follow-ups: `if`/`final` (`if0`
+   path), pure `private` clause wiring, by-pointer firstprivate snapshot, and
+   the libgomp-task snapshot fix (packed path).
 4. **pmsis** — define the embedded task API, then map (closure-style if
    available); tests.
