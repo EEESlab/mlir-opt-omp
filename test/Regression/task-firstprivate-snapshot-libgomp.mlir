@@ -1,19 +1,14 @@
-// firstprivate SNAPSHOT TIMING (libgomp) — KNOWN GAP (XFAIL).
+// firstprivate SNAPSHOT TIMING (libgomp).
 //
 // Same property as task-firstprivate-snapshot-iomp.mlir: a firstprivate value
-// must be snapshotted into the task's data block at task CREATION.  The libgomp
-// task path reuses the packed privatizer handling shared with omp.parallel,
-// which captures the source BY POINTER and dereferences it at task ENTRY.  For
-// `parallel` that is harmless (no mutation window between fork and region), but
-// for a deferred task it observes a post-creation mutation — the wrong value.
+// must be snapshotted into the task's data block at task CREATION, not read
+// through a captured pointer at ENTRY (otherwise a deferred task running after
+// the source was mutated observes the wrong value).  The libgomp task path
+// reuses the packed privatizer handling shared with omp.parallel;
+// `forceFirstprivateByValue` re-classifies scalar-alloca sources into the
+// by-value bucket so the value is loaded and snapshotted at the call site.  This
+// is harmless for `parallel` (creation coincides with the fork).
 //
-// Fixing it means forcing scalar firstprivate sources to by-value packing in the
-// packed path too (as outlineTaskShareds now does for iomp), without disturbing
-// the parallel path.  Until then this test is expected to fail (see the directive
-// below): the by-value snapshot load is absent at the call site.  Drop that
-// directive once the packed path snapshots at the call site.
-//
-// XFAIL: *
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

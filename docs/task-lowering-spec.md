@@ -274,12 +274,13 @@ the `void(void*)` closure path. Concretely:
   source was mutated (the canonical `firstprivate(i)` spawn loop) observes the
   wrong value. `classifyCaptures` leaves the source as a plain (pointer) capture
   because its first in-region use is the injected marker cast, so
-  `outlineTaskShareds` re-classifies scalar-**alloca** sources into the by-value
-  bucket, making `storeCapturesToBase` load and snapshot them at the call site.
-  Non-alloca (e.g. by-pointer argument) sources cannot be snapshotted this way
-  and keep the read-at-entry behaviour — a documented limitation. The libgomp
-  packed path still snapshots at entry for tasks (harmless for `parallel`); see
-  `task-firstprivate-snapshot-libgomp.mlir` (XFAIL).
+  the shared `forceFirstprivateByValue` helper re-classifies scalar-**alloca**
+  sources into the by-value bucket, making `storeCapturesToBase` load and
+  snapshot them at the call site. It runs on both the iomp (`outlineTaskShareds`)
+  and the libgomp/packed (`outlineConstruct`) task paths; for `parallel` it is
+  harmless because creation coincides with the fork. Non-alloca (e.g. by-pointer
+  argument) sources cannot be snapshotted this way and keep the read-at-entry
+  behaviour — a documented limitation.
 - **Call site**, iterating *all* invoke calls (not just the first):
   - `task_size` → `sizeof(kmp_task_t)` where the header struct is
     `{ptr,ptr,i32,ptr,ptr}` (40 B) to match the runtime; `shareds_size` →
@@ -381,8 +382,7 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   and that no firstprivate parameter leaks into the outlined signature.
 - **`test/Regression/task-firstprivate-snapshot-{iomp,libgomp}.mlir`** — the
   snapshot-timing property: the scalar firstprivate source is loaded by value at
-  the call site (task creation), not dereferenced at entry. Passes for iomp;
-  XFAIL for libgomp (packed path still snapshots at entry).
+  the call site (task creation), not dereferenced at entry. Both runtimes pass.
 - Future (iomp): the `if0` begin/complete (`if`/`final`) path; pure `private`
   clause wiring.
 
@@ -428,8 +428,8 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
    Approach A) + shareds population + `__kmpc_omp_task`; `task-iomp.mlir`.
    **(done)**. Explicit firstprivate copy-in + `task-firstprivate-*.mlir` and
    the `task_firstprivate.mlir` integration case, and scalar firstprivate
-   snapshot-at-creation timing. **(done)**. Follow-ups: `if`/`final` (`if0`
-   path), pure `private` clause wiring, by-pointer firstprivate snapshot, and
-   the libgomp-task snapshot fix (packed path).
+   snapshot-at-creation timing (both runtimes, via the shared
+   `forceFirstprivateByValue` helper). **(done)**. Follow-ups: `if`/`final`
+   (`if0` path), pure `private` clause wiring, by-pointer firstprivate snapshot.
 4. **pmsis** — define the embedded task API, then map (closure-style if
    available); tests.

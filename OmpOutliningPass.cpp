@@ -182,6 +182,39 @@ static void classifyCaptures(ArrayRef<Value> captures, Region &region,
       ptrAllocaCaptures.insert(cap);
 }
 
+// firstprivate snapshot timing: a firstprivate value must be captured *by value*
+// so it is snapshotted into the capture struct at construct creation (loaded at
+// the call site by storeCapturesToBase), not read through a captured pointer at
+// entry.  Otherwise a deferred task that runs after the source was mutated (the
+// canonical firstprivate(i) spawn loop) observes the wrong value.  The sources
+// are the leading captures (injected first by OmpToOmpLowerPass, one per
+// privatizer block arg); classifyCaptures leaves them as plain captures because
+// their first in-region use is the injected marker cast, not a load.  Force
+// scalar-alloca sources into the by-value bucket here.  Non-alloca (by-pointer)
+// sources can't be packed by value this way and keep the read-at-entry
+// behaviour.  Harmless for `parallel` (creation coincides with the fork).
+static void forceFirstprivateByValue(
+    Region &body, ArrayRef<Value> captures,
+    const llvm::SetVector<Value> &privateCaptures,
+    llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures) {
+  size_t numPriv = body.empty() ? 0 : body.front().getNumArguments();
+  for (size_t i = 0; i < numPriv && i < captures.size(); i++) {
+    Value src = captures[i];
+    if (privateCaptures.contains(src) || scalarAllocaCaptures.contains(src) ||
+        ptrAllocaCaptures.contains(src))
+      continue;
+    if (auto a = src.getDefiningOp<LLVM::AllocaOp>()) {
+      Type et = a.getElemType();
+      if (LLVM::isCompatibleType(et) &&
+          !llvm::isa<LLVM::LLVMPointerType>(et) &&
+          !llvm::isa<LLVM::LLVMArrayType>(et) &&
+          !llvm::isa<LLVM::LLVMStructType>(et))
+        scalarAllocaCaptures.insert(src);
+    }
+  }
+}
+
 static void replaceUsesInRegion(Region &region, Value oldVal, Value newVal) {
   for (auto &use : llvm::make_early_inc_range(oldVal.getUses()))
     if (region.isAncestor(use.getOwner()->getParentRegion()))
@@ -647,32 +680,9 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
   classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
                    ptrAllocaCaptures);
 
-  // firstprivate snapshot timing: a firstprivate source must be captured *by
-  // value* so its value is snapshotted into shareds at task creation, not read
-  // through a captured pointer at task entry (which would observe a mutation
-  // made between creation and a deferred execution — the whole point of
-  // firstprivate).  The sources are the leading captures (injected first by
-  // OmpToOmpLowerPass, one per privatizer block arg); classifyCaptures leaves
-  // them as plain captures because their first in-region use is the injected
-  // marker cast, not a load.  Force scalar-alloca sources into the by-value
-  // bucket here so storeCapturesToBase loads them at the call site.  (Non-alloca
-  // ptr sources can't be packed by value this way and keep the read-at-entry
-  // behaviour — a documented limitation.)
-  size_t numPriv = body.empty() ? 0 : body.front().getNumArguments();
-  for (size_t i = 0; i < numPriv && i < captures.size(); i++) {
-    Value src = captures[i];
-    if (privateCaptures.contains(src) || scalarAllocaCaptures.contains(src) ||
-        ptrAllocaCaptures.contains(src))
-      continue;
-    if (auto a = src.getDefiningOp<LLVM::AllocaOp>()) {
-      Type et = a.getElemType();
-      if (LLVM::isCompatibleType(et) &&
-          !llvm::isa<LLVM::LLVMPointerType>(et) &&
-          !llvm::isa<LLVM::LLVMArrayType>(et) &&
-          !llvm::isa<LLVM::LLVMStructType>(et))
-        scalarAllocaCaptures.insert(src);
-    }
-  }
+  // firstprivate values are snapshotted at task creation (see helper).
+  forceFirstprivateByValue(body, captures, privateCaptures,
+                           scalarAllocaCaptures, ptrAllocaCaptures);
 
   // shareds struct: one field per capture (element type for a scalar-alloca
   // capture, else the captured value's own type).
@@ -1025,6 +1035,13 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   llvm::SetVector<Value> privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures;
   classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
                    ptrAllocaCaptures);
+
+  // Snapshot firstprivate values at creation for the packed strategy (the
+  // by-value capture struct).  Only the packed path consumes these buckets; the
+  // by_pointer path passes captures as individual args.  See helper.
+  if (isPacked)
+    forceFirstprivateByValue(body, captures, privateCaptures,
+                             scalarAllocaCaptures, ptrAllocaCaptures);
 
   // Name the outlined function after the construct ("outlined_parallel_N",
   // "outlined_task_N", ...).  Parallel keeps its historical name.
