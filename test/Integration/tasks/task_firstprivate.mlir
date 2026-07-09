@@ -1,21 +1,19 @@
 // End-to-end smoke test for EXPLICIT firstprivate on a task.
 //
-// The task takes `x` (== 42) firstprivate via a privatizer recipe with a copy
-// region, then writes its private copy out through a shared pointer.  The
-// printed result is 42 iff the firstprivate copy-in actually ran: the task body
-// reads the privatizer block arg (%px), which is only initialised if the value
-// was copied from the source at task creation.  If the copy-in is missing the
-// read observes uninitialised memory (not 42) or the program crashes.
+// A task nested in a parallel takes `x` (== 42) firstprivate via a privatizer
+// recipe with a copy region, then writes its private copy out through a shared
+// pointer.  The printed result is 42 iff the firstprivate copy-in ran: the task
+// body reads the privatizer block arg (%px), which is only initialised if the
+// value was copied from the source.  If the copy-in is missing the read
+// observes uninitialised memory (not 42) or the program crashes.
 //
-// This is the runtime counterpart of the regression tests
-// task-firstprivate-{libgomp,iomp}.mlir:
-//   - libgomp reuses the packed/closure privatizer copy-in → prints 42.
-//   - iomp v1 has NO firstprivate wiring in outlineTaskShareds (silent ABI
-//     break); run_tasks.sh treats this as a KNOWN GAP, not a hard failure.
+// The task is nested in a parallel (not top-level) so the parallel's implicit
+// barrier completes it before main reads `out` — the same sync as task_nested,
+// keeping this test focused on firstprivate.  (Top-level taskwait is exercised
+// separately by taskwait_toplevel.mlir.)  %pout is a by-value pointer capture,
+// so the store lands in main's `out`; x is unmutated, so every thread writes 42.
 //
-// Top-level task (no enclosing parallel) to keep the capture path minimal; it
-// runs in the initial implicit team and completes at the taskwait.  %pout is a
-// by-value pointer capture, so the store lands in main's `out`.
+// libgomp copies in via the packed path; iomp via outlineTaskShareds.
 
 module {
   llvm.func @printf(!llvm.ptr, ...) -> i32
@@ -30,7 +28,7 @@ module {
 
   func.func @main() -> i32 {
     %c1   = llvm.mlir.constant(1 : i64) : i64
-    %x    = llvm.alloca %c1 x i32 : (i64) -> !llvm.ptr       // firstprivate source
+    %x    = llvm.alloca %c1 x i32 : (i64) -> !llvm.ptr       // firstprivate source (== 42)
     %out  = llvm.alloca %c1 x i32 : (i64) -> !llvm.ptr       // task writes here
     %pout = llvm.alloca %c1 x !llvm.ptr : (i64) -> !llvm.ptr
     %c42  = llvm.mlir.constant(42 : i32) : i32
@@ -39,13 +37,15 @@ module {
     llvm.store %c0, %out : i32, !llvm.ptr
     llvm.store %out, %pout : !llvm.ptr, !llvm.ptr            // pout = &out
 
-    omp.task private(@fp_i32 %x -> %px : !llvm.ptr) {
-      %v  = llvm.load %px : !llvm.ptr -> i32                 // firstprivate copy (== 42)
-      %pp = llvm.load %pout : !llvm.ptr -> !llvm.ptr
-      llvm.store %v, %pp : i32, !llvm.ptr                    // *out = 42
+    omp.parallel {
+      omp.task private(@fp_i32 %x -> %px : !llvm.ptr) {
+        %v  = llvm.load %px : !llvm.ptr -> i32               // firstprivate copy (== 42)
+        %pp = llvm.load %pout : !llvm.ptr -> !llvm.ptr
+        llvm.store %v, %pp : i32, !llvm.ptr                  // *out = 42
+        omp.terminator
+      }
       omp.terminator
     }
-    omp.taskwait                                             // complete the task
 
     %r    = llvm.load %out : !llvm.ptr -> i32
     %fmt  = llvm.mlir.addressof @fmt : !llvm.ptr

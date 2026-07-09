@@ -27,10 +27,16 @@
 #               ref vs opt (like [2]).  Depends on ClangIR emitting omp.taskwait;
 #               if it does not, [4] fails at the front-end while [3] still passes.
 #
-#   [5] MLIR  — a hand-written task with an EXPLICIT firstprivate clause
+#   [5] MLIR  — a parallel { task } with an EXPLICIT firstprivate clause
 #               (task_firstprivate.mlir): prints 42 iff the firstprivate copy-in
 #               ran.  Both runtimes copy the value in (libgomp via the packed
-#               path, iomp via outlineTaskShareds).
+#               path, iomp via outlineTaskShareds); the parallel's implicit
+#               barrier completes the task.
+#
+#   [6] MLIR  — a TOP-LEVEL task + TOP-LEVEL taskwait (taskwait_toplevel.mlir),
+#               outside any parallel: exercises lowerTopLevelLeaf, which resolves
+#               a real gtid (__kmpc_global_thread_num) — the iomp path previously
+#               crashed here with an undef gtid.
 #
 # A test PASSes iff the program prints 42 (the task's write to the shared int is
 # visible after the parallel region's implicit barrier).  For [2] the ref and
@@ -228,13 +234,33 @@ fi
 echo ""
 
 # --- [5] hand-written MLIR: explicit firstprivate on a task ----------------
-# The task firstprivate-copies x (==42) and writes its private copy out; the
-# result is 42 iff the copy-in ran.  Both runtimes copy in the firstprivate
-# value (libgomp via the packed path, iomp via outlineTaskShareds).
-echo "── [5] MLIR: task firstprivate; taskwait"
+# A task nested in a parallel firstprivate-copies x (==42) and writes its
+# private copy out; the result is 42 iff the copy-in ran.  Both runtimes copy in
+# the firstprivate value (libgomp via the packed path, iomp via
+# outlineTaskShareds); the parallel's implicit barrier completes the task.
+echo "── [5] MLIR: parallel { task firstprivate }"
 if mlir_to_bin "$SCRIPT_DIR/task_firstprivate.mlir" "$TMP/fp_bin" \
         "$DUMP_BASE/mlir_firstprivate"; then
     got="$(OMP_NUM_THREADS=2 "$TMP/fp_bin" 2>/dev/null || echo '<crash>')"
+    echo "     output: '$got' (expected '$EXPECTED')"
+    if [ "$got" = "$EXPECTED" ]; then
+        echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+    else
+        echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+    fi
+else
+    echo -e "     ${RED}${BOLD}ERROR${RESET}: lowering/build failed"; fail=1
+fi
+echo ""
+
+# --- [6] hand-written MLIR: top-level task + top-level taskwait -------------
+# A task and a taskwait outside any parallel.  The top-level taskwait must
+# resolve a real gtid (lowerTopLevelLeaf); under iomp the old undef-gtid
+# lowering crashed here.  libgomp's GOMP_taskwait() takes no args.
+echo "── [6] MLIR: top-level task; top-level taskwait"
+if mlir_to_bin "$SCRIPT_DIR/taskwait_toplevel.mlir" "$TMP/twtl_bin" \
+        "$DUMP_BASE/mlir_taskwait_toplevel"; then
+    got="$(OMP_NUM_THREADS=2 "$TMP/twtl_bin" 2>/dev/null || echo '<crash>')"
     echo "     output: '$got' (expected '$EXPECTED')"
     if [ "$got" = "$EXPECTED" ]; then
         echo -e "     ${GREEN}${BOLD}PASS${RESET}"

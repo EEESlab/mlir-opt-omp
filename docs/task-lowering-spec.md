@@ -358,7 +358,7 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   checks the task is outlined into its own closure, the `GOMP_task` call lands
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
-- **`test/Integration/tasks/run_tasks.sh`** — five end-to-end checks against
+- **`test/Integration/tasks/run_tasks.sh`** — six end-to-end checks against
   the real runtime (`./run_tasks.sh [libgomp|iomp]`), all expecting `42`:
   - `tasks/task_nested.mlir` — hand-written `parallel { task { *p = 42 } }`
     lowered + linked + run. MLIR input, so independent of the CIR front-end.
@@ -371,12 +371,20 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
     `__kmpc_omp_taskwait` end to end. MLIR input, front-end independent.
   - `tasks/taskwait_smoke.c` — the same load-bearing taskwait in C, ref vs opt
     (like `task_smoke.c`). Depends on ClangIR emitting `omp.taskwait`.
-  - `tasks/task_firstprivate.mlir` — a task with an *explicit* firstprivate
-    clause; prints `42` iff the firstprivate copy-in ran. Passes on both
-    libgomp (packed path) and iomp (`outlineTaskShareds` copy-in).
+  - `tasks/task_firstprivate.mlir` — a `parallel { task }` with an *explicit*
+    firstprivate clause; prints `42` iff the firstprivate copy-in ran. Passes on
+    both libgomp (packed path) and iomp (`outlineTaskShareds` copy-in). Nested in
+    a parallel so the implicit barrier completes the task (keeps it focused on
+    firstprivate; top-level taskwait is covered separately).
+  - `tasks/taskwait_toplevel.mlir` — a top-level task + top-level `omp.taskwait`
+    (outside any parallel); prints `42`. Exercises `lowerTopLevelLeaf` (real gtid
+    from `__kmpc_global_thread_num`), the path that previously crashed iomp.
 - **`test/Regression/task-iomp.mlir`** — an iomp task: checks the
   `i32(i32 gtid, ptr task) -> i32` entry and the `__kmpc_global_thread_num` /
   `__kmpc_omp_task_alloc` / `__kmpc_omp_task` call sequence.
+- **`test/Regression/taskwait-toplevel-iomp.mlir`** — a top-level `omp.taskwait`
+  lowers (in the outlining pass) to `__kmpc_global_thread_num` +
+  `__kmpc_omp_taskwait` with a real gtid, leaving no `omp_lower.construct`.
 - **`test/Regression/task-firstprivate-{iomp,libgomp}.mlir`** — a task with an
   explicit firstprivate clause: checks the copy-in (a task-private `llvm.alloca`)
   and that no firstprivate parameter leaks into the outlined signature.
@@ -409,9 +417,14 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   there %gtid is the entry's arg 0 *by value* (the shareds ABI
   `i32(i32 gtid, ptr task)`), not the microtask ptr-to-i32, so the shared leaf
   helper takes the gtid source as a callback. An `omp.barrier` inside a task
-  region is invalid OpenMP and is diagnosed there. `depend`/`nowait` on taskwait
-  are still ignored (a warning is emitted); pmsis (no standard task-wait API) is
-  a follow-up.
+  region is invalid OpenMP and is diagnosed there.
+  A *top-level* `taskwait`/`barrier` (not inside a parallel) reaches the
+  outlining pass as an empty-body `ConstructOp`; `lowerTopLevelLeaf` lowers it
+  there (not in `PlanLoweringPass`, which would resolve `%ident`/`%gtid` to
+  `undef` and crash iomp) with a real gtid from `__kmpc_global_thread_num`.
+  In-parallel taskwait/barrier take the real `%gtid` from the microtask arg.
+  `depend`/`nowait` on taskwait are still ignored (a warning is emitted);
+  pmsis (no standard task-wait API) is a follow-up.
 - **`taskgroup` / `taskloop`** — separate constructs, out of scope.
 - **LLP64 targets** — the `long = i64`, `_Bool = i8` mapping assumes LP64
   (the wsl/workstation Linux targets). Revisit only for a Windows/LLP64 libgomp.

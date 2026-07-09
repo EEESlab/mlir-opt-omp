@@ -986,6 +986,71 @@ static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
   }
 }
 
+// Lower a top-level leaf construct (barrier / taskwait NOT inside a parallel):
+// it reaches the outlining pass as an empty-body ConstructOp carrying its plan
+// as attributes.  We handle it here rather than in PlanLoweringPass because
+// there %ident/%gtid resolve to `undef` — for iomp that means
+// __kmpc_omp_taskwait(undef, undef), which crashes at runtime.  With no
+// enclosing microtask to read gtid from, %gtid is a real
+// __kmpc_global_thread_num call (seeded off the default ident).
+static void lowerTopLevelLeaf(ConstructOp op, ModuleOp module) {
+  MLIRContext *ctx = op.getContext();
+  Location loc = op.getLoc();
+  OpBuilder builder(op);
+  auto ptr  = ptrTy(ctx);
+  auto i32t = i32Ty(ctx);
+
+  // gtid is emitted lazily and memoised (one call shared by all args).
+  Value gtidVal;
+  auto getGtid = [&]() -> Value {
+    if (!gtidVal) {
+      Value id = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+      auto decl = getOrInsertDeclWithReturn(module, "__kmpc_global_thread_num",
+                                            {ptr}, i32t, builder);
+      gtidVal = func::CallOp::create(builder, loc, decl,
+                                     ValueRange{id}).getResult(0);
+    }
+    return gtidVal;
+  };
+
+  auto resolveArg = [&](Attribute a) -> Value {
+    if (auto ia = llvm::dyn_cast<IntegerAttr>(a))
+      return arith::ConstantOp::create(builder, loc, i32t,
+        IntegerAttr::get(i32t, ia.getInt()));
+    if (auto sa = llvm::dyn_cast<StringAttr>(a)) {
+      llvm::StringRef s = sa.getValue();
+      uint32_t flags;
+      if (parseIdentRef(s, flags))
+        return getOrCreateIdent(module, builder, loc, ctx, flags);
+      if (s == "%gtid")
+        return getGtid();
+    }
+    return LLVM::UndefOp::create(builder, loc, ptr);
+  };
+
+  auto lowerBlock = [&](ArrayAttr block) {
+    if (!block) return;
+    for (Attribute actionAttr : block) {
+      auto ca = llvm::dyn_cast<PlanCallAttr>(actionAttr);
+      if (!ca) continue;
+      SmallVector<Value> args;
+      SmallVector<Type>  types;
+      for (Attribute argAttr : ca.getArgs()) {
+        Value v = resolveArg(argAttr);
+        args.push_back(v); types.push_back(v.getType());
+      }
+      auto decl = getOrInsertDecl(module, ca.getCallee().getValue(), types,
+                                  builder);
+      func::CallOp::create(builder, loc, decl, args);
+    }
+  };
+
+  lowerBlock(op.getPre());
+  lowerBlock(op.getInvoke());
+  lowerBlock(op.getPost());
+  op.erase();
+}
+
 // ---------------------------------------------------------------------------
 // 1. PARALLEL OUTLINING
 // ---------------------------------------------------------------------------
@@ -1939,6 +2004,17 @@ struct OmpOutliningPass
     int counter = 0;
     for (auto op : constructs)
       outlineConstruct(op, module, counter, *barrierPlan, taskwaitPlanPtr);
+
+    // Step 1b: lower top-level leaf constructs (barrier / taskwait not nested
+    // in a parallel), which remain as empty-body ConstructOps after Step 1.
+    // Done here — not in PlanLoweringPass — so %ident/%gtid resolve to real
+    // values (a __kmpc_global_thread_num gtid) instead of undef.
+    SmallVector<ConstructOp> leaves;
+    module.walk([&](ConstructOp op) {
+      if (op.getBody().empty()) leaves.push_back(op);
+    });
+    for (auto op : leaves)
+      lowerTopLevelLeaf(op, module);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;
