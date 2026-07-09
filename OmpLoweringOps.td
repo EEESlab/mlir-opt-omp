@@ -47,9 +47,12 @@ def PlanCallAttr : OmpLowering_Attr<"PlanCall", "call"> {
   let summary = "A single planned runtime call";
   let parameters = (ins
     "::mlir::StringAttr":$callee,
-    "::mlir::ArrayAttr":$args
+    "::mlir::ArrayAttr":$args,
+    // Non-null when the call's SSA result is bound (`let <name> = call ...`);
+    // holds <name> so the outlining pass can thread the result to later calls.
+    OptionalParameter<"::mlir::StringAttr">:$result
   );
-  let assemblyFormat = "`<` $callee `,` `[` $args `]` `>`";
+  let assemblyFormat = "`<` $callee `,` `[` $args `]` (`,` `result` `=` $result^)? `>`";
 }
 
 // ---------------------------------------------------------------------------

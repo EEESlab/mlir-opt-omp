@@ -76,6 +76,7 @@ struct PlanEmit {
 struct PlanCall {
   std::string callee;   // resolved to a string (function name)
   std::vector<Value> args;
+  std::string resultName;  // non-empty if the call's SSA result is bound (let = call)
 };
 
 using PlanAction = std::variant<PlanEmit, PlanCall>;

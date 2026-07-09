@@ -66,7 +66,8 @@ Attribute planActionToAttr(const dsl::PlanAction &action, MLIRContext *ctx) {
       return PlanCallAttr::get(
         ctx,
         StringAttr::get(ctx, c.callee),
-        ArrayAttr::get(ctx, argAttrs));
+        ArrayAttr::get(ctx, argAttrs),
+        c.resultName.empty() ? StringAttr() : StringAttr::get(ctx, c.resultName));
     }
   ), action);
 }
@@ -225,7 +226,8 @@ extractTaskContext(omp::TaskOp op) {
   ctx["task_flags"]   = dsl::makeStr("task_flags");
   ctx["task_size"]    = dsl::makeStr("task_size");
   ctx["shareds_size"] = dsl::makeStr("shareds_size");
-  ctx["task"]         = dsl::makeStr("task");
+  // `task` is no longer pre-seeded: it is bound explicitly by
+  // `let task = call "__kmpc_omp_task_alloc"(...)` in rules.dsl (Approach B).
 
   return ctx;
 }

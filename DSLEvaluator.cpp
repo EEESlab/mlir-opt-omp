@@ -299,7 +299,12 @@ Expected<PlanAction> evalAction(const Action &action, ScopeImpl &scope) {
   return std::visit(llvm::makeVisitor(
     [&](const EmitAction &a) -> Expected<PlanAction> {
       Value val;
-      if (scope.has(a.name)) {
+      if (a.arg) {
+        // `emit name(arg)`: the argument value rides the emit's value slot.
+        auto v = evalExpr(*a.arg, scope);
+        if (!v) return v.takeError();
+        val = std::move(*v);
+      } else if (scope.has(a.name)) {
         auto v = scope.get(a.name);
         if (!v) return v.takeError();
         val = std::move(*v);
@@ -337,6 +342,20 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       auto v = evalExpr(ls->decl.expr, scope);
       if (!v) return v.takeError();
       scope.set(ls->decl.name, std::move(*v));
+      i++;
+      continue;
+    }
+
+    if (auto *lc = std::get_if<LetCallStmt>(&stmt)) {
+      // Emit the call and bind <name> to a symbolic placeholder ("%name") so
+      // later argument expressions referencing it resolve to that token; the
+      // pass maps the token back to the call's SSA result.
+      auto a = evalAction(Action{lc->call}, scope);
+      if (!a) return a.takeError();
+      auto &pc = std::get<PlanCall>(*a);
+      pc.resultName = lc->name;
+      out.push_back(std::move(*a));
+      scope.set(lc->name, makeStr("%" + lc->name));
       i++;
       continue;
     }

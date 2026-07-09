@@ -591,10 +591,49 @@ static void outlineTaskShareds(ConstructOp op, ModuleOp module, int &counter) {
   Value fnPtrCast = UnrealizedConversionCastOp::create(builder, loc,
     TypeRange{ptr}, ValueRange{fnPtr}).getResult(0);
 
-  // Emit the invoke calls in DSL order, threading the task_alloc result into
-  // the `task` token and populating shareds in between (Approach A).
-  Value taskResult;
+  // Emit the invoke actions in DSL order.  A `let <name> = call ...` binds the
+  // call's SSA result under the token "%<name>"; later arg tokens and the
+  // `populate_shareds` verb resolve against that map (Approach B, see
+  // docs/dsl-result-binding-proposal.md).
+  llvm::StringMap<Value> boundResults;
+
+  // Resolve one symbolic string arg to an SSA value.  Bound results shadow the
+  // built-in tokens.
+  auto resolveToken = [&](llvm::StringRef s) -> Value {
+    if (auto it = boundResults.find(s); it != boundResults.end())
+      return it->second;
+    uint32_t flags;
+    if (parseIdentRef(s, flags))
+      return (flags == 0x02) ? identVal
+                             : getOrCreateIdent(module, builder, loc, ctx, flags);
+    if (s == "%gtid")        return gtid;
+    if (s == "task_flags")
+      return arith::ConstantOp::create(builder, loc, i32t,
+               IntegerAttr::get(i32t, 1)); // tied
+    if (s == "task_size")    return taskSizeV;
+    if (s == "shareds_size") return sharedsSizeV;
+    if (s == "body")         return fnPtrCast;
+    return LLVM::UndefOp::create(builder, loc, ptr);
+  };
+
   for (auto attr : op.getInvoke()) {
+    // `emit populate_shareds(<task>)`: write the captures into task->shareds.
+    if (auto ea = llvm::dyn_cast<PlanEmitAttr>(attr)) {
+      if (ea.getSymName().getValue() != "populate_shareds") continue;
+      if (captures.empty()) continue;
+      Value base;
+      if (auto sv = llvm::dyn_cast<StringAttr>(ea.getValue()))
+        base = resolveToken(sv.getValue());
+      else
+        base = LLVM::UndefOp::create(builder, loc, ptr);
+      Value sg = LLVM::GEPOp::create(builder, loc, ptr, kmpTaskTy, base,
+        ArrayRef<LLVM::GEPArg>{0, 0});
+      Value sh = LLVM::LoadOp::create(builder, loc, ptr, sg);
+      storeCapturesToBase(builder, loc, sh, sharedsTy, captures, fieldTypes,
+        privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
+      continue;
+    }
+
     auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
     if (!ca) continue;
     llvm::StringRef callee = ca.getCallee().getValue();
@@ -603,24 +642,7 @@ static void outlineTaskShareds(ConstructOp op, ModuleOp module, int &counter) {
     for (auto argAttr : ca.getArgs()) {
       Value v;
       if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-        llvm::StringRef s = sa.getValue();
-        uint32_t flags;
-        if (parseIdentRef(s, flags))
-          v = (flags == 0x02)
-                ? identVal
-                : getOrCreateIdent(module, builder, loc, ctx, flags);
-        else if (s == "%gtid")        v = gtid;
-        else if (s == "task_flags")
-          v = arith::ConstantOp::create(builder, loc, i32t,
-                IntegerAttr::get(i32t, 1)); // tied
-        else if (s == "task_size")    v = taskSizeV;
-        else if (s == "shareds_size") v = sharedsSizeV;
-        else if (s == "body")         v = fnPtrCast;
-        else if (s == "task")
-          v = taskResult ? taskResult
-                         : LLVM::UndefOp::create(builder, loc, ptr);
-        else
-          v = LLVM::UndefOp::create(builder, loc, ptr);
+        v = resolveToken(sa.getValue());
       } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
         v = arith::ConstantOp::create(builder, loc, i32t,
           IntegerAttr::get(i32t, ia.getInt()));
@@ -631,17 +653,12 @@ static void outlineTaskShareds(ConstructOp op, ModuleOp module, int &counter) {
       types.push_back(v.getType());
     }
 
-    if (callee == "__kmpc_omp_task_alloc") {
+    // A bound call returns a handle (ptr); a fire-and-forget call returns i32
+    // and its result is dropped.
+    if (auto resultName = ca.getResult()) {
       auto decl = getOrInsertDeclWithReturn(module, callee, types, ptr, builder);
-      taskResult = func::CallOp::create(builder, loc, decl, args).getResult(0);
-      // Populate task->shareds with the captures.
-      if (!captures.empty()) {
-        Value sg = LLVM::GEPOp::create(builder, loc, ptr, kmpTaskTy, taskResult,
-          ArrayRef<LLVM::GEPArg>{0, 0});
-        Value sh = LLVM::LoadOp::create(builder, loc, ptr, sg);
-        storeCapturesToBase(builder, loc, sh, sharedsTy, captures, fieldTypes,
-          privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
-      }
+      Value res = func::CallOp::create(builder, loc, decl, args).getResult(0);
+      boundResults["%" + resultName.getValue().str()] = res;
     } else {
       auto decl = getOrInsertDeclWithReturn(module, callee, types, i32t, builder);
       func::CallOp::create(builder, loc, decl, args);

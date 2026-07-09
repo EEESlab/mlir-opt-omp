@@ -73,7 +73,7 @@ struct PredOr    { std::shared_ptr<Predicate> left, right; };
 // Action
 // ===========================================================================
 
-struct EmitAction { std::string name; };
+struct EmitAction { std::string name; std::optional<Expr> arg; };
 struct CallAction { Expr callee; std::vector<Expr> args; };
 using Action = std::variant<EmitAction, CallAction>;
 
@@ -86,15 +86,20 @@ struct ActionStmt;
 struct WhenStmt;
 struct OtherwiseStmt;
 struct LetStmt;
+struct LetCallStmt;
 
 struct LetDecl { std::string name; Expr expr; };
 
-using Statement = std::variant<ActionStmt, WhenStmt, OtherwiseStmt, LetStmt>;
+using Statement =
+  std::variant<ActionStmt, WhenStmt, OtherwiseStmt, LetStmt, LetCallStmt>;
 
 struct ActionStmt    { Action action; };
 struct WhenStmt      { Predicate predicate; Action action; };
 struct OtherwiseStmt { Action action; };
 struct LetStmt       { LetDecl decl; };
+// `let <name> = call "<callee>"(<args>);` — binds <name> to the call's SSA
+// result so later statements can reference it (see docs/dsl-result-binding-proposal.md).
+struct LetCallStmt   { std::string name; CallAction call; };
 
 // ===========================================================================
 // Construct items

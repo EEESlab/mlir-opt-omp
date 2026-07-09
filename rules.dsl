@@ -50,13 +50,15 @@
         // tag matched by .find("task_entry").
         outline_signature = task_entry();
         // No pre block: unlike parallel every task invoke call uses
-        // both ident and global_tid, so there is no optionality. 
+        // both ident and global_tid, so there is no optionality.
         invoke {
-          // `task` resolves to the __kmpc_omp_task_alloc result; the lowering
-          // also populates task->shareds with the captures (more documented in
+          // `let task = call ...` binds the __kmpc_omp_task_alloc result;
+          // `populate_shareds(task)` is a C++-backed verb that writes the
+          // captures into task->shareds (more documented in
           // docs/task-lowering-spec.md). task_flags=1 (tied); if/final TBD.
-          call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
-                                       task_size, shareds_size, body);
+          let task = call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
+                                                  task_size, shareds_size, body);
+          emit populate_shareds(task);
           call "__kmpc_omp_task"(ident, global_tid, task);
         }
       }
