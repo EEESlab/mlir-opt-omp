@@ -221,12 +221,25 @@ static void replaceUsesInRegion(Region &region, Value oldVal, Value newVal) {
       use.set(newVal);
 }
 
-// The single clause operand carried by a ConstructOp, if any: num_threads for
-// parallel, if_clause for task.  Which one it is follows from the construct
-// kind and the symbolic arg name being resolved in the plan.
-static Value getClauseOperand(ConstructOp op) {
-  auto ops = op.getClauseOperands();
-  return ops.empty() ? Value() : ops[0];
+// Clause operands are carried on the ConstructOp as a single variadic list;
+// the 1:1 clause_names attribute says which clause each entry belongs to
+// ("num_threads", "if_clause", ...).  Returns the operand for `name`, or null.
+static Value getClauseOperand(ConstructOp op, llvm::StringRef name) {
+  auto names = op.getClauseNames();
+  if (!names) return Value();
+  for (auto [i, n] : llvm::enumerate(*names))
+    if (llvm::cast<StringAttr>(n).getValue() == name)
+      return op.getClauseOperands()[i];
+  return Value();
+}
+
+// Normalise a clause value to i1 for use as an llvm.cond_br condition /
+// arith.select predicate (if-clause values are typically already i1).
+static Value clauseToI1(OpBuilder &builder, Location loc, Value v) {
+  if (v.getType().isInteger(1)) return v;
+  Value zero = LLVM::ConstantOp::create(builder, loc, v.getType(),
+    IntegerAttr::get(v.getType(), 0));
+  return LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne, v, zero);
 }
 
 static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
@@ -654,10 +667,13 @@ static void replaceTerminatorsWithReturn(
 // leaf helper) when the runtime provides a taskwait plan; %gtid is the entry's
 // arg 0 (an i32 value, unlike the microtask ptr-to-i32 convention).
 // Supports implicit captures and explicit firstprivate clauses (copy-in into a
-// task-private slot, mirroring the packed path).  v1 limitations: pure `private`
-// clauses are not wired (diagnosed, not miscompiled); no if/final clause (always
-// deferred); task_flags = 1 (tied); depend/nowait on taskwait ignored;
-// omp.barrier is illegal in a task region and diagnosed.
+// task-private slot, mirroring the packed path), and the if clause via a
+// runtime branch: deferred __kmpc_omp_task when the condition holds, the
+// undeferred __kmpc_omp_task_begin_if0 / direct entry call / _complete_if0
+// protocol when it does not.  v1 limitations: pure `private` clauses are not
+// wired (diagnosed, not miscompiled); no final clause; task_flags = 1 (tied);
+// depend/nowait on taskwait ignored; omp.barrier is illegal in a task region
+// and diagnosed.
 static void
 lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module, MLIRContext *ctx,
                    llvm::StringRef opName, const dsl::LoweringPlan &plan,
@@ -926,6 +942,46 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
       auto decl = getOrInsertDeclWithReturn(module, callee, types, ptr, builder);
       Value res = func::CallOp::create(builder, loc, decl, args).getResult(0);
       boundResults["%" + resultName.getValue().str()] = res;
+    } else if (callee == "__kmpc_omp_task" && !args.empty() &&
+               getClauseOperand(op, "if_clause")) {
+      // if(cond) needs a branch on the runtime value (the flat DSL plan can
+      // only branch on clause *presence*), so it is emitted here:
+      //   cond true  → deferred:   __kmpc_omp_task(ident, gtid, task)
+      //   cond false → undeferred: the if0 protocol — begin_if0, direct call
+      //                of the entry on the current thread, complete_if0.
+      // The task is allocated either way (the if0 calls also take kmp_task_t*).
+      // The task handle is the call's last resolved arg (the DSL `task`
+      // binding in `call "__kmpc_omp_task"(ident, global_tid, task)`).
+      Value taskV = args.back();
+      Value cond = clauseToI1(builder, loc, getClauseOperand(op, "if_clause"));
+      Block *curBlock = builder.getInsertionBlock();
+      // op and everything after it continue in contBlock.
+      Block *contBlock = curBlock->splitBlock(op);
+      Block *deferredBlock = builder.createBlock(contBlock);
+      Block *if0Block = builder.createBlock(contBlock);
+
+      builder.setInsertionPointToEnd(curBlock);
+      LLVM::CondBrOp::create(builder, loc, cond, deferredBlock, if0Block);
+
+      builder.setInsertionPointToEnd(deferredBlock);
+      auto decl = getOrInsertDeclWithReturn(module, callee, types, i32t, builder);
+      func::CallOp::create(builder, loc, decl, args);
+      LLVM::BrOp::create(builder, loc, contBlock);
+
+      builder.setInsertionPointToEnd(if0Block);
+      auto beginDecl = getOrInsertDecl(module, "__kmpc_omp_task_begin_if0",
+        {ptr, i32t, ptr}, builder);
+      func::CallOp::create(builder, loc, beginDecl,
+        ValueRange{identVal, gtid, taskV});
+      func::CallOp::create(builder, loc, outlinedFn,
+        ValueRange{gtid, taskV});
+      auto completeDecl = getOrInsertDecl(module, "__kmpc_omp_task_complete_if0",
+        {ptr, i32t, ptr}, builder);
+      func::CallOp::create(builder, loc, completeDecl,
+        ValueRange{identVal, gtid, taskV});
+      LLVM::BrOp::create(builder, loc, contBlock);
+
+      builder.setInsertionPoint(op);
     } else {
       auto decl = getOrInsertDeclWithReturn(module, callee, types, i32t, builder);
       func::CallOp::create(builder, loc, decl, args);
@@ -1278,7 +1334,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // unsupported clause shape (a pure `private` clause, a non-scalar/aggregate
   // firstprivate, or one whose element type couldn't be inferred): diagnose it
   // rather than silently emit a wrong-ABI outlined function.  Mirrors the iomp
-  // path (outlineTaskShareds).
+  // path (outlineTaskEntry).
   if (!privatizerArgs.empty()) {
     for (auto arg : llvm::reverse(privatizerArgs)) {
       if (arg.use_empty())
@@ -1376,6 +1432,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       runtimeCallee = ca.getCallee().getValue().str();
       break;
     }
+
+  // Set by whichever emission path consumes the if clause; checked after
+  // emission so an unconsumed if is flagged instead of silently dropped.
+  bool ifClauseUsed = false;
 
   if (!runtimeCallee.empty()) {
     builder.setInsertionPoint(op);
@@ -1521,10 +1581,11 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             else if (s == "env_align")
               v = LLVM::ConstantOp::create(builder, loc, i64t,
                     IntegerAttr::get(i64t, (int64_t)envAlign));
-            else if (s == "if_clause" && getClauseOperand(op)) {
+            else if (s == "if_clause" && getClauseOperand(op, "if_clause")) {
               // Normalise the if-clause SSA value (typically i1) to i8 to
               // match the C `_Bool` parameter of GOMP_task.
-              Value ifv = getClauseOperand(op);
+              ifClauseUsed = true;
+              Value ifv = getClauseOperand(op, "if_clause");
               if (ifv.getType() != i8t) {
                 unsigned bw = ifv.getType().getIntOrFloatBitWidth();
                 ifv = bw < 8
@@ -1589,11 +1650,29 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       }
     }
 
+    // parallel if(cond) on libgomp: GOMP_parallel has no if parameter — GCC
+    // lowers the clause by forcing num_threads to 1 when the condition is
+    // false (a one-thread team is the undeferred/serial execution).  The
+    // num_threads slot is arg 2 of GOMP_parallel(fn, data, num_threads,
+    // flags); 0 there means "runtime default".
+    if (runtimeCallee == "GOMP_parallel" && callArgs.size() >= 3 &&
+        llvm::isa<IntegerType>(callArgs[2].getType())) {
+      if (Value ifv = getClauseOperand(op, "if_clause")) {
+        ifClauseUsed = true;
+        Value cond = clauseToI1(builder, loc, ifv);
+        Type ntTy = callArgs[2].getType();
+        Value oneNt = arith::ConstantOp::create(builder, loc, ntTy,
+          IntegerAttr::get(ntTy, 1));
+        callArgs[2] = arith::SelectOp::create(builder, loc, cond,
+          callArgs[2], oneNt);
+        callTypes[2] = callArgs[2].getType();
+      }
+    }
+
     // __kmpc_fork_call is variadic: (ident, argc, fn, ...captures) -> void.
     // Declare it as llvm.func variadic so multiple parallel regions with
     // different capture counts can share the same declaration.
-    if (runtimeCallee == "__kmpc_fork_call" ||
-        runtimeCallee == "__kmpc_fork_call_if") {
+    if (runtimeCallee == "__kmpc_fork_call") {
       MLIRContext *mctx = module.getContext();
       // Fixed prefix: ident(ptr), argc(i32), fn(ptr)
       SmallVector<Type> fixedTypes;
@@ -1612,12 +1691,83 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           UnknownLoc::get(mctx), runtimeCallee, varFnType,
           LLVM::Linkage::External);
       }
-      LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
+
+      Value ifCond = isPacked ? Value() : getClauseOperand(op, "if_clause");
+      if (!ifCond) {
+        LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
+      } else {
+        // parallel if(cond): branch on the runtime value, clang-style.
+        //   cond true  → __kmpc_fork_call as usual
+        //   cond false → serialized parallel: __kmpc_serialized_parallel,
+        //                direct microtask call on this thread (gtid/btid
+        //                passed by pointer, btid = 0),
+        //                __kmpc_end_serialized_parallel.
+        // __kmpc_fork_call_if is deliberately NOT used: it takes a single
+        // packed `void *args` (argc <= 1), incompatible with the by_pointer
+        // capture convention that passes each capture as its own vararg.
+        ifClauseUsed = true;
+        Value gtidVal = gtidAtCallSite;
+        if (!gtidVal) {
+          auto gtidDecl = getOrInsertDeclWithReturn(module,
+            "__kmpc_global_thread_num", {ptrTy(ctx)}, i32Ty(ctx), builder);
+          gtidVal = func::CallOp::create(builder, loc, gtidDecl,
+            ValueRange{identVal}).getResult(0);
+        }
+        auto i64t = IntegerType::get(ctx, 64);
+        Value one64 = LLVM::ConstantOp::create(builder, loc, i64t,
+          IntegerAttr::get(i64t, 1));
+        Value zero32 = LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
+          IntegerAttr::get(i32Ty(ctx), 0));
+        Value gtidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+          i32Ty(ctx), one64);
+        Value btidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+          i32Ty(ctx), one64);
+        LLVM::StoreOp::create(builder, loc, gtidVal, gtidAddr);
+        LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
+        Value cond = clauseToI1(builder, loc, ifCond);
+
+        Block *curBlock = builder.getInsertionBlock();
+        // op and everything after it continue in contBlock.
+        Block *contBlock = curBlock->splitBlock(op);
+        Block *forkBlock = builder.createBlock(contBlock);
+        Block *serBlock  = builder.createBlock(contBlock);
+
+        builder.setInsertionPointToEnd(curBlock);
+        LLVM::CondBrOp::create(builder, loc, cond, forkBlock, serBlock);
+
+        builder.setInsertionPointToEnd(forkBlock);
+        LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
+        LLVM::BrOp::create(builder, loc, contBlock);
+
+        builder.setInsertionPointToEnd(serBlock);
+        auto serDecl = getOrInsertDecl(module, "__kmpc_serialized_parallel",
+          {ptrTy(ctx), i32Ty(ctx)}, builder);
+        func::CallOp::create(builder, loc, serDecl,
+          ValueRange{identVal, gtidVal});
+        // callArgs[3..] are exactly the capture args of the microtask.
+        SmallVector<Value> directArgs{gtidAddr, btidAddr};
+        for (size_t ai = 3; ai < callArgs.size(); ++ai)
+          directArgs.push_back(callArgs[ai]);
+        func::CallOp::create(builder, loc, outlinedFn, directArgs);
+        auto endSerDecl = getOrInsertDecl(module,
+          "__kmpc_end_serialized_parallel", {ptrTy(ctx), i32Ty(ctx)}, builder);
+        func::CallOp::create(builder, loc, endSerDecl,
+          ValueRange{identVal, gtidVal});
+        LLVM::BrOp::create(builder, loc, contBlock);
+
+        builder.setInsertionPoint(op);
+      }
     } else {
       auto decl = getOrInsertDecl(module, runtimeCallee, callTypes, builder);
       func::CallOp::create(builder, loc, decl, callArgs);
     }
   }
+
+  // An if clause that no emission path consumed would silently change
+  // semantics (if(false) must run the region undeferred/serialized): flag it.
+  if (getClauseOperand(op, "if_clause") && !ifClauseUsed)
+    op.emitWarning("omp-outline: `if` clause is not supported by this "
+                   "runtime/construct lowering and was ignored");
 
   op.erase();
 }

@@ -24,8 +24,13 @@
         }
 
         invoke {
-          when has(if_clause) => call "__kmpc_fork_call_if"(ident, argc(captures), body, if_clause, captures);
-          otherwise => call "__kmpc_fork_call"(ident, argc(captures), body, captures);
+          // if(cond) is a branch on a runtime VALUE, which the flat plan
+          // cannot express: the outlining pass emits it in C++ around this
+          // call (cond true → __kmpc_fork_call; cond false → serialized
+          // parallel + direct microtask call).  __kmpc_fork_call_if is not
+          // usable here: it takes a single packed void* (argc <= 1), while
+          // by_pointer passes each capture as its own vararg.
+          call "__kmpc_fork_call"(ident, argc(captures), body, captures);
         }
       }
 
@@ -80,6 +85,10 @@
           // `populate_shareds(task)` is a C++-backed verb that writes the
           // captures into task->shareds (more documented in
           // docs/task-lowering-spec.md).  task_flags is the `let` above.
+          // if(cond) is handled in C++ around the __kmpc_omp_task call (a
+          // runtime-value branch the flat plan cannot express): cond false
+          // takes the undeferred begin_if0 / direct entry call / complete_if0
+          // path instead.
           let task = call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
                                                   task_size, shareds_size, body);
           emit populate_shareds(task);

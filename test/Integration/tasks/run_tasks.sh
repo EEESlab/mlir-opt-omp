@@ -38,6 +38,17 @@
 #               a real gtid (__kmpc_global_thread_num) — the iomp path previously
 #               crashed here with an undef gtid.
 #
+#   [7] MLIR  — task if(false) (task_if0.mlir): the task must run UNDEFERRED,
+#               so the read-back right after the construct — with NO taskwait —
+#               sees its write.  iomp takes the __kmpc_omp_task_begin_if0 /
+#               direct entry call / _complete_if0 branch; libgomp passes
+#               if_clause=false to GOMP_task (inline execution).
+#
+#   [8] MLIR  — parallel if(false) (parallel_if0.mlir): the region must run
+#               SERIALIZED (one increment of x, not one per thread).  iomp takes
+#               the __kmpc_serialized_parallel + direct microtask call branch;
+#               libgomp forces num_threads to 1 (GCC-style).
+#
 # A test PASSes iff the program prints 42 (the task's write to the shared int is
 # visible after the parallel region's implicit barrier).  For [2] the ref and
 # opt outputs must also match.
@@ -261,6 +272,47 @@ echo "── [6] MLIR: top-level task; top-level taskwait"
 if mlir_to_bin "$SCRIPT_DIR/taskwait_toplevel.mlir" "$TMP/twtl_bin" \
         "$DUMP_BASE/mlir_taskwait_toplevel"; then
     got="$(OMP_NUM_THREADS=2 "$TMP/twtl_bin" 2>/dev/null || echo '<crash>')"
+    echo "     output: '$got' (expected '$EXPECTED')"
+    if [ "$got" = "$EXPECTED" ]; then
+        echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+    else
+        echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+    fi
+else
+    echo -e "     ${RED}${BOLD}ERROR${RESET}: lowering/build failed"; fail=1
+fi
+echo ""
+
+# --- [7] hand-written MLIR: task if(false) is undeferred ---------------------
+# The task writes 42; the region reads it back IMMEDIATELY, with no taskwait:
+# if(false) requires the spawning thread to execute the task before moving on,
+# so the read is deterministically 42.  Before the if0 lowering the clause was
+# dropped (task always deferred) and this read raced with the task body.
+echo "── [7] MLIR: parallel { task if(false); read-back, no taskwait }"
+if mlir_to_bin "$SCRIPT_DIR/task_if0.mlir" "$TMP/if0_bin" \
+        "$DUMP_BASE/mlir_task_if0"; then
+    got="$(OMP_NUM_THREADS=2 "$TMP/if0_bin" 2>/dev/null || echo '<crash>')"
+    echo "     output: '$got' (expected '$EXPECTED')"
+    if [ "$got" = "$EXPECTED" ]; then
+        echo -e "     ${GREEN}${BOLD}PASS${RESET}"
+    else
+        echo -e "     ${RED}${BOLD}FAIL${RESET}"; fail=1
+    fi
+else
+    echo -e "     ${RED}${BOLD}ERROR${RESET}: lowering/build failed"; fail=1
+fi
+echo ""
+
+# --- [8] hand-written MLIR: parallel if(false) runs serialized ---------------
+# The region increments x by 42; serialized execution (a team of one) means
+# exactly one increment, so the printed value is 42.  A real fork with
+# OMP_NUM_THREADS=2 would increment twice.  Under iomp this previously emitted
+# __kmpc_fork_call_if with the cond argument missing (captures shifted into its
+# slot); under libgomp the clause was silently ignored.
+echo "── [8] MLIR: parallel if(false) { x += 42 }"
+if mlir_to_bin "$SCRIPT_DIR/parallel_if0.mlir" "$TMP/pif0_bin" \
+        "$DUMP_BASE/mlir_parallel_if0"; then
+    got="$(OMP_NUM_THREADS=2 "$TMP/pif0_bin" 2>/dev/null || echo '<crash>')"
     echo "     output: '$got' (expected '$EXPECTED')"
     if [ "$got" = "$EXPECTED" ]; then
         echo -e "     ${GREEN}${BOLD}PASS${RESET}"

@@ -84,9 +84,10 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     //
     // A single variadic list (rather than several Optional operands) avoids
     // AttrSizedOperandSegments, whose generated verifier is broken when the
-    // dialect disables usePropertiesForAttributes.  At most one operand is
-    // present today: num_threads (parallel) or if_clause (task); the construct
-    // kind and the plan's symbolic arg name disambiguate which it is.
+    // dialect disables usePropertiesForAttributes.  The 1:1 clause_names
+    // array below says which clause each operand carries ("num_threads",
+    // "if_clause", ...), so a construct can carry several at once (e.g.
+    // `parallel num_threads(n) if(c)`).
     Variadic<AnyType>:$clause_operands,
 
     StrAttr:$runtime,
@@ -96,7 +97,10 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     DictionaryAttr:$prop_dict,
     ArrayAttr:$pre,
     ArrayAttr:$invoke,
-    ArrayAttr:$post
+    ArrayAttr:$post,
+    // Clause name of each clause_operands entry, same order.  Optional so
+    // constructs without clause operands (barrier, taskwait) stay unchanged.
+    OptionalAttr<StrArrayAttr>:$clause_names
   );
 
   let results = (outs);

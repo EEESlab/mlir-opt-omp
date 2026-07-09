@@ -94,11 +94,19 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
     return ArrayAttr::get(ctx, attrs);
   };
 
-  // At most one clause operand is present: num_threads (parallel) or
-  // if_clause (task).  Both ride a single variadic operand list.
+  // Clause operands ride a single variadic list; clause_names records which
+  // clause each entry carries so the outlining pass can look them up by name
+  // (a parallel can have both num_threads and if_clause at once).
   SmallVector<Value> clauseOperands;
-  if (numThreads) clauseOperands.push_back(numThreads);
-  if (ifClause)   clauseOperands.push_back(ifClause);
+  SmallVector<Attribute> clauseNames;
+  if (numThreads) {
+    clauseOperands.push_back(numThreads);
+    clauseNames.push_back(builder.getStringAttr("num_threads"));
+  }
+  if (ifClause) {
+    clauseOperands.push_back(ifClause);
+    clauseNames.push_back(builder.getStringAttr("if_clause"));
+  }
 
   auto constructOp = ConstructOp::create(builder, loc,
     clauseOperands,
@@ -107,7 +115,8 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
     propDict,
     toArrayAttr(plan.pre),
     toArrayAttr(plan.invoke),
-    toArrayAttr(plan.post));
+    toArrayAttr(plan.post),
+    clauseNames.empty() ? ArrayAttr() : builder.getArrayAttr(clauseNames));
 
   // Move the source region (e.g. omp.parallel body) into the construct op.
   if (srcRegion && !srcRegion->empty())
@@ -118,14 +127,6 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
 // Context extraction from omp.* ops
 // ===========================================================================
 
-static dsl::Value ssaToStrVal(mlir::Value v) {
-  if (!v) return dsl::makeNull();
-  std::string s;
-  llvm::raw_string_ostream os(s);
-  v.print(os);
-  return dsl::makeStr(s);
-}
-
 static llvm::StringMap<dsl::Value>
 extractParallelContext(omp::ParallelOp op) {
   llvm::StringMap<dsl::Value> ctx;
@@ -133,9 +134,11 @@ extractParallelContext(omp::ParallelOp op) {
   ctx["body"]     = dsl::makeStr("outlined_parallel");
   ctx["captures"] = dsl::makeList({});
 
-  // if_clause
-  if (auto ifVar = op.getIfExpr())
-    ctx["if_clause"] = ssaToStrVal(ifVar);
+  // if_clause is a sentinel like on task: non-null selects `when
+  // has(if_clause)` branches; the SSA value rides as a ConstructOp clause
+  // operand (named "if_clause") and is resolved at the call site.
+  if (op.getIfExpr())
+    ctx["if_clause"] = dsl::makeStr("if_clause");
   else
     ctx["if_clause"] = dsl::makeNull();
 
@@ -379,7 +382,7 @@ struct OmpToOmpLowerPass
       if (op.getNumThreadsDimsCount() > 0)
         numThreads = op.getNumThreads(0);
       if (!process(op, "parallel", extractParallelContext(op),
-                   &op.getRegion(), numThreads)) return;
+                   &op.getRegion(), numThreads, op.getIfExpr())) return;
     }
 
     // Tasks behave like parallel for outlining (closure/packed body), but
@@ -388,6 +391,25 @@ struct OmpToOmpLowerPass
     // firstprivate uses before moving the region.
     for (auto op : tasks) {
       if (!op->getBlock()) continue;
+      // Clauses with no lowering yet: warn instead of silently dropping them
+      // (if/firstprivate are wired; pure private is diagnosed downstream).
+      if (op.getFinal())
+        op.emitWarning("omp task `final` clause is not supported; ignored");
+      if (op.getUntied())
+        op.emitWarning("omp task `untied` clause is not supported; the task "
+                       "stays tied");
+      if (op.getMergeable())
+        op.emitWarning("omp task `mergeable` clause is not supported; ignored");
+      if (op.getPriority())
+        op.emitWarning("omp task `priority` clause is not supported; ignored");
+      if (!op.getDependVars().empty())
+        op.emitWarning("omp task `depend` clause is not supported; the "
+                       "dependency is ignored");
+      if (!op.getInReductionVars().empty())
+        op.emitWarning("omp task `in_reduction` clause is not supported; "
+                       "ignored");
+      if (op.getEventHandle())
+        op.emitWarning("omp task `detach` clause is not supported; ignored");
       injectFirstprivateUses(op);
       Value ifClause = op.getIfExpr();
       if (!process(op, "task", extractTaskContext(op),
