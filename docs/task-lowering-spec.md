@@ -383,6 +383,10 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 - **`test/Regression/task-firstprivate-snapshot-{iomp,libgomp}.mlir`** — the
   snapshot-timing property: the scalar firstprivate source is loaded by value at
   the call site (task creation), not dereferenced at entry. Both runtimes pass.
+- **`test/Regression/task-firstprivate-unsupported-{iomp,libgomp}.mlir`** — an
+  unsupported firstprivate shape (block arg used without a scalar load, so the
+  element type can't be inferred) is diagnosed on both paths (`-verify-diagnostics`)
+  instead of silently emitting a wrong-ABI outlined function.
 - Future (iomp): the `if0` begin/complete (`if`/`final`) path; pure `private`
   clause wiring.
 

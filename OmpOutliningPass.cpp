@@ -1207,13 +1207,23 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     }
   }
 
-  // Remove unused privatizer block args from the entry block.
-  // They were already replaced by private copies in the prolog; keeping them
-  // would add extra parameters that receive no values at the call site.
+  // Remove privatizer block args now made dead by the copy-in.  They were
+  // replaced by private copies in the prolog, so keeping them would add extra
+  // parameters the call site never fills.  A survivor with live uses is an
+  // unsupported clause shape (a pure `private` clause, a non-scalar/aggregate
+  // firstprivate, or one whose element type couldn't be inferred): diagnose it
+  // rather than silently emit a wrong-ABI outlined function.  Mirrors the iomp
+  // path (outlineTaskShareds).
   if (!privatizerArgs.empty()) {
-    for (auto arg : llvm::reverse(privatizerArgs))
+    for (auto arg : llvm::reverse(privatizerArgs)) {
       if (arg.use_empty())
         entry.eraseArgument(arg.getArgNumber());
+      else
+        op.emitError("omp-outline: ")
+            << op.getConstructName()
+            << " construct has an unsupported private/firstprivate clause; "
+               "outlined ABI would break";
+    }
   }
 
   // Remove injected unrealized_conversion_cast marker ops (no users).
