@@ -458,7 +458,7 @@ static void storeCapturesToBase(
 //     with the captures, then __kmpc_omp_task.
 // v1 limitations: no firstprivate/private clause wiring (captures only); no
 // if/final clause (always deferred); task_flags = 1 (tied).
-static void outlineTaskShareds(ConstructOp op, ModuleOp module, int &counter) {
+static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -690,7 +690,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // sequence.  The capture topology is still "packed" (one struct); only the
   // signature differs, so we dispatch on it here.
   if (outlineSig.find("task_entry") != std::string::npos) {
-    outlineTaskShareds(op, module, counter);
+    outlineTaskEntry(op, module, counter);
     return;
   }
 

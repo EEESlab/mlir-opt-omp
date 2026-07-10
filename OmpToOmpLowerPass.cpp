@@ -217,7 +217,7 @@ extractTaskContext(omp::TaskOp op) {
   ctx["env_size"]  = dsl::makeStr("env_size");
   ctx["env_align"] = dsl::makeStr("env_align");
 
-  // iomp task tokens resolved at the call site in OmpOutliningPass::outlineTaskShareds.
+  // iomp task tokens resolved at the call site in OmpOutliningPass::outlineTaskEntry.
   // gtid/task_t commented because before were present, but only decorative
   ctx["ident"]        = dsl::makeStr("%ident");
   ctx["global_tid"]   = dsl::makeStr("%gtid");

@@ -251,7 +251,7 @@ tasks. (The shared `counter` is global, so the inner task's function is e.g.
 
 ### 5.3 iomp (implemented — Approach A)
 
-A new outlining branch (`outlineTaskShareds`) keyed on `outline_signature`
+A new outlining branch (`outlineTaskEntry`) keyed on `outline_signature`
 containing `task_entry` (the capture topology stays `packed`). It cannot share
 the `void(void*)` closure path. Concretely:
 
@@ -372,7 +372,7 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 2. **libgomp v2** — nested tasks (collect every `omp.task`); nested-task
    regression test; end-to-end `run_tasks.sh` integration test. **(done)**
 3. **iomp** — new `task_entry`/`shareds` outline branch
-   (`outlineTaskShareds`); `__kmpc_omp_task_alloc` (result bound to `task`,
+   (`outlineTaskEntry`); `__kmpc_omp_task_alloc` (result bound to `task`,
    Approach A) + shareds population + `__kmpc_omp_task`; `task-iomp.mlir`.
    **(implemented — pending build/test)**. Follow-ups: `if`/`final` (`if0`
    path), firstprivate via shareds, libomp end-to-end run.
