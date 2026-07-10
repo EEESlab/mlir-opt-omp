@@ -569,12 +569,13 @@ static void outlineTaskShareds(ConstructOp op, ModuleOp module, int &counter) {
 
   // Every task invoke call uses both ident and global_tid (that is why the
   // task construct has no `pre { emit ... }` block), so emit them eagerly:
-  // one ident global and one __kmpc_global_thread_num call shared by the two
-  // invoke calls.  gtid seeds off the default (KMPC-flagged) ident, matching
-  // the runtime's contract.
+  // one ident global and one global_tid_function call (DSL property, iomp:
+  // __kmpc_global_thread_num) shared by the two invoke calls.  gtid seeds off
+  // the default (KMPC-flagged) ident, matching the runtime's contract.
   Value identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+  std::string gtidFnName = getPropStr(op, "global_tid_function");
   auto gtidDecl = getOrInsertDeclWithReturn(module,
-    "__kmpc_global_thread_num", {ptr}, i32t, builder);
+    gtidFnName, {ptr}, i32t, builder);
   Value gtid = func::CallOp::create(builder, loc, gtidDecl,
     ValueRange{identVal}).getResult(0);
 
@@ -1045,8 +1046,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     // global_tid at call site
     Value gtidAtCallSite;
     if (needsGlobalTid) {
+      std::string gtidFnName = getPropStr(op, "global_tid_function");
       auto gtidDecl = getOrInsertDeclWithReturn(module,
-        "__kmpc_global_thread_num", {ptrTy(ctx)}, i32Ty(ctx), builder);
+        gtidFnName, {ptrTy(ctx)}, i32Ty(ctx), builder);
       gtidAtCallSite = func::CallOp::create(builder, loc, gtidDecl,
         ValueRange{identVal}).getResult(0);
     }

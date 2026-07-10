@@ -1,4 +1,7 @@
     runtime iomp {
+      // How the global thread id is acquired
+      global_tid_function = "__kmpc_global_thread_num";
+
       // Chunk size for the static work-sharing schedule; flows into the final
       // `chunk` argument of __kmpc_for_static_init_4 (wsloop construct).
       let default_chunk = 1;

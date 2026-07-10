@@ -503,6 +503,17 @@ Expected<LoweringPlan> Evaluator::buildPlan(
   plan.runtime   = runtime->name;
   plan.construct = cd->name;
 
+  // Evaluate runtime-level properties into the plan. They are shared by every
+  // construct of the runtime; a construct-level property of the same name
+  // overrides (the construct loop below runs afterwards).
+  for (auto &item : runtime->items) {
+    if (auto *pd = std::get_if<PropertyDecl>(&item)) {
+      auto v = evalExpr(pd->expr, root);
+      if (!v) return v.takeError();
+      plan.properties[pd->name] = std::move(*v);
+    }
+  }
+
   // Construct scope inherits runtime scope
   ScopeImpl cscope(&root);
 

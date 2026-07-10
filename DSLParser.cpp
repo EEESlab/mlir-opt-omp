@@ -533,6 +533,11 @@ class Parser {
         auto cd = parseConstructDecl();
         if (!cd) return cd.takeError();
         items.push_back(std::move(*cd));
+      } else if (at(TK::IDENT)) {
+        // Runtime-level property, e.g. `global_tid_function = "...";`.
+        auto pd = parsePropertyDecl();
+        if (!pd) return pd.takeError();
+        items.push_back(std::move(*pd));
       } else {
         return make_error<StringError>(
           "unexpected token in runtime at line " + std::to_string(cur().line),

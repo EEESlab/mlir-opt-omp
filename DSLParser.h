@@ -120,7 +120,7 @@ struct ConstructDecl {
   std::vector<ConstructItem> items;
 };
 
-using RuntimeItem = std::variant<LetDecl, ConstructDecl>;
+using RuntimeItem = std::variant<LetDecl, PropertyDecl, ConstructDecl>;
 
 struct RuntimeDecl {
   std::string name;
