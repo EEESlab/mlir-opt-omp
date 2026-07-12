@@ -271,8 +271,9 @@ the `void(void*)` closure path. Concretely:
   - Emit `__kmpc_omp_task(ident, gtid, task)`.
 - `ident` / `global_tid` are resolved on demand at the call site (default ident +
   a memoised `__kmpc_global_thread_num`), the same resolve-on-reference model
-  barrier/wsloop use — not the parallel `emit`-gated pre block, since a task
-  always needs both.
+  parallel/barrier/wsloop use — no `emit` declaration anywhere.  The only
+  difference from parallel is that a task always needs both, so they are
+  materialised eagerly rather than lazily; the result is identical.
 
 See [dsl-result-binding-proposal.md](dsl-result-binding-proposal.md) for the
 Approach B (`let = call`) alternative to the implicit `task` binding.

@@ -14,8 +14,12 @@
         capture_strategy = "by_pointer";
 
         pre {
-          emit ident;
-          emit global_tid;
+          // No `emit` for ident or global_tid: both are materialised on demand
+          // from the references below, exactly like barrier/wsloop/task resolve
+          // their `ident`/`global_tid` args.  ident is always needed (the fork);
+          // global_tid only when one of these two optional push calls is present
+          // — the pass derives the need from usage, no DSL declaration.  The
+          // gtid function name comes from the `global_tid_function` property.
           when has(num_threads) => call "__kmpc_push_num_threads"(ident, global_tid, num_threads);
           when has(proc_bind) => call "__kmpc_push_proc_bind"(ident, global_tid, proc_bind);
         }
@@ -52,13 +56,18 @@
         // the ABI.  The signature is an ABI
         // tag matched by .find("task_entry").
         outline_signature = task_entry();
+        // Task allocation flags for __kmpc_omp_task_alloc.  1 = tied; the
+        // value lives here (like `default_chunk`) so the runtime ABI constant
+        // is DSL-owned rather than hardcoded in the pass.  if/final TBD: those
+        // would OR extra bits in via a `when has(...)` chain.
+        let task_flags = 1;
         // No pre block: unlike parallel every task invoke call uses
         // both ident and global_tid, so there is no optionality.
         invoke {
           // `let task = call ...` binds the __kmpc_omp_task_alloc result;
           // `populate_shareds(task)` is a C++-backed verb that writes the
           // captures into task->shareds (more documented in
-          // docs/task-lowering-spec.md). task_flags=1 (tied); if/final TBD.
+          // docs/task-lowering-spec.md).  task_flags is the `let` above.
           let task = call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
                                                   task_size, shareds_size, body);
           emit populate_shareds(task);

@@ -7,7 +7,7 @@
 //    - Move region body into it, wire captured values as block args
 //    - Emit __kmpc_fork_call (iomp) or GOMP_parallel (libgomp) with captures
 //    - Create per-flags __omp_ident_<hex> globals (Clang-parity ident_t) on
-//      demand via getOrCreateIdent; "emit ident" requests the default one
+//      demand via getOrCreateIdent; the fork path requests the default one
 //
 //    Capture strategies:
 //      by_pointer (iomp): each capture passed as a separate pointer argument
@@ -567,9 +567,11 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   // ---- Call site ----
   builder.setInsertionPoint(op);
 
-  // Every task invoke call uses both ident and global_tid (that is why the
-  // task construct has no `pre { emit ... }` block), so emit them eagerly:
-  // one ident global and one global_tid_function call (DSL property, iomp:
+  // ident and global_tid are resolved on demand from the invoke args (same
+  // model as parallel/barrier/wsloop — no DSL `emit`).  Unlike parallel, where
+  // gtid is optional, every task invoke call uses both, so materialising them
+  // eagerly here is equivalent to lazy and keeps the code simpler: one ident
+  // global and one global_tid_function call (DSL property, iomp:
   // __kmpc_global_thread_num) shared by the two invoke calls.  gtid seeds off
   // the default (KMPC-flagged) ident, matching the runtime's contract.
   Value identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
@@ -608,9 +610,9 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
       return (flags == 0x02) ? identVal
                              : getOrCreateIdent(module, builder, loc, ctx, flags);
     if (s == "%gtid")        return gtid;
-    if (s == "task_flags")
-      return arith::ConstantOp::create(builder, loc, i32t,
-               IntegerAttr::get(i32t, 1)); // tied
+    // task_flags is no longer a symbolic token: it is a `let task_flags = 1;`
+    // in rules.dsl, so it reaches the invoke as an IntegerAttr and is handled
+    // by the integer branch of the arg loop below.
     if (s == "task_size")    return taskSizeV;
     if (s == "shareds_size") return sharedsSizeV;
     if (s == "body")         return fnPtrCast;
@@ -1011,16 +1013,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     barrierOp->erase();
   }
 
-  // ---- Check DSL pre block for emit ident / emit global_tid ----
-  bool needsIdent     = false;
-  bool needsGlobalTid = false;
-  for (auto attr : op.getPre()) {
-    if (auto ea = llvm::dyn_cast<PlanEmitAttr>(attr)) {
-      if (ea.getSymName().getValue() == "ident")      needsIdent = true;
-      if (ea.getSymName().getValue() == "global_tid") needsGlobalTid = true;
-    }
-  }
-
   // ---- Emit the runtime call at the call site ----
   std::string runtimeCallee;
   for (auto attr : op.getInvoke())
@@ -1035,23 +1027,31 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     SmallVector<Value> callArgs;
     SmallVector<Type>  callTypes;
 
-    // ident (default flags: KMPC only) — used for the fork call, the
-    // global_thread_num seed, and bare `ident` references in the pre block.
-    Value identVal;
-    if (needsIdent)
-      identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
-    else
-      identVal = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-
-    // global_tid at call site
-    Value gtidAtCallSite;
-    if (needsGlobalTid) {
-      std::string gtidFnName = getPropStr(op, "global_tid_function");
-      auto gtidDecl = getOrInsertDeclWithReturn(module,
-        gtidFnName, {ptrTy(ctx)}, i32Ty(ctx), builder);
-      gtidAtCallSite = func::CallOp::create(builder, loc, gtidDecl,
-        ValueRange{identVal}).getResult(0);
-    }
+    // Call-site ident and master global_tid are materialised on demand — once,
+    // the first time a pre/invoke call actually references them — with no `emit`
+    // declaration in the DSL (same on-demand model as barrier/wsloop/task).
+    //   - ident: needed by the iomp fork and as the gtid seed; the packed path
+    //     (libgomp/pmsis) references neither, so it is never emitted there.
+    //   - global_tid: needed only when an optional push_num_threads /
+    //     push_proc_bind pre-call is present.  Its function name comes from the
+    //     `global_tid_function` DSL property; it seeds off the default ident.
+    Value identCache;
+    auto getIdent = [&]() -> Value {
+      if (!identCache)
+        identCache = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+      return identCache;
+    };
+    Value gtidCache;
+    auto getGtid = [&]() -> Value {
+      if (!gtidCache) {
+        std::string gtidFnName = getPropStr(op, "global_tid_function");
+        auto gtidDecl = getOrInsertDeclWithReturn(module,
+          gtidFnName, {ptrTy(ctx)}, i32Ty(ctx), builder);
+        gtidCache = func::CallOp::create(builder, loc, gtidDecl,
+          ValueRange{getIdent()}).getResult(0);
+      }
+      return gtidCache;
+    };
 
     // Emit pre-block calls (push_num_threads, push_proc_bind, etc.)
     for (auto attr : op.getPre()) {
@@ -1066,12 +1066,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           uint32_t identFlags;
           if (parseIdentRef(s, identFlags))
             v = identFlags == 0x02
-              ? identVal
+              ? getIdent()
               : getOrCreateIdent(module, builder, loc, ctx, identFlags);
           else if (s == "%gtid")
-            v = gtidAtCallSite
-              ? gtidAtCallSite
-              : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
+            v = getGtid();
           else if (s == "num_threads" && getClauseOperand(op))
             v = getClauseOperand(op);
           else
@@ -1199,7 +1197,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       // -----------------------------------------------------------------------
       // BY_POINTER (iomp): ident, argc, fn_ptr, captures...
       // -----------------------------------------------------------------------
-      callArgs.push_back(identVal); callTypes.push_back(ptrTy(ctx));
+      callArgs.push_back(getIdent()); callTypes.push_back(ptrTy(ctx));
 
       Value argcVal = arith::ConstantOp::create(builder, loc,
         builder.getI32Type(),

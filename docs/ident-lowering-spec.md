@@ -104,7 +104,7 @@ Behaviour:
 A small `flagTokenToBits(StringRef)` maps the DSL tokens in §4.1 to bits (always OR `0x02`); unknown token → pass error.
 
 Resolution sites that currently match `"ident"`/`"%ident"` must parse the optional `:flag` suffix and call `getOrCreateIdent(..., bits)`:
-- parallel pre/arg resolution, and the call-site `identVal`/`needsIdent` block;
+- parallel pre/arg resolution, and the call-site `identVal` block (materialised on demand — the fork always needs an ident, so it is no longer gated by an `emit ident`);
 - barrier arg resolution;
 - wsloop `resolveCallArg`
 

@@ -223,7 +223,9 @@ extractTaskContext(omp::TaskOp op) {
   ctx["global_tid"]   = dsl::makeStr("%gtid");
   // ctx["gtid"]         = dsl::makeStr("gtid");
   // ctx["task_t"]       = dsl::makeStr("task_t");
-  ctx["task_flags"]   = dsl::makeStr("task_flags");
+  // task_flags is not seeded here: it is a `let task_flags = 1;` in the task
+  // construct (rules.dsl), so the evaluator resolves it to the literal and the
+  // plan carries the value directly — mirroring `default_chunk` for wsloop.
   ctx["task_size"]    = dsl::makeStr("task_size");
   ctx["shareds_size"] = dsl::makeStr("shareds_size");
   // `task` is no longer pre-seeded: it is bound explicitly by
