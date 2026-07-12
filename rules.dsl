@@ -56,6 +56,11 @@
         // the ABI.  The signature is an ABI
         // tag matched by .find("task_entry").
         outline_signature = task_entry();
+        // kmp_task_t header ABI layout, DSL-owned (like task_flags below).
+        // Consumed by the pass (as outline_signature is): field 0 is the
+        // shareds pointer the entry prolog loads, and sizeof(this) is the
+        // `task_size` passed to __kmpc_omp_task_alloc.
+        kmp_task_t = struct(ptr, ptr, i32, ptr, ptr);
         // Task allocation flags for __kmpc_omp_task_alloc.  1 = tied; the
         // value lives here (like `default_chunk`) so the runtime ABI constant
         // is DSL-owned rather than hardcoded in the pass.  if/final TBD: those

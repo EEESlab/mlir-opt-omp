@@ -4,6 +4,13 @@
 // the task, populates shareds, and schedules it.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+//
+// The DSL-owned kmp_task_t layout reaches the construct's prop_dict as the
+// symbolic `%struct:...` token, which the outlining pass re-expands.
+// RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
+// RUN:   --omp-to-omp-lower | FileCheck %s --check-prefix=LOWER
+// LOWER: omp_lower.construct
+// LOWER-SAME: kmp_task_t = "%struct:ptr,ptr,i32,ptr,ptr"
 
 llvm.func @use(!llvm.ptr)
 

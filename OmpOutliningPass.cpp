@@ -202,6 +202,35 @@ static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
   return "";
 }
 
+// Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
+// type.  Kept small on purpose: extend as new layouts need more field types.
+static Type parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
+  if (t == "ptr") return ptrTy(ctx);
+  if (t == "i32") return i32Ty(ctx);
+  if (t == "i64") return IntegerType::get(ctx, 64);
+  if (t == "i8")  return IntegerType::get(ctx, 8);
+  return ptrTy(ctx);
+}
+
+// Read a DSL-owned struct-layout property of the form "%struct:t0,t1,..." into
+// an LLVM literal struct type.  Absent or malformed property falls back to the
+// caller's default so older DSL files keep working.
+static LLVM::LLVMStructType getPropStructType(ConstructOp op, llvm::StringRef key,
+    MLIRContext *ctx, LLVM::LLVMStructType fallback) {
+  std::string s = getPropStr(op, key);
+  llvm::StringRef body(s);
+  if (!body.consume_front("%struct:")) return fallback;
+  SmallVector<llvm::StringRef> toks;
+  body.split(toks, ',');
+  SmallVector<Type> fields;
+  for (auto tok : toks) {
+    tok = tok.trim();
+    if (!tok.empty()) fields.push_back(parseAbiType(ctx, tok));
+  }
+  if (fields.empty()) return fallback;
+  return LLVM::LLVMStructType::getLiteral(ctx, fields);
+}
+
 static func::FuncOp getOrInsertDecl(ModuleOp module,
                                     llvm::StringRef name,
                                     ArrayRef<Type> argTypes,
@@ -483,9 +512,11 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   // kmp_task_t header: { void *shareds, routine, kmp_int32 part_id, data1,
   // data2 } — 40 bytes on 64-bit; only field 0 (shareds) is accessed here, but
   // the full size is passed to __kmpc_omp_task_alloc so the runtime's writes to
-  // the header stay in bounds.
-  auto kmpTaskTy =
-      LLVM::LLVMStructType::getLiteral(ctx, {ptr, ptr, i32t, ptr, ptr});
+  // the header stay in bounds.  The layout is DSL-owned (`kmp_task_t = struct
+  // (...)` in the task construct, like `task_flags`); the literal below is the
+  // fallback for DSL files that don't declare it.
+  auto kmpTaskTy = getPropStructType(op, "kmp_task_t", ctx,
+      LLVM::LLVMStructType::getLiteral(ctx, {ptr, ptr, i32t, ptr, ptr}));
 
   std::string fnName =
       "outlined_" + op.getConstructName().str() + "_" + std::to_string(counter++);

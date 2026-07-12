@@ -214,6 +214,20 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
         }
         return makeStr(flag.empty() ? "%ident" : "%ident:" + flag);
       }
+      // struct(t0, t1, ...): an ABI type layout.  The args are bare type names
+      // (e.g. ptr, i32), not scope variables, so read them with evalExprOrBare
+      // like a predicate rhs.  Serialise to the symbolic token
+      // "%struct:t0,t1,..." which the pass re-expands into an LLVM struct type.
+      if (e.name == "struct") {
+        std::string layout;
+        for (auto &a : e.args) {
+          auto r = evalExprOrBare(a, scope);
+          if (!r) return r.takeError();
+          if (!layout.empty()) layout += ",";
+          layout += valueToString(*r);
+        }
+        return makeStr("%struct:" + layout);
+      }
       std::vector<Value> args;
       for (auto &a : e.args) {
         auto r = evalExpr(a, scope);
