@@ -478,6 +478,63 @@ static void storeCapturesToBase(
 }
 
 // ---------------------------------------------------------------------------
+// Outlined-body prep helpers (shared by the parallel/closure and task_entry
+// paths).  The capture-unpacking prolog differs per ABI and stays in each
+// caller; these factor out the identical head (strip private_vars + takeBody)
+// and tail (dead-cast cleanup + terminator rewrite).
+// ---------------------------------------------------------------------------
+
+// Strip omp private_vars from the region, move it into outlinedFn, and return
+// the entry block.  preexistingArgs is filled with the block args that arrived
+// with the region (privatizer args) so the caller can wire or drop them.
+static Block &takeOutlinedBody(Region &body, func::FuncOp outlinedFn,
+                               SmallVectorImpl<BlockArgument> &preexistingArgs) {
+  // Strip omp.wsloop/omp.parallel private_vars operands before takeBody so
+  // replaceUsesInRegion cannot corrupt those operand references.
+  body.walk([&](Operation *walkOp) {
+    if (auto wsOp = llvm::dyn_cast<omp::WsloopOp>(walkOp))
+      if (!wsOp.getPrivateVars().empty())
+        wsOp.getPrivateVarsMutable().clear();
+    if (auto parOp = llvm::dyn_cast<omp::ParallelOp>(walkOp))
+      if (!parOp.getPrivateVars().empty())
+        parOp.getPrivateVarsMutable().clear();
+  });
+
+  outlinedFn.getBody().takeBody(body);
+  Block &entry = outlinedFn.getBody().front();
+  preexistingArgs.assign(entry.getArguments().begin(),
+                         entry.getArguments().end());
+  return entry;
+}
+
+// Erase injected unrealized_conversion_cast marker ops that have no users.
+static void eraseDeadCasts(func::FuncOp outlinedFn) {
+  SmallVector<Operation *> casts;
+  outlinedFn.getBody().walk([&](UnrealizedConversionCastOp c) {
+    if (c->use_empty()) casts.push_back(c);
+  });
+  for (auto *c : casts) c->erase();
+}
+
+// Replace every omp.terminator with a func.return.  emitReturn builds the
+// return op at the terminator's location (void for closure/microtask, an i32
+// zero for task_entry), once per terminator so each gets its own operands.
+static void replaceTerminatorsWithReturn(
+    func::FuncOp outlinedFn,
+    llvm::function_ref<void(OpBuilder &, Location)> emitReturn) {
+  SmallVector<Operation *> terms;
+  for (auto &blk : outlinedFn.getBody())
+    for (auto &innerOp : blk)
+      if (innerOp.getName().getStringRef() == "omp.terminator")
+        terms.push_back(&innerOp);
+  for (auto *t : terms) {
+    OpBuilder tb(t);
+    emitReturn(tb, t->getLoc());
+    t->erase();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 1a. IOMP TASK OUTLINING  (outline_signature = task_entry)
 // ---------------------------------------------------------------------------
 // Lowers an omp_lower.construct for an iomp task:
@@ -533,21 +590,11 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   outlinedFn.setVisibility(SymbolTable::Visibility::Nested);
   builder.insert(outlinedFn);
 
-  // Strip omp private_vars before moving the body (mirrors the parallel path).
-  body.walk([&](Operation *walkOp) {
-    if (auto wsOp = llvm::dyn_cast<omp::WsloopOp>(walkOp))
-      if (!wsOp.getPrivateVars().empty()) wsOp.getPrivateVarsMutable().clear();
-    if (auto parOp = llvm::dyn_cast<omp::ParallelOp>(walkOp))
-      if (!parOp.getPrivateVars().empty()) parOp.getPrivateVarsMutable().clear();
-  });
-
-  outlinedFn.getBody().takeBody(body);
-  Block &entry = outlinedFn.getBody().front();
-
-  // v1: no firstprivate wiring — record any block args that arrived with the
-  // region so unused ones can be dropped after capture unpacking.
-  SmallVector<BlockArgument> staleArgs(entry.getArguments().begin(),
-                                       entry.getArguments().end());
+  // Move the body into the entry function.  staleArgs receives any privatizer
+  // block args that arrived with the region; v1 does no firstprivate wiring, so
+  // unused ones are dropped after capture unpacking.
+  SmallVector<BlockArgument> staleArgs;
+  Block &entry = takeOutlinedBody(body, outlinedFn, staleArgs);
 
   // Prepend the entry args: [gtid, task, ...stale privatizer args].
   entry.insertArgument(0u, i32t, loc);                         // gtid
@@ -571,29 +618,18 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
     if (arg.use_empty()) entry.eraseArgument(arg.getArgNumber());
 
   // Remove injected privatizer marker casts.
-  SmallVector<Operation *> casts;
-  outlinedFn.getBody().walk([&](UnrealizedConversionCastOp c) {
-    if (c->use_empty()) casts.push_back(c);
-  });
-  for (auto *c : casts) c->erase();
+  eraseDeadCasts(outlinedFn);
 
   // Finalize the function type to match the entry block.
   outlinedFn.setFunctionType(
       FunctionType::get(ctx, entry.getArgumentTypes(), {i32t}));
 
   // Replace omp.terminator with `func.return %0 : i32`.
-  SmallVector<Operation *> terms;
-  for (auto &blk : outlinedFn.getBody())
-    for (auto &innerOp : blk)
-      if (innerOp.getName().getStringRef() == "omp.terminator")
-        terms.push_back(&innerOp);
-  for (auto *t : terms) {
-    OpBuilder tb(t);
-    Value zero = LLVM::ConstantOp::create(tb, t->getLoc(), i32t,
+  replaceTerminatorsWithReturn(outlinedFn, [&](OpBuilder &tb, Location l) {
+    Value zero = LLVM::ConstantOp::create(tb, l, i32t,
       IntegerAttr::get(i32t, 0));
-    func::ReturnOp::create(tb, t->getLoc(), ValueRange{zero});
-    t->erase();
-  }
+    func::ReturnOp::create(tb, l, ValueRange{zero});
+  });
 
   // ---- Call site ----
   builder.setInsertionPoint(op);
@@ -785,24 +821,11 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   outlinedFn.setVisibility(SymbolTable::Visibility::Nested);
   builder.insert(outlinedFn);
 
-  // Strip omp.wsloop/omp.parallel private_vars operands before takeBody to
-  // prevent replaceUsesInRegion from corrupting those operand references.
-  body.walk([&](Operation *walkOp) {
-    if (auto wsOp = llvm::dyn_cast<omp::WsloopOp>(walkOp))
-      if (!wsOp.getPrivateVars().empty())
-        wsOp.getPrivateVarsMutable().clear();
-    if (auto parOp = llvm::dyn_cast<omp::ParallelOp>(walkOp))
-      if (!parOp.getPrivateVars().empty())
-        parOp.getPrivateVarsMutable().clear();
-  });
-
-  // Take the body. Entry block may have privatizer args from omp.parallel.
-  outlinedFn.getBody().takeBody(body);
-  Block &entry = outlinedFn.getBody().front();
-
-  // Save existing privatizer block args before inserting capture args.
-  SmallVector<BlockArgument> privatizerArgs(entry.getArguments().begin(),
-                                             entry.getArguments().end());
+  // Move the body into the outlined function.  privatizerArgs receives any
+  // privatizer block args that arrived with the region (from omp.parallel),
+  // saved before inserting capture args.
+  SmallVector<BlockArgument> privatizerArgs;
+  Block &entry = takeOutlinedBody(body, outlinedFn, privatizerArgs);
 
   if (isPacked) {
     // -------------------------------------------------------------------------
@@ -949,11 +972,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   }
 
   // Remove injected unrealized_conversion_cast marker ops (no users).
-  SmallVector<Operation *> injectedCasts;
-  outlinedFn.getBody().walk([&](UnrealizedConversionCastOp castOp) {
-    if (castOp->use_empty()) injectedCasts.push_back(castOp);
-  });
-  for (auto *c : injectedCasts) c->erase();
+  eraseDeadCasts(outlinedFn);
 
   // Erase unused capture args from the entry block and filter captures list.
   // This removes captures that were only needed as privatizer sources
@@ -985,16 +1004,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   outlinedFn.setFunctionType(FunctionType::get(ctx, finalArgTypes, {}));
 
   // Replace omp.terminator with func.return (direct blocks only).
-  SmallVector<Operation *> terminators;
-  for (auto &block : outlinedFn.getBody())
-    for (auto &innerOp : block)
-      if (innerOp.getName().getStringRef() == "omp.terminator")
-        terminators.push_back(&innerOp);
-  for (auto *termOp : terminators) {
-    OpBuilder tb(termOp);
-    func::ReturnOp::create(tb, termOp->getLoc());
-    termOp->erase();
-  }
+  replaceTerminatorsWithReturn(outlinedFn, [](OpBuilder &tb, Location l) {
+    func::ReturnOp::create(tb, l);
+  });
 
   // Lower omp.barrier inside the outlined function — DSL-driven.
   // The barrier plan (one per runtime) is built once in runOnOperation;
