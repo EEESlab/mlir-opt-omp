@@ -281,11 +281,15 @@ static Value emitNoArgI32Call(ModuleOp module, OpBuilder &builder,
   return func::CallOp::create(builder, loc, decl, ValueRange{}).getResult(0);
 }
 
+// KMP_IDENT_KMPC: the default ident flag, always set, mirroring
+// OMPIRBuilder::getOrCreateIdent.  Idents with exactly these flags are the
+// "default ident" that fork/gtid calls seed off and that call sites cache.
+static constexpr uint32_t kIdentKmpc = 0x02;
+
 // Map a DSL ident flag token to the effective `ident_t.flags` bitmask.
-// KMP_IDENT_KMPC (0x02) is always set, mirroring OMPIRBuilder::getOrCreateIdent.
 // Values match clang's OpenMPLocationFlags (CGOpenMPRuntime.cpp).
 static uint32_t identFlagBits(llvm::StringRef tok) {
-  uint32_t kmpc = 0x02;
+  uint32_t kmpc = kIdentKmpc;
   if (tok.empty() || tok == "kmpc")        return kmpc;
   if (tok == "barrier_expl")               return kmpc | 0x20;
   if (tok == "barrier_impl" ||
@@ -368,6 +372,60 @@ static Value getOrCreateIdent(ModuleOp module, OpBuilder &builder, Location loc,
   }
   return LLVM::AddressOfOp::create(builder, loc, ptr,
     FlatSymbolRefAttr::get(ctx, identName));
+}
+
+// ---------------------------------------------------------------------------
+// Symbolic token resolution
+// ---------------------------------------------------------------------------
+// Every lowering path resolves DSL argument tokens (strings like "%gtid",
+// "ident", "%lb", "env_ptr", ...) to SSA Values against one shared vocabulary:
+//   1. a site-specific binding (looked up first, so a construct's own tokens and
+//      `let`-bound results shadow the built-ins);
+//   2. an ident reference ("ident"/"%ident"/"%ident:<flag>") -> resolveIdent;
+//   3. "%gtid"                                                -> resolveGtid;
+//   4. anything unrecognised                                  -> an undef ptr.
+// resolveIdent/resolveGtid are seams so each caller keeps its own caching and
+// lazy-materialisation policy (e.g. the fork path only emits the gtid call when
+// a token actually references it).  Literal (integer/bool) arguments stay in
+// each caller's arg loop: most sites emit the same arith i32 constant, but
+// wsloop types them as the induction variable (LLVM constant) and the packed
+// invoke adds i8-bool / i64-size forms.
+static Value resolveSymbolToken(
+    llvm::StringRef s, OpBuilder &builder, Location loc,
+    const llvm::StringMap<Value> &bindings,
+    llvm::function_ref<Value(uint32_t)> resolveIdent,
+    llvm::function_ref<Value()> resolveGtid) {
+  if (auto it = bindings.find(s); it != bindings.end())
+    return it->second;
+  uint32_t flags;
+  if (parseIdentRef(s, flags))
+    return resolveIdent(flags);
+  if (s == "%gtid")
+    return resolveGtid();
+  return LLVM::UndefOp::create(builder, loc, ptrTy(builder.getContext()));
+}
+
+// No-bindings overload for sites whose only symbolic tokens are ident/%gtid
+// (e.g. barrier).
+static Value resolveSymbolToken(
+    llvm::StringRef s, OpBuilder &builder, Location loc,
+    llvm::function_ref<Value(uint32_t)> resolveIdent,
+    llvm::function_ref<Value()> resolveGtid) {
+  static const llvm::StringMap<Value> noBindings;
+  return resolveSymbolToken(s, builder, loc, noBindings, resolveIdent,
+                            resolveGtid);
+}
+
+// Shared policy for the resolveIdent seam: default (KMPC) flags reuse the
+// caller's cached default ident; any other flags get their own global
+// (deduped by symbol name inside getOrCreateIdent).
+static Value resolveIdentToken(uint32_t flags, ModuleOp module,
+                               OpBuilder &builder, Location loc,
+                               MLIRContext *ctx,
+                               llvm::function_ref<Value()> defaultIdent) {
+  return flags == kIdentKmpc
+             ? defaultIdent()
+             : getOrCreateIdent(module, builder, loc, ctx, flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -641,12 +699,21 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   // global and one global_tid_function call (DSL property, iomp:
   // __kmpc_global_thread_num) shared by the two invoke calls.  gtid seeds off
   // the default (KMPC-flagged) ident, matching the runtime's contract.
-  Value identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+  Value identVal = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
   std::string gtidFnName = getPropStr(op, "global_tid_function");
-  auto gtidDecl = getOrInsertDeclWithReturn(module,
-    gtidFnName, {ptr}, i32t, builder);
-  Value gtid = func::CallOp::create(builder, loc, gtidDecl,
-    ValueRange{identVal}).getResult(0);
+  Value gtid;
+  if (gtidFnName.empty()) {
+    // No global_tid_function DSL property (non-iomp runtime): there is no gtid
+    // source, and declaring a nameless function would fail the verifier.
+    op.emitWarning("task lowering: runtime defines no global_tid_function; "
+                   "using undef gtid");
+    gtid = LLVM::UndefOp::create(builder, loc, i32t);
+  } else {
+    auto gtidDecl = getOrInsertDeclWithReturn(module,
+      gtidFnName, {ptr}, i32t, builder);
+    gtid = func::CallOp::create(builder, loc, gtidDecl,
+      ValueRange{identVal}).getResult(0);
+  }
 
   DataLayout dl(module);
   uint64_t taskSize    = dl.getTypeSize(kmpTaskTy).getFixedValue();
@@ -663,27 +730,29 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
 
   // Emit the invoke actions in DSL order.  A `let <name> = call ...` binds the
   // call's SSA result under the token "%<name>"; later arg tokens and the
-  // `populate_shareds` verb resolve against that map (Approach B, see
-  // docs/dsl-result-binding-proposal.md).
+  // `populate_shareds` verb resolve against this map (Approach B, see
+  // docs/dsl-result-binding-proposal.md).  The construct's built-in tokens
+  // (task_size/shareds_size/body) seed the same map; because the map lookup
+  // runs first, a `let` result shadows a built-in of the same name.
+  // task_flags is not a symbolic token: it is a `let task_flags = 1;` in
+  // rules.dsl, so it reaches the invoke as an IntegerAttr and is handled by the
+  // integer branch of the arg loop below.
   llvm::StringMap<Value> boundResults;
+  boundResults["task_size"]    = taskSizeV;
+  boundResults["shareds_size"] = sharedsSizeV;
+  boundResults["body"]         = fnPtrCast;
 
-  // Resolve one symbolic string arg to an SSA value.  Bound results shadow the
-  // built-in tokens.
+  // Resolve one symbolic string arg to an SSA value (see resolveSymbolToken).
+  // The default (KMPC) ident reuses the value materialised above; %gtid is the
+  // gtid emitted eagerly at the call site (every task invoke call needs it).
   auto resolveToken = [&](llvm::StringRef s) -> Value {
-    if (auto it = boundResults.find(s); it != boundResults.end())
-      return it->second;
-    uint32_t flags;
-    if (parseIdentRef(s, flags))
-      return (flags == 0x02) ? identVal
-                             : getOrCreateIdent(module, builder, loc, ctx, flags);
-    if (s == "%gtid")        return gtid;
-    // task_flags is no longer a symbolic token: it is a `let task_flags = 1;`
-    // in rules.dsl, so it reaches the invoke as an IntegerAttr and is handled
-    // by the integer branch of the arg loop below.
-    if (s == "task_size")    return taskSizeV;
-    if (s == "shareds_size") return sharedsSizeV;
-    if (s == "body")         return fnPtrCast;
-    return LLVM::UndefOp::create(builder, loc, ptr);
+    return resolveSymbolToken(
+        s, builder, loc, boundResults,
+        [&](uint32_t flags) {
+          return resolveIdentToken(flags, module, builder, loc, ctx,
+                                   [&] { return identVal; });
+        },
+        [&] { return gtid; });
   };
 
   for (auto attr : op.getInvoke()) {
@@ -1021,20 +1090,20 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     Location bloc = barrierOp->getLoc();
 
     auto resolveArg = [&](const dsl::Value &v) -> Value {
-      if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
-        llvm::StringRef s = sv->value;
-        uint32_t identFlags;
-        if (parseIdentRef(s, identFlags))
-          return getOrCreateIdent(module, bb, bloc, ctx, identFlags);
-        if (s == "%gtid") {
-          // Microtask convention: first arg is ptr to i32 gtid.
-          auto &fnEntry = outlinedFn.getBody().front();
-          if (fnEntry.getNumArguments() >= 2)
-            return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
-                                         fnEntry.getArgument(0));
-          return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
-        }
-      }
+      if (auto *sv = std::get_if<dsl::StrVal>(&v))
+        return resolveSymbolToken(
+            sv->value, bb, bloc,
+            [&](uint32_t flags) {
+              return getOrCreateIdent(module, bb, bloc, ctx, flags);
+            },
+            [&]() -> Value {
+              // Microtask convention: first arg is ptr to i32 gtid.
+              auto &fnEntry = outlinedFn.getBody().front();
+              if (fnEntry.getNumArguments() >= 2)
+                return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
+                                            fnEntry.getArgument(0));
+              return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
+            });
       if (auto *iv = std::get_if<dsl::IntVal>(&v))
         return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
           IntegerAttr::get(i32Ty(ctx), iv->value));
@@ -1081,20 +1150,38 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     Value identCache;
     auto getIdent = [&]() -> Value {
       if (!identCache)
-        identCache = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+        identCache = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
       return identCache;
     };
     Value gtidCache;
     auto getGtid = [&]() -> Value {
       if (!gtidCache) {
         std::string gtidFnName = getPropStr(op, "global_tid_function");
-        auto gtidDecl = getOrInsertDeclWithReturn(module,
-          gtidFnName, {ptrTy(ctx)}, i32Ty(ctx), builder);
-        gtidCache = func::CallOp::create(builder, loc, gtidDecl,
-          ValueRange{getIdent()}).getResult(0);
+        if (gtidFnName.empty()) {
+          // A %gtid token under a runtime with no global_tid_function DSL
+          // property (libgomp/pmsis) has no gtid source; declaring a nameless
+          // function would fail the verifier.
+          op.emitWarning("'%gtid' referenced but the runtime defines no "
+                         "global_tid_function; using undef");
+          gtidCache = LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
+        } else {
+          auto gtidDecl = getOrInsertDeclWithReturn(module,
+            gtidFnName, {ptrTy(ctx)}, i32Ty(ctx), builder);
+          gtidCache = func::CallOp::create(builder, loc, gtidDecl,
+            ValueRange{getIdent()}).getResult(0);
+        }
       }
       return gtidCache;
     };
+    // Shared ident seam for the pre/invoke resolvers below (see
+    // resolveIdentToken): the default ident reuses the cached fork ident.
+    auto resolveIdent = [&](uint32_t flags) -> Value {
+      return resolveIdentToken(flags, module, builder, loc, ctx, getIdent);
+    };
+
+    // Bindings for the pre-block resolver: num_threads when the clause is set.
+    llvm::StringMap<Value> preBindings;
+    if (Value ct = getClauseOperand(op)) preBindings["num_threads"] = ct;
 
     // Emit pre-block calls (push_num_threads, push_proc_bind, etc.)
     for (auto attr : op.getPre()) {
@@ -1105,18 +1192,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       for (auto argAttr : ca.getArgs()) {
         Value v;
         if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-          llvm::StringRef s = sa.getValue();
-          uint32_t identFlags;
-          if (parseIdentRef(s, identFlags))
-            v = identFlags == 0x02
-              ? getIdent()
-              : getOrCreateIdent(module, builder, loc, ctx, identFlags);
-          else if (s == "%gtid")
-            v = getGtid();
-          else if (s == "num_threads" && getClauseOperand(op))
-            v = getClauseOperand(op);
-          else
-            v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+          v = resolveSymbolToken(sa.getValue(), builder, loc, preBindings,
+                                 resolveIdent, getGtid);
         } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
           v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
             IntegerAttr::get(i32Ty(ctx), ia.getInt()));
@@ -1175,16 +1252,18 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         ? 1u : dataLayout.getTypeABIAlignment(structTy);
       if (envAlign == 0) envAlign = 16;
 
-      // Build call args from DSL invoke args, resolving symbolic names:
-      //   "body"               → fnPtrCast  (the outlined function pointer)
-      //   "env_ptr"            → structAlloca (the capture struct pointer)
-      //   "num_threads"        → clause operand (SSA value)
-      //   "env_size"/"env_align" → i64 constants (task capture struct)
-      //   "if_clause"          → clause operand, as i8 (C _Bool)
-      //   "null"               → null pointer
-      //   bool literal         → i8 constant (C _Bool)
-      //   integer              → i32 constant
-      //   other str            → undef ptr
+      // Plain-lookup tokens shared with resolveSymbolToken.  env_size/env_align
+      // (lazy i64 constants, emitted only when referenced so the parallel path
+      // materialises none), if_clause (i1→i8 normalisation) and null (a real
+      // null ptr, not the undef fallback) stay special-cased below.
+      llvm::StringMap<Value> invokeBindings;
+      invokeBindings["body"]              = fnPtrCast;
+      invokeBindings["outlined_parallel"] = fnPtrCast;
+      invokeBindings["outlined_task"]     = fnPtrCast;
+      invokeBindings["env_ptr"]           = structAlloca;
+      if (Value ct = getClauseOperand(op)) invokeBindings["num_threads"] = ct;
+
+      // Build call args from DSL invoke args, resolving symbolic names.
       for (auto attr : op.getInvoke()) {
         auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
         if (!ca) continue;
@@ -1192,13 +1271,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           Value v;
           if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
             llvm::StringRef s = sa.getValue();
-            if (s == "body" || s == "outlined_parallel" || s == "outlined_task")
-              v = fnPtrCast;
-            else if (s == "env_ptr")
-              v = structAlloca;
-            else if (s == "num_threads" && getClauseOperand(op))
-              v = getClauseOperand(op);
-            else if (s == "env_size")
+            if (s == "env_size")
               v = LLVM::ConstantOp::create(builder, loc, i64t,
                     IntegerAttr::get(i64t, (int64_t)envSize));
             else if (s == "env_align")
@@ -1218,7 +1291,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
             } else if (s == "null")
               v = LLVM::ZeroOp::create(builder, loc, ptrTy(ctx));
             else
-              v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+              v = resolveSymbolToken(s, builder, loc, invokeBindings,
+                                     resolveIdent, getGtid);
           } else if (auto ba = llvm::dyn_cast<BoolAttr>(argAttr)) {
             v = LLVM::ConstantOp::create(builder, loc, i8t,
                   IntegerAttr::get(i8t, ba.getValue() ? 1 : 0));
@@ -1398,21 +1472,23 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   // pstride: no initialization — pure output parameter
   LLVM::StoreOp::create(builder, loc, zero32,      plast);
 
-  // Map symbolic DSL names to SSA values.
+  // Map symbolic DSL names to SSA values.  The loop-specific slots (%lb, %ub,
+  // %step, %stride, %last) are the site bindings; ident and %gtid come from the
+  // shared vocabulary (see resolveSymbolToken).
+  llvm::StringMap<Value> wsBindings;
+  wsBindings["%lb"]     = plb;      // in/out lower-bound slot
+  wsBindings["%ub"]     = pub;      // in/out upper-bound slot
+  wsBindings["%step"]   = step;     // actual loop step
+  wsBindings["%stride"] = pstride;  // output ptr for runtime stride
+  wsBindings["%last"]   = plast;    // in/out last-iteration flag
   auto resolveCallArg = [&](const dsl::Value &v) -> Value {
-    if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
-      llvm::StringRef s = sv->value;
-      uint32_t identFlags;
-      if (parseIdentRef(s, identFlags))
-        return getOrCreateIdent(module, builder, loc, ctx, identFlags);
-      if (s == "%gtid")   return gtidVal;
-      if (s == "%lb")     return plb;
-      if (s == "%ub")     return pub;
-      if (s == "%step")   return step;    // actual loop step
-      if (s == "%stride") return pstride; // output ptr for runtime
-      if (s == "%last")   return plast;
-      return LLVM::UndefOp::create(builder, loc, ptrT);
-    }
+    if (auto *sv = std::get_if<dsl::StrVal>(&v))
+      return resolveSymbolToken(
+          sv->value, builder, loc, wsBindings,
+          [&](uint32_t flags) {
+            return getOrCreateIdent(module, builder, loc, ctx, flags);
+          },
+          [&] { return gtidVal; });
     if (auto *iv = std::get_if<dsl::IntVal>(&v))
       return LLVM::ConstantOp::create(builder, loc, iterTy,
         IntegerAttr::get(iterTy, iv->value));
