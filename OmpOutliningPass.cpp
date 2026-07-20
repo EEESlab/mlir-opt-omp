@@ -1078,6 +1078,22 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     finalArgTypes.push_back(arg.getType());
   outlinedFn.setFunctionType(FunctionType::get(ctx, finalArgTypes, {}));
 
+  // Mark capture pointer args `noalias` so the optimiser can hoist the base-
+  // pointer loads out of the outlined loop and vectorise the body.  Each
+  // capture arrives as a pointer to a distinct caller-side slot (one spilled
+  // slot per shared variable, materialised by OmpToOmpLowerPass), so a store
+  // through one capture never touches the storage of another — the assertion
+  // is sound.  Without it the by_pointer microtask body stays scalar: a store
+  // through one capture may, for all the optimiser knows, clobber the pointer
+  // reached through another, which blocks LICM and vectorisation.  gtid/btid
+  // are runtime-owned and left untouched (captures start at index 2).
+  if (abi == CaptureAbi::ByPointer) {
+    UnitAttr noalias = UnitAttr::get(ctx);
+    for (unsigned i = 2, e = entry.getNumArguments(); i < e; i++)
+      if (llvm::isa<LLVM::LLVMPointerType>(entry.getArgument(i).getType()))
+        outlinedFn.setArgAttr(i, "llvm.noalias", noalias);
+  }
+
   // Replace omp.terminator with func.return (direct blocks only).
   replaceTerminatorsWithReturn(outlinedFn, [](OpBuilder &tb, Location l) {
     func::ReturnOp::create(tb, l);
