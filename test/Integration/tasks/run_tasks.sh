@@ -1,8 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# run_tasks.sh — end-to-end smoke tests for omp.task lowering (libgomp).
+# run_tasks.sh — end-to-end smoke tests for omp.task lowering.
 #
-# Two checks, both ending in a real run against libgomp:
+# Two checks, both ending in a real run against the selected runtime
+# (libgomp's GOMP_task or libomp's __kmpc_omp_task_alloc/__kmpc_omp_task):
 #
 #   [1] MLIR  — a hand-written parallel { task { *p = 42 } } module
 #               (task_nested.mlir) lowered through mlir-opt-omp and run.
@@ -10,8 +11,8 @@
 #               omp.task), so it always exercises the lowering we own.
 #
 #   [2] C     — task_smoke.c compiled two ways and compared:
-#                 ref : gcc -fopenmp
-#                 opt : clang->CIR->cir-opt->mlir-opt-omp->...->llc->link -lgomp
+#                 ref : the stock OpenMP compiler ($REF_CC -fopenmp)
+#                 opt : clang->CIR->cir-opt->mlir-opt-omp->...->llc->link
 #               This is the full front-end path; it depends on ClangIR emitting
 #               omp.task.  If your clang-cir lacks task support, [2] fails at the
 #               front-end while [1] still passes.
@@ -20,17 +21,19 @@
 # visible after the parallel region's implicit barrier).  For [2] the ref and
 # opt outputs must also match.
 #
-# Tool locations come from ../lib/common.sh (config.env / env vars).  libgomp only.
+# Tool locations and the per-runtime knobs (REF_CC, OPT_FOPENMP,
+# OPT_EXTRA_LIBS) come from ../lib/common.sh (config.env / env vars).
 #
 # Usage:
-#   ./run_tasks.sh
+#   ./run_tasks.sh [libgomp|iomp]     # default: libgomp (or $RUNTIME if set)
 # =============================================================================
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# This test targets libgomp; set before sourcing so common.sh picks the knobs.
-RUNTIME=libgomp
+# Runtime under test; set before sourcing so common.sh picks the right knobs.
+# (pmsis has no task API — common.sh accepts it, but the lowering would fail.)
+RUNTIME="${1:-${RUNTIME:-libgomp}}"
 # shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/../lib/common.sh"
 
@@ -41,7 +44,7 @@ fail=0
 
 # Where to keep the lowered IR for inspection. Anchored to the Integration
 # dir so it lands next to the other drivers' results/ (gitignored, split per
-# runtime — this test is libgomp-only) no matter where the script is run from.
+# runtime) no matter where the script is run from.
 # One subdir per test; each pipeline stage is written as a numbered file so
 # the lowering can be read step by step.
 OUTDIR="${OUTDIR:-$SCRIPT_DIR/../results}/$RUNTIME"
@@ -51,12 +54,12 @@ mkdir -p "$DUMP_BASE"
 
 # --- shared tail: a (post-front-end) MLIR module -> runnable binary ---------
 # Input is in the omp + llvm + func dialects (i.e. the state just before
-# mlir-opt-omp); output is a libgomp-linked executable.
+# mlir-opt-omp); output is an executable linked against $RUNTIME's library.
 mlir_to_bin() {
     local in="$1" out="$2" d="${3:-$TMP}"
     mkdir -p "$d"
     local omp_flags=(--allow-unregistered-dialect
-        --omp-lower-dsl="$RULES" --omp-lower-runtime=libgomp)
+        --omp-lower-dsl="$RULES" --omp-lower-runtime="$RUNTIME")
 
     cp "$in" "$d/01-input.mlir"
 
@@ -89,7 +92,10 @@ mlir_to_bin() {
     "$OPT" -S -O3 "$d/06-llvmir.ll" > "$d/07-opt-O3.ll" || return 1
     "$LLC" -O3 -relocation-model=pic -filetype=obj "$d/07-opt-O3.ll" \
         -o "$d/08-obj.o" || return 1
-    "$CLANG" -no-pie "$d/08-obj.o" -lgomp -lm -o "$out" || return 1
+    # $OPT_FOPENMP/$OPT_EXTRA_LIBS pull in the right runtime library
+    # (libgomp: -fopenmp=libgomp -lgomp; iomp: -fopenmp -> libomp).
+    "$CLANG" $OPT_FOPENMP -no-pie "$d/08-obj.o" $OPT_EXTRA_LIBS -o "$out" \
+        || return 1
 }
 
 # --- C -> CIR -> LLVM-dialect MLIR (front-end half of the opt pipeline) -----
@@ -106,7 +112,7 @@ c_to_mlir() {
     sed -i -E 's/cir\.[^,}]+,? ?//g' "$out"
 }
 
-echo "=== omp.task END-TO-END (libgomp) ==="
+echo "=== omp.task END-TO-END ($RUNTIME) ==="
 echo "rules: $RULES"
 echo ""
 
@@ -127,14 +133,15 @@ fi
 echo ""
 
 # --- [2] C through the CIR front-end (ref vs opt) --------------------------
-echo "── [2] C: parallel { task }  (ref=gcc vs opt=CIR pipeline)"
+echo "── [2] C: parallel { task }  (ref=$REF_CC vs opt=CIR pipeline)"
 CSRC="$SCRIPT_DIR/task_smoke.c"
 
 ref="<n/a>"
-if "$GCC" -O3 $GCC_STRICT_FP $WARN_SUPPRESS -fopenmp "$CSRC" -o "$TMP/c_ref"; then
+if "$REF_CC" -O3 $REF_FP $WARN_SUPPRESS -fopenmp $REF_OMP_INC \
+        "$CSRC" -o "$TMP/c_ref"; then
     ref="$(OMP_NUM_THREADS=4 "$TMP/c_ref" 2>/dev/null || echo '<crash>')"
 else
-    echo -e "     ${RED}ERROR${RESET}: ref (gcc) build failed"; fail=1
+    echo -e "     ${RED}ERROR${RESET}: ref ($REF_CC) build failed"; fail=1
 fi
 
 opt="<n/a>"

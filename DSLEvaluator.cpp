@@ -214,6 +214,20 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
         }
         return makeStr(flag.empty() ? "%ident" : "%ident:" + flag);
       }
+      // struct(t0, t1, ...): an ABI type layout.  The args are bare type names
+      // (e.g. ptr, i32), not scope variables, so read them with evalExprOrBare
+      // like a predicate rhs.  Serialise to the symbolic token
+      // "%struct:t0,t1,..." which the pass re-expands into an LLVM struct type.
+      if (e.name == "struct") {
+        std::string layout;
+        for (auto &a : e.args) {
+          auto r = evalExprOrBare(a, scope);
+          if (!r) return r.takeError();
+          if (!layout.empty()) layout += ",";
+          layout += valueToString(*r);
+        }
+        return makeStr("%struct:" + layout);
+      }
       std::vector<Value> args;
       for (auto &a : e.args) {
         auto r = evalExpr(a, scope);
@@ -299,7 +313,12 @@ Expected<PlanAction> evalAction(const Action &action, ScopeImpl &scope) {
   return std::visit(llvm::makeVisitor(
     [&](const EmitAction &a) -> Expected<PlanAction> {
       Value val;
-      if (scope.has(a.name)) {
+      if (a.arg) {
+        // `emit name(arg)`: the argument value rides the emit's value slot.
+        auto v = evalExpr(*a.arg, scope);
+        if (!v) return v.takeError();
+        val = std::move(*v);
+      } else if (scope.has(a.name)) {
         auto v = scope.get(a.name);
         if (!v) return v.takeError();
         val = std::move(*v);
@@ -337,6 +356,20 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       auto v = evalExpr(ls->decl.expr, scope);
       if (!v) return v.takeError();
       scope.set(ls->decl.name, std::move(*v));
+      i++;
+      continue;
+    }
+
+    if (auto *lc = std::get_if<LetCallStmt>(&stmt)) {
+      // Emit the call and bind <name> to a symbolic placeholder ("%name") so
+      // later argument expressions referencing it resolve to that token; the
+      // pass maps the token back to the call's SSA result.
+      auto a = evalAction(Action{lc->call}, scope);
+      if (!a) return a.takeError();
+      auto &pc = std::get<PlanCall>(*a);
+      pc.resultName = lc->name;
+      out.push_back(std::move(*a));
+      scope.set(lc->name, makeStr("%" + lc->name));
       i++;
       continue;
     }
@@ -483,6 +516,17 @@ Expected<LoweringPlan> Evaluator::buildPlan(
   LoweringPlan plan;
   plan.runtime   = runtime->name;
   plan.construct = cd->name;
+
+  // Evaluate runtime-level properties into the plan. They are shared by every
+  // construct of the runtime; a construct-level property of the same name
+  // overrides (the construct loop below runs afterwards).
+  for (auto &item : runtime->items) {
+    if (auto *pd = std::get_if<PropertyDecl>(&item)) {
+      auto v = evalExpr(pd->expr, root);
+      if (!v) return v.takeError();
+      plan.properties[pd->name] = std::move(*v);
+    }
+  }
 
   // Construct scope inherits runtime scope
   ScopeImpl cscope(&root);

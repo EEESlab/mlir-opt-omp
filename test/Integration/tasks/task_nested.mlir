@@ -8,8 +8,8 @@
 // pointer capture (first use is a load) is packed by value and the store lands
 // in the caller's x.
 //
-// Lowered through mlir-opt-omp (libgomp) and run against real libgomp by
-// run_tasks.sh.
+// Lowered through mlir-opt-omp and run against the real runtime (libgomp's
+// GOMP_task or libomp's __kmpc_omp_task_alloc/__kmpc_omp_task) by run_tasks.sh.
 
 module {
   llvm.func @printf(!llvm.ptr, ...) -> i32

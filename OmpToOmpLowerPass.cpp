@@ -66,7 +66,8 @@ Attribute planActionToAttr(const dsl::PlanAction &action, MLIRContext *ctx) {
       return PlanCallAttr::get(
         ctx,
         StringAttr::get(ctx, c.callee),
-        ArrayAttr::get(ctx, argAttrs));
+        ArrayAttr::get(ctx, argAttrs),
+        c.resultName.empty() ? StringAttr() : StringAttr::get(ctx, c.resultName));
     }
   ), action);
 }
@@ -215,6 +216,20 @@ extractTaskContext(omp::TaskOp op) {
   // from the actual struct type (see OmpOutliningPass).
   ctx["env_size"]  = dsl::makeStr("env_size");
   ctx["env_align"] = dsl::makeStr("env_align");
+
+  // iomp task tokens resolved at the call site in OmpOutliningPass::outlineTaskEntry.
+  // gtid/task_t commented because before were present, but only decorative
+  ctx["ident"]        = dsl::makeStr("%ident");
+  ctx["global_tid"]   = dsl::makeStr("%gtid");
+  // ctx["gtid"]         = dsl::makeStr("gtid");
+  // ctx["task_t"]       = dsl::makeStr("task_t");
+  // task_flags is not seeded here: it is a `let task_flags = 1;` in the task
+  // construct (rules.dsl), so the evaluator resolves it to the literal and the
+  // plan carries the value directly — mirroring `default_chunk` for wsloop.
+  ctx["task_size"]    = dsl::makeStr("task_size");
+  ctx["shareds_size"] = dsl::makeStr("shareds_size");
+  // `task` is no longer pre-seeded: it is bound explicitly by
+  // `let task = call "__kmpc_omp_task_alloc"(...)` in rules.dsl (Approach B).
 
   return ctx;
 }

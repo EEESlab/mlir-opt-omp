@@ -372,7 +372,16 @@ class Parser {
       advance();
       auto name = cur().value;
       if (auto e = expect(TK::IDENT); !e) return e.takeError();
-      return Action{EmitAction{name}};
+      // Optional single parenthesized argument, e.g. `emit populate_shareds(task)`.
+      std::optional<Expr> arg;
+      if (at(TK::LPAREN)) {
+        advance();
+        auto a = parseExpr();
+        if (!a) return a.takeError();
+        arg = std::move(*a);
+        if (auto e = expect(TK::RPAREN); !e) return e.takeError();
+      }
+      return Action{EmitAction{name, std::move(arg)}};
     }
     return make_error<StringError>(
       "expected 'call' or 'emit' at line " + std::to_string(cur().line),
@@ -405,6 +414,20 @@ class Parser {
       auto name = cur().value;
       if (auto e = expect(TK::IDENT); !e) return e.takeError();
       if (auto e = expect(TK::EQUALS); !e) return e.takeError();
+      // `let <name> = call "<callee>"(...)` binds the call's SSA result; any
+      // other RHS is an expression binding.
+      if (at(TK::CALL)) {
+        auto act = parseAction();
+        if (!act) return act.takeError();
+        auto *ca = std::get_if<CallAction>(&*act);
+        if (!ca)
+          return make_error<StringError>(
+            "expected a call after 'let " + name + " =' at line " +
+              std::to_string(cur().line),
+            inconvertibleErrorCode());
+        if (auto e = expect(TK::SEMI); !e) return e.takeError();
+        return Statement{LetCallStmt{name, std::move(*ca)}};
+      }
       auto expr = parseExpr();
       if (!expr) return expr.takeError();
       if (auto e = expect(TK::SEMI); !e) return e.takeError();
@@ -510,6 +533,11 @@ class Parser {
         auto cd = parseConstructDecl();
         if (!cd) return cd.takeError();
         items.push_back(std::move(*cd));
+      } else if (at(TK::IDENT)) {
+        // Runtime-level property, e.g. `global_tid_function = "...";`.
+        auto pd = parsePropertyDecl();
+        if (!pd) return pd.takeError();
+        items.push_back(std::move(*pd));
       } else {
         return make_error<StringError>(
           "unexpected token in runtime at line " + std::to_string(cur().line),
