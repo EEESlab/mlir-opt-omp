@@ -41,6 +41,8 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::omp_lower;
 
@@ -200,6 +202,21 @@ static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
   if (auto sa = llvm::dyn_cast_or_null<StringAttr>(dict.get(key)))
     return sa.getValue().str();
   return "";
+}
+
+// capture_strategy is the single ABI discriminator: the delivery mechanism it
+// names uniquely entails the outlined-function signature.
+//   - by_pointer -> microtask   void(gtid, btid, cap0, cap1, ...)
+//   - packed     -> closure      void(ptr data)   (captures in one struct)
+//   - shareds    -> task routine i32(gtid, ptr task), captures via
+//                   task->shareds, emitted by outlineTaskEntry.
+enum class CaptureAbi { ByPointer, Packed, Shareds };
+
+static std::optional<CaptureAbi> parseCaptureAbi(llvm::StringRef s) {
+  if (s == "by_pointer") return CaptureAbi::ByPointer;
+  if (s == "packed")     return CaptureAbi::Packed;
+  if (s == "shareds")    return CaptureAbi::Shareds;
+  return std::nullopt;
 }
 
 // Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
@@ -819,23 +836,14 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   MLIRContext *ctx = op.getContext();
   Location loc = op.getLoc();
 
-  // capture_strategy is the single ABI discriminator: the delivery mechanism it
-  // names uniquely entails the outlined-function signature.
-  //   - by_pointer -> microtask   void(gtid, btid, cap0, cap1, ...)
-  //   - packed     -> closure      void(ptr data)   (captures in one struct)
-  //   - shareds    -> task routine i32(gtid, ptr task), captures via
-  //                   task->shareds, emitted by outlineTaskEntry.
-  enum class CaptureAbi { ByPointer, Packed, Shareds };
   std::string captureStrat = getPropStr(op, "capture_strategy");
-  CaptureAbi abi;
-  if (captureStrat == "by_pointer")   abi = CaptureAbi::ByPointer;
-  else if (captureStrat == "packed")  abi = CaptureAbi::Packed;
-  else if (captureStrat == "shareds") abi = CaptureAbi::Shareds;
-  else {
+  std::optional<CaptureAbi> abiOpt = parseCaptureAbi(captureStrat);
+  if (!abiOpt) {
     op.emitError("unknown capture_strategy '" + captureStrat +
                  "' (expected by_pointer, packed, or shareds)");
     return;
   }
+  CaptureAbi abi = *abiOpt;
 
   // iomp task uses a distinct ABI — the shareds signature: an
   // i32(i32 gtid, ptr task) entry whose captures live in a runtime-allocated
@@ -845,9 +853,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     outlineTaskEntry(op, module, counter);
     return;
   }
-
-  bool isMicrotask = abi == CaptureAbi::ByPointer;
-  bool isPacked    = abi == CaptureAbi::Packed;
 
   // Collect all values used inside the region but defined outside.
   SmallVector<Value> captures = collectCaptures(body);
@@ -875,7 +880,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
 
   // Build outlined function argument types.
   SmallVector<Type> fnArgTypes;
-  if (isMicrotask) {
+  if (abi == CaptureAbi::ByPointer) {
     // iomp microtask: void(ptr gtid, ptr btid, cap0, cap1, ...)
     fnArgTypes.push_back(ptrTy(ctx)); // ptr gtid
     fnArgTypes.push_back(ptrTy(ctx)); // ptr btid
@@ -905,7 +910,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   SmallVector<BlockArgument> privatizerArgs;
   Block &entry = takeOutlinedBody(body, outlinedFn, privatizerArgs);
 
-  if (isPacked) {
+  if (abi == CaptureAbi::Packed) {
     // -------------------------------------------------------------------------
     // PACKED / CLOSURE strategy (libgomp)
     // -------------------------------------------------------------------------
@@ -963,7 +968,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         replaceUsesInRegion(outlinedFn.getBody(), dstArg, privAlloca);
       }
     }
-  } else if (isMicrotask) {
+  } else if (abi == CaptureAbi::ByPointer) {
     // -------------------------------------------------------------------------
     // BY_POINTER strategy (iomp microtask)
     // -------------------------------------------------------------------------
@@ -1048,7 +1053,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // This removes captures that were only needed as privatizer sources
   // (e.g., source allocas for private vars that don't need copying).
   {
-    unsigned capBase = isMicrotask ? 2 : 1; // microtask: [gtid,btid,...]; packed: [data,...]
+    unsigned capBase = abi == CaptureAbi::ByPointer ? 2 : 1; // microtask: [gtid,btid,...]; packed: [data,...]
     llvm::DenseSet<unsigned> erasedCapIdx;
     for (int i = (int)captures.size() - 1; i >= 0; i--) {
       unsigned argIdx = capBase + (unsigned)i;
@@ -1208,7 +1213,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       func::CallOp::create(builder, loc, preDecl, preArgs);
     }
 
-    if (isPacked) {
+    if (abi == CaptureAbi::Packed) {
       // -----------------------------------------------------------------------
       // PACKED / CLOSURE: build capture struct on the stack, pass ptr to it
       // -----------------------------------------------------------------------
