@@ -15,8 +15,14 @@
 // adjust the loop below — the behaviour under test is the emitted ident
 // globals, not the loop parsing.
 //
+// The @sink call after the wsloop keeps the loop's implicit barrier from being
+// the region's trailing op, so it is NOT elided (that elision is exercised by
+// barrier-elision-iomp.mlir) and its ident is emitted here as intended.
+//
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+
+llvm.func @sink(i32)
 
 func.func @parallel_wsloop() {
   omp.parallel {
@@ -28,6 +34,7 @@ func.func @parallel_wsloop() {
         omp.yield
       }
     }
+    llvm.call @sink(%ub) : (i32) -> ()
     omp.terminator
   }
   return

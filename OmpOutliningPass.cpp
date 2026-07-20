@@ -1800,6 +1800,41 @@ struct OmpOutliningPass
 
       lowerWsloop(wsOp, module, *plan);
     }
+
+    // Step 3: drop the redundant trailing team barrier of each outlined
+    // parallel region.  A team barrier that is the last operation before the
+    // microtask returns is already covered by the implicit join barrier of
+    // __kmpc_fork_call (the master waits for the whole team before fork_call
+    // returns).  This is the combined `parallel for` case — clang elides the
+    // work-sharing barrier the same way.  Removing it saves one global barrier
+    // per parallel region, which is significant for kernels that fork many
+    // short regions (e.g. stencils looping over thousands of time steps).
+    //
+    // The barrier callee is runtime-specific (iomp __kmpc_barrier, libgomp
+    // GOMP_barrier, ...), so we take it from the barrier plan.  Only the *last*
+    // barrier before the return is dropped, so a barrier that separates two
+    // work-sharing loops inside the same region is preserved.  Tasks are not
+    // fork/joined this way, so only outlined_parallel_* functions qualify.
+    std::string barrierCallee;
+    for (auto &action : barrierPlan->invoke)
+      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+        barrierCallee = ca->callee;
+        break;
+      }
+    if (!barrierCallee.empty()) {
+      module.walk([&](func::FuncOp fn) {
+        if (!fn.getName().starts_with("outlined_parallel_"))
+          return;
+        for (Block &blk : fn.getBody()) {
+          auto ret = llvm::dyn_cast_or_null<func::ReturnOp>(blk.getTerminator());
+          if (!ret)
+            continue;
+          auto call = llvm::dyn_cast_or_null<func::CallOp>(ret->getPrevNode());
+          if (call && call.getCallee() == barrierCallee)
+            call.erase();
+        }
+      });
+    }
   }
 };
 
