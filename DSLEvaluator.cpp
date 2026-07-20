@@ -522,7 +522,10 @@ Expected<LoweringPlan> Evaluator::buildPlan(
   // overrides (the construct loop below runs afterwards).
   for (auto &item : runtime->items) {
     if (auto *pd = std::get_if<PropertyDecl>(&item)) {
-      auto v = evalExpr(pd->expr, root);
+      // evalExprOrBare (not evalExpr): a bare-identifier property value such as
+      // `capture_strategy = packed;` is an enum token, not a scope variable, so
+      // an unknown ident resolves to its own string instead of erroring.
+      auto v = evalExprOrBare(pd->expr, root);
       if (!v) return v.takeError();
       plan.properties[pd->name] = std::move(*v);
     }
@@ -538,7 +541,9 @@ Expected<LoweringPlan> Evaluator::buildPlan(
       cscope.set(ld->name, std::move(*v));
 
     } else if (auto *pd = std::get_if<PropertyDecl>(&item)) {
-      auto v = evalExpr(pd->expr, cscope);
+      // evalExprOrBare: see the runtime-level property loop above — bare-ident
+      // enum values (e.g. `capture_strategy = by_pointer;`) resolve to strings.
+      auto v = evalExprOrBare(pd->expr, cscope);
       if (!v) return v.takeError();
       plan.properties[pd->name] = std::move(*v);
 

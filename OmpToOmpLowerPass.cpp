@@ -159,14 +159,15 @@ extractParallelContext(omp::ParallelOp op) {
   ctx["ident"]      = dsl::makeStr("%ident");
   ctx["global_tid"] = dsl::makeStr("%gtid");
 
-  // Removed: ptr_tid/ptr_btid were only decorative args of the microtask
-  // outline_signature, now emptied to `microtask()` in rules.dsl, so nothing
+  // Removed: ptr_tid/ptr_btid were only decorative args of the old microtask
+  // outline_signature, which no longer exists in rules.dsl, so nothing
   // references them anymore.
   // ctx["ptr_tid"]    = dsl::makeStr("ptr_tid");
   // ctx["ptr_btid"]   = dsl::makeStr("ptr_btid");
 
-  // Removed: capture_strategy values are quoted string literals in the DSL, so
-  // these bare tokens are never looked up.
+  // Not seeded: capture_strategy values (by_pointer/packed) are bare-identifier
+  // enum tokens read via evalExprOrBare, which falls back to the token's own
+  // name when it isn't in this context — so seeding them would be redundant.
   // ctx["by_pointer"] = dsl::makeStr("by_pointer");
   // ctx["packed"]     = dsl::makeStr("packed");
 
@@ -207,9 +208,9 @@ extractTaskContext(omp::TaskOp op) {
   else
     ctx["if_clause"] = dsl::makeNull();
 
-  // Removed: capture_strategy is a quoted literal in the DSL, so the bare
-  // `packed` token is never looked up.  env_ptr, by contrast, is  used
-  // by the libgomp task invoke (GOMP_task(body, env_ptr, ...)).
+  // Not seeded: capture_strategy's bare `packed`/`shareds` token falls back to
+  // its own name via evalExprOrBare, so it needs no context entry.  env_ptr, by
+  // contrast, is used by the libgomp task invoke (GOMP_task(body, env_ptr, ...)).
   // ctx["packed"]    = dsl::makeStr("packed");
   ctx["env_ptr"]   = dsl::makeStr("env_ptr");
   // Capture-struct size/alignment placeholders, materialised at the call site

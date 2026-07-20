@@ -593,7 +593,7 @@ static void replaceTerminatorsWithReturn(
 }
 
 // ---------------------------------------------------------------------------
-// 1a. IOMP TASK OUTLINING  (outline_signature = task_entry)
+// 1a. IOMP TASK OUTLINING  (capture_strategy = shareds)
 // ---------------------------------------------------------------------------
 // Lowers an omp_lower.construct for an iomp task:
 //   - outlines the body into an entry function  i32(i32 gtid, ptr task) that
@@ -819,22 +819,35 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   MLIRContext *ctx = op.getContext();
   Location loc = op.getLoc();
 
-  std::string outlineSig   = getPropStr(op, "outline_signature");
+  // capture_strategy is the single ABI discriminator: the delivery mechanism it
+  // names uniquely entails the outlined-function signature.
+  //   - by_pointer -> microtask   void(gtid, btid, cap0, cap1, ...)
+  //   - packed     -> closure      void(ptr data)   (captures in one struct)
+  //   - shareds    -> task routine i32(gtid, ptr task), captures via
+  //                   task->shareds, emitted by outlineTaskEntry.
+  enum class CaptureAbi { ByPointer, Packed, Shareds };
   std::string captureStrat = getPropStr(op, "capture_strategy");
+  CaptureAbi abi;
+  if (captureStrat == "by_pointer")   abi = CaptureAbi::ByPointer;
+  else if (captureStrat == "packed")  abi = CaptureAbi::Packed;
+  else if (captureStrat == "shareds") abi = CaptureAbi::Shareds;
+  else {
+    op.emitError("unknown capture_strategy '" + captureStrat +
+                 "' (expected by_pointer, packed, or shareds)");
+    return;
+  }
 
-  // iomp task uses a distinct ABI — the task_entry signature: an
+  // iomp task uses a distinct ABI — the shareds signature: an
   // i32(i32 gtid, ptr task) entry whose captures live in a runtime-allocated
   // shareds block, emitted via the __kmpc_omp_task_alloc/task two-call
-  // sequence.  The capture topology is still "packed" (one struct); only the
-  // signature differs, so we dispatch on it here.
-  if (outlineSig.find("task_entry") != std::string::npos) {
+  // sequence.
+  if (abi == CaptureAbi::Shareds) {
     outlineTaskEntry(op, module, counter);
     return;
   }
 
-  bool isMicrotask = outlineSig.find("microtask") != std::string::npos;
-  bool isClosure   = outlineSig.find("closure")   != std::string::npos;
-  bool isPacked    = captureStrat == "packed";
+  bool isMicrotask = abi == CaptureAbi::ByPointer;
+  bool isPacked    = abi == CaptureAbi::Packed;
 
   // Collect all values used inside the region but defined outside.
   SmallVector<Value> captures = collectCaptures(body);
@@ -863,17 +876,13 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // Build outlined function argument types.
   SmallVector<Type> fnArgTypes;
   if (isMicrotask) {
+    // iomp microtask: void(ptr gtid, ptr btid, cap0, cap1, ...)
     fnArgTypes.push_back(ptrTy(ctx)); // ptr gtid
     fnArgTypes.push_back(ptrTy(ctx)); // ptr btid
-    if (isPacked)
-      fnArgTypes.push_back(ptrTy(ctx)); // ptr to capture struct
-    else
-      for (auto cap : captures) fnArgTypes.push_back(cap.getType());
-  } else if (isClosure) {
-    // libgomp: void(void *data) — data points to capture struct
-    fnArgTypes.push_back(ptrTy(ctx));
-  } else {
     for (auto cap : captures) fnArgTypes.push_back(cap.getType());
+  } else {
+    // packed/closure: void(ptr data) — data points to the capture struct.
+    fnArgTypes.push_back(ptrTy(ctx));
   }
 
   OpBuilder builder(ctx);
@@ -907,16 +916,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     // Each field is the capture value itself (not a pointer to it) for
     // scalar types, or a pointer for pointer types.
     //
-    // For isMicrotask+isPacked (unusual): prepend gtid/btid first.
-    if (isMicrotask) {
-      entry.insertArgument(0u, ptrTy(ctx), loc); // btid
-      entry.insertArgument(0u, ptrTy(ctx), loc); // gtid
-    }
-    // Always insert the data ptr at position 0 (closure) or 2 (microtask).
-    // The entry block may already have privatizer args — we insert before them.
-    unsigned dataPtrIdx = isMicrotask ? 2u : 0u;
-    entry.insertArgument(dataPtrIdx, ptrTy(ctx), loc);
-    BlockArgument dataPtr = entry.getArgument(dataPtrIdx);
+    // Insert the data ptr at position 0.  The entry block may already have
+    // privatizer args — we insert before them.
+    entry.insertArgument(0u, ptrTy(ctx), loc);
+    BlockArgument dataPtr = entry.getArgument(0u);
 
     // Build the capture struct type: { cap_0_type, cap_1_type, ... }
     SmallVector<Type> fieldTypes;
@@ -1027,8 +1030,6 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         }
       }
     }
-  } else if (isClosure) {
-    // closure without microtask: single env ptr already at index 0
   }
 
   // Remove unused privatizer block args from the entry block.
@@ -1047,7 +1048,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // This removes captures that were only needed as privatizer sources
   // (e.g., source allocas for private vars that don't need copying).
   {
-    unsigned capBase = isMicrotask ? 2 : (isClosure ? 1 : 0);
+    unsigned capBase = isMicrotask ? 2 : 1; // microtask: [gtid,btid,...]; packed: [data,...]
     llvm::DenseSet<unsigned> erasedCapIdx;
     for (int i = (int)captures.size() - 1; i >= 0; i--) {
       unsigned argIdx = capBase + (unsigned)i;

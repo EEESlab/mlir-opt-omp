@@ -7,11 +7,10 @@
       let default_chunk = 1;
 
       construct parallel {
-        // ABI tag, matched head-only (.find("microtask")).  The args
-        // (ptr_tid, ptr_btid, captures) were decorative so they are dropped;
-        // the actual microtask shape is built in C++ (see outlineConstruct).
-        outline_signature = microtask();
-        capture_strategy = "by_pointer";
+        // ABI selector.  by_pointer entails the Intel microtask signature
+        // void(ptr gtid, ptr btid, cap0, cap1, ...), built in C++ (see
+        // outlineConstruct): each capture is passed as its own trailing arg.
+        capture_strategy = by_pointer;
 
         pre {
           // No `emit` for ident or global_tid: both are materialised on demand
@@ -50,14 +49,13 @@
       }
 
       construct task {
-        // No capture_strategy: the task has a single valid topology 
-        // (the same "packed" struct as the closure path,
-        // runtime-allocated and reached via load(task->shareds)), entailed by
-        // the ABI.  The signature is an ABI
-        // tag matched by .find("task_entry").
-        outline_signature = task_entry();
+        // ABI selector.  shareds entails the Intel task-routine signature
+        // i32(i32 gtid, ptr task): captures live in a runtime-allocated shareds
+        // struct reached via load(task->shareds), emitted via the
+        // __kmpc_omp_task_alloc/task two-call sequence (see outlineTaskEntry).
+        capture_strategy = shareds;
         // kmp_task_t header ABI layout, DSL-owned (like task_flags below).
-        // Consumed by the pass (as outline_signature is): field 0 is the
+        // Consumed by the pass (as capture_strategy is): field 0 is the
         // shareds pointer the entry prolog loads, and sizeof(this) is the
         // `task_size` passed to __kmpc_omp_task_alloc.
         kmp_task_t = struct(ptr, ptr, i32, ptr, ptr);
@@ -84,8 +82,9 @@
 
 runtime libgomp {
   construct parallel {
-    outline_signature = closure();   // ABI tag, head-only matched; env_ptr is kept (used by the invoke), just not as a decorative signature arg
-    capture_strategy = "packed";
+    // ABI selector.  packed entails the closure signature void(ptr data): all
+    // captures live in one struct the call site hands over by pointer (env_ptr).
+    capture_strategy = packed;
     pre {}
     invoke {
       when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, 0);
@@ -111,8 +110,9 @@ runtime libgomp {
     }
   }
   construct task {
-    outline_signature = closure();   // ABI tag, head-only matched; env_ptr is kept (used by the invoke), just not as a decorative signature arg
-    capture_strategy  = "packed";
+    // ABI selector.  packed entails the closure signature void(ptr data): all
+    // captures live in one struct the call site hands over by pointer (env_ptr).
+    capture_strategy = packed;
     invoke {
       when has(if_clause) =>
         call "GOMP_task"(body, env_ptr, null,
@@ -129,8 +129,9 @@ runtime libgomp {
 
 runtime pmsis {
   construct parallel {
-    outline_signature = closure();   // ABI tag, head-only matched; env_ptr is kept (used by the invoke), just not as a decorative signature arg
-    capture_strategy = "packed";
+    // ABI selector.  packed entails the closure signature void(ptr data): all
+    // captures live in one struct the call site hands over by pointer (env_ptr).
+    capture_strategy = packed;
     pre {}
     invoke {
       call "ext_pi_cl_team_fork"(8, body, env_ptr);

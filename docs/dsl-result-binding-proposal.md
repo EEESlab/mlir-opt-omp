@@ -24,7 +24,7 @@ result is dropped. There is no way in the DSL to name a call's result and refer
 to it from a later argument.
 
 For iomp `task` we worked around this: the C++ lowering for
-`capture_strategy = "shareds"` recognises the `__kmpc_omp_task_alloc` callee,
+`capture_strategy = shareds` recognises the `__kmpc_omp_task_alloc` callee,
 remembers its SSA result, and resolves a magic `task` token to it. Zero
 parser changes but the data flow is invisible in the DSL and the binding is
 hardcoded to one callee.

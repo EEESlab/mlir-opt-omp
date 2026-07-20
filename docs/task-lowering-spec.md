@@ -112,8 +112,7 @@ declaring tasks unsupported on this target). No invented API is assumed here.
 
 ```
 construct task {
-  outline_signature = closure(env_ptr);
-  capture_strategy  = "packed";
+  capture_strategy = packed;   // closure signature void(ptr data), one struct
   invoke {
     when has(if_clause) =>
       call "GOMP_task"(body, env_ptr, null,
@@ -146,9 +145,8 @@ for the boolean argument.
 
 ```
 construct task {
-  outline_signature = task_entry();               // ABI tag (i32(i32 gtid, ptr task)), matched head-only
-  // no capture_strategy: the only valid topology (packed, runtime-allocated,
-  // reached via task->shareds) is entailed by task_entry, so it would be inert.
+  capture_strategy = shareds;   // ABI selector: task-routine i32(i32 gtid, ptr task),
+                                // captures runtime-allocated, reached via task->shareds
   // no pre block: every invoke call uses both ident and global_tid (unlike
   // parallel, where gtid is optional), so there is no optionality to gate.
   // They are resolved on demand from the tokens below, as barrier/wsloop do.
@@ -164,7 +162,7 @@ New symbolic tokens (resolved in the outlining pass):
 
 | Token | Resolves to |
 |-------|-------------|
-| `task_entry` | new outline signature `i32(i32 gtid, ptr task)` — **the dispatch discriminator** (no `capture_strategy`: the packed, runtime-allocated topology reached via `task->shareds` is entailed by the ABI) |
+| `capture_strategy = shareds` | selects the task-routine signature `i32(i32 gtid, ptr task)` — **the dispatch discriminator**; the packed, runtime-allocated topology reached via `task->shareds` is entailed by this ABI value |
 | `body` | the entry fn pointer (`kmp_routine_entry_t`) |
 | `task_flags` | i32 flags — **v1 = 1 (tied)**; `final`/`untied`/… later |
 | `task_size` | i64 `sizeof(kmp_task_t)` — `{ptr,ptr,i32,ptr,ptr}` = 40B header |
@@ -251,8 +249,8 @@ tasks. (The shared `counter` is global, so the inner task's function is e.g.
 
 ### 5.3 iomp (implemented — Approach A)
 
-A new outlining branch (`outlineTaskEntry`) keyed on `outline_signature`
-containing `task_entry` (the capture topology stays `packed`). It cannot share
+A new outlining branch (`outlineTaskEntry`) keyed on `capture_strategy == shareds`
+(the capture topology is a runtime-allocated struct). It cannot share
 the `void(void*)` closure path. Concretely:
 
 - **Entry function** `i32(i32 gtid, ptr task)`: load `shareds` from the task
