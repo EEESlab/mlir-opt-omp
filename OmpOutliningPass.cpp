@@ -617,9 +617,19 @@ static void replaceTerminatorsWithReturn(
 //     loads task->shareds and unpacks the captures from it;
 //   - at the call site emits __kmpc_omp_task_alloc, populates task->shareds
 //     with the captures, then __kmpc_omp_task.
+// An omp.taskwait nested in the task body is lowered here too (via the shared
+// leaf helper) when the runtime provides a taskwait plan; %gtid is the entry's
+// arg 0 (an i32 value, unlike the microtask ptr-to-i32 convention).
 // v1 limitations: no firstprivate/private clause wiring (captures only); no
-// if/final clause (always deferred); task_flags = 1 (tied).
-static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
+// if/final clause (always deferred); task_flags = 1 (tied); depend/nowait
+// on taskwait ignored; omp.barrier is illegal in a task region and diagnosed.
+static void
+lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module, MLIRContext *ctx,
+                   llvm::StringRef opName, const dsl::LoweringPlan &plan,
+                   llvm::function_ref<Value(OpBuilder &, Location)> resolveGtid);
+
+static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
+                             const dsl::LoweringPlan *taskwaitPlan) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -704,6 +714,31 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
     Value zero = LLVM::ConstantOp::create(tb, l, i32t,
       IntegerAttr::get(i32t, 0));
     func::ReturnOp::create(tb, l, ValueRange{zero});
+  });
+
+  // Lower an omp.taskwait nested directly in the task body — e.g.
+  // `parallel { task { taskwait } }`, where it rides in as a still-unconverted
+  // omp.taskwait.  The shareds entry ABI is i32(i32 gtid, ptr task), so %gtid is
+  // arg 0 *by value* (not the microtask ptr-to-i32); the leaf helper is reused
+  // with that gtid source.  An omp.barrier is illegal inside a task region in
+  // OpenMP, so it is diagnosed rather than lowered.
+  if (taskwaitPlan) {
+    auto taskGtid = [&](OpBuilder &, Location) -> Value {
+      return outlinedFn.getBody().front().getArgument(0); // i32 gtid value
+    };
+    lowerLeafConstruct(outlinedFn, module, ctx, "omp.taskwait", *taskwaitPlan,
+                       taskGtid);
+  } else {
+    outlinedFn.walk([&](Operation *inner) {
+      if (inner->getName().getStringRef() == "omp.taskwait")
+        inner->emitError(
+            "omp-outline: selected runtime has no `construct taskwait`");
+    });
+  }
+  outlinedFn.walk([&](Operation *inner) {
+    if (inner->getName().getStringRef() == "omp.barrier")
+      inner->emitError(
+          "omp-outline: 'omp.barrier' is not valid inside a task region");
   });
 
   // ---- Call site ----
@@ -827,10 +862,15 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
 // Lower leaf omp ops (omp.barrier, omp.taskwait) that ride inside an outlined
 // function by applying a precomputed DSL plan.  These constructs have no body
 // and no captures; the plan's invoke calls use only the symbolic %ident/%gtid
-// args, resolved here from the microtask convention (arg 0 = ptr to i32 gtid).
+// args.  ident resolves the same everywhere, but the gtid source depends on the
+// enclosing function's ABI, so the caller supplies it via resolveGtid:
+//   - microtask entry  void(ptr gtid, ptr btid, ...):  load arg 0 (ptr to i32);
+//   - task entry       i32(i32 gtid, ptr task):        arg 0 is the gtid value.
 static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
                                MLIRContext *ctx, llvm::StringRef opName,
-                               const dsl::LoweringPlan &plan) {
+                               const dsl::LoweringPlan &plan,
+                               llvm::function_ref<Value(OpBuilder &, Location)>
+                                   resolveGtid) {
   SmallVector<Operation *> targets;
   for (auto &block : outlinedFn.getBody())
     for (auto &innerOp : block)
@@ -847,14 +887,7 @@ static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
             [&](uint32_t flags) {
               return getOrCreateIdent(module, bb, bloc, ctx, flags);
             },
-            [&]() -> Value {
-              // Microtask convention: first arg is ptr to i32 gtid.
-              auto &fnEntry = outlinedFn.getBody().front();
-              if (fnEntry.getNumArguments() >= 2)
-                return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
-                                            fnEntry.getArgument(0));
-              return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
-            });
+            [&]() -> Value { return resolveGtid(bb, bloc); });
       if (auto *iv = std::get_if<dsl::IntVal>(&v))
         return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
           IntegerAttr::get(i32Ty(ctx), iv->value));
@@ -904,7 +937,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // shareds block, emitted via the __kmpc_omp_task_alloc/task two-call
   // sequence.
   if (abi == CaptureAbi::Shareds) {
-    outlineTaskEntry(op, module, counter);
+    outlineTaskEntry(op, module, counter, taskwaitPlan);
     return;
   }
 
@@ -1155,10 +1188,19 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
 
   // Lower omp.barrier / omp.taskwait inside the outlined function — DSL-driven.
   // The plans (one per runtime) are built once in runOnOperation; the helper
-  // only resolves the symbolic args (%ident, %gtid) at each call site.
-  lowerLeafConstruct(outlinedFn, module, ctx, "omp.barrier", barrierPlan);
+  // only resolves the symbolic args (%ident, %gtid) at each call site.  This is
+  // the microtask entry, so %gtid is a load of arg 0 (a ptr to i32 gtid).
+  auto microtaskGtid = [&](OpBuilder &bb, Location bloc) -> Value {
+    auto &fnEntry = outlinedFn.getBody().front();
+    if (fnEntry.getNumArguments() >= 2)
+      return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx), fnEntry.getArgument(0));
+    return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
+  };
+  lowerLeafConstruct(outlinedFn, module, ctx, "omp.barrier", barrierPlan,
+                     microtaskGtid);
   if (taskwaitPlan) {
-    lowerLeafConstruct(outlinedFn, module, ctx, "omp.taskwait", *taskwaitPlan);
+    lowerLeafConstruct(outlinedFn, module, ctx, "omp.taskwait", *taskwaitPlan,
+                       microtaskGtid);
   } else {
     // No taskwait plan for the selected runtime: a taskwait inside a parallel
     // cannot be lowered.  Flag it rather than silently dropping the wait.

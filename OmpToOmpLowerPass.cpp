@@ -313,6 +313,14 @@ struct OmpToOmpLowerPass
     // taskwait mirrors barrier: those inside a parallel ride into its body
     // region and are lowered by the outlining pass; only collect the rest.
     module.walk([&](omp::TaskwaitOp op) {
+      // v1 lowers taskwait as an unconditional, full wait: the depend and nowait
+      // clauses are not modelled yet.  Warn rather than dropping them silently,
+      // so a caller relying on those semantics isn't misled.  This walk sees
+      // every taskwait (in-parallel ones included), so the diagnostic fires
+      // regardless of which lowering path the op eventually takes.
+      if (op->getNumOperands() > 0 || op->hasAttr("nowait"))
+        op.emitWarning("omp-to-omp-lower: taskwait depend/nowait clauses are "
+                       "ignored in v1; lowering as a full, unconditional wait");
       if (!op->getParentOfType<omp::ParallelOp>())
         taskwaits.push_back(op);
     });

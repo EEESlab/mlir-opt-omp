@@ -368,8 +368,14 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   `OpenMPLocationFlags` bit); libgomp emits the no-argument `GOMP_taskwait()`.
   The pass logic is runtime-agnostic (plan built from the DSL), so the
   `taskwait` plan is optional: a `taskwait` under a runtime lacking the
-  construct is diagnosed, not dropped. `depend`/`nowait` ignored in v1; pmsis
-  (no standard task-wait API) is a follow-up.
+  construct is diagnosed, not dropped. A `taskwait` nested directly in a task
+  body (`parallel { task { taskwait } }`) is lowered in the task entry too:
+  there %gtid is the entry's arg 0 *by value* (the shareds ABI
+  `i32(i32 gtid, ptr task)`), not the microtask ptr-to-i32, so the shared leaf
+  helper takes the gtid source as a callback. An `omp.barrier` inside a task
+  region is invalid OpenMP and is diagnosed there. `depend`/`nowait` on taskwait
+  are still ignored (a warning is emitted); pmsis (no standard task-wait API) is
+  a follow-up.
 - **`taskgroup` / `taskloop`** — separate constructs, out of scope.
 - **LLP64 targets** — the `long = i64`, `_Bool = i8` mapping assumes LP64
   (the wsl/workstation Linux targets). Revisit only for a Windows/LLP64 libgomp.
