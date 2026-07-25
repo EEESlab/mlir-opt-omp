@@ -37,6 +37,16 @@ cp ../Integration/config.env.lucap-wsl.example ../Integration/config.env
 
 Native runtimes (`iomp`, `libgomp`) also build and **run** the binary and print
 `0 11 22 33 44 55 66 77` — a self-check that the lowering is correct end to end.
+`pmsis` stops at the lowered IR here (the toy driver is a host program); to
+build and **run the same kernel on gvsoc**, see [`pulp/`](pulp/).
+
+## Same kernel on embedded hardware (gvsoc)
+
+[`pulp/run-pulp.sh`](pulp/run-pulp.sh) takes the **same** `vecadd.c` down to a
+GAP8 executable and runs it on the **gvsoc** simulator — the pmsis lowering
+(`ext_pi_cl_team_fork`) linked against the real PMSIS API via a small shim
+layer. Self-contained (no external PolyBench-PULP harness); workstation only
+(needs the GAP SDK + gvsoc). See [`pulp/README.md`](pulp/README.md).
 
 ## What each stage shows (map to slides)
 

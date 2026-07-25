@@ -102,7 +102,7 @@ for rt in "${RUNTIMES[@]}"; do
   case "$rt" in
     iomp)    fopenmp="-fopenmp";         libs="-lm";;
     libgomp) fopenmp="-fopenmp=libgomp"; libs="-lm -lgomp";;
-    *)  echo "   (pmsis: IR only — the riscv32 / gvsoc back end needs the PULP SDK)"; echo; continue;;
+    *)  echo "   (pmsis: IR only here — to build & RUN on gvsoc use pulp/run-pulp.sh)"; echo; continue;;
   esac
 
   "$MLIR_OPT" "$d/04-omp-lower-plan.mlir" \
