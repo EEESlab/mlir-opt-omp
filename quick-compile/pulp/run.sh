@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 OMP_REPO_ROOT="$(cd ../.. && pwd)"
-OMP_DEFAULT_TOOL_BIN="$OMP_REPO_ROOT/BUILD"
+OMP_DEFAULT_TOOL_BIN="$OMP_REPO_ROOT/build"
 # shellcheck source=../../scripts/load-local-env.sh
 . "$OMP_REPO_ROOT/scripts/load-local-env.sh"
 

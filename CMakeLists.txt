@@ -56,7 +56,16 @@ target_include_directories(OmpLoweringStatic PRIVATE
 # CIR is linked in only so the tool can parse modules that still carry cir.*,
 # i.e. the C front-end path. Against a stock LLVM/MLIR install the option turns
 # itself off and the tool still builds, for hand-written or Flang-produced MLIR.
-if(EXISTS "${LLVM_INSTALL_PREFIX}/lib/libMLIRCIR.a")
+#
+# Probe LLVM_LIBRARY_DIR, not LLVM_INSTALL_PREFIX: the latter is the install
+# prefix, which is unset when MLIR_DIR points at an LLVM *build tree* — the
+# usual ClangIR setup, since CIR is often built but never installed. The former
+# is set correctly by LLVMConfig.cmake for both build trees and installs.
+#
+# Note this only picks the *default*. option() honours a cached value, so a
+# build directory configured while CIR was undetectable keeps it off; force it
+# with -DOMP_LOWER_ENABLE_CIR=ON or configure into a clean directory.
+if(EXISTS "${LLVM_LIBRARY_DIR}/libMLIRCIR.a")
   set(OMP_LOWER_CIR_DEFAULT ON)
 else()
   set(OMP_LOWER_CIR_DEFAULT OFF)
@@ -79,27 +88,41 @@ target_include_directories(mlir-opt-omp PRIVATE
   ${LLVM_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
-  ${LLVM_INSTALL_PREFIX}/include
-  #  /home/tagliavini/MLIR/BUILD-LLVM/tools/clang/include  # generated CIR headers
 )
 
 if(OMP_LOWER_ENABLE_CIR)
   message(STATUS "mlir-opt-omp: CIR support ON")
   target_compile_definitions(mlir-opt-omp PRIVATE OMP_LOWER_HAS_CIR)
+
+  # Clang headers: mlir-opt-omp.cpp includes clang/CIR/Dialect/IR/CIRDialect.h,
+  # which in turn pulls in generated .inc files. A build tree keeps the two
+  # apart — the header in the clang source tree, the .inc under
+  # tools/clang/include — so ask ClangConfig for both instead of guessing.
+  find_package(Clang CONFIG QUIET HINTS "${LLVM_LIBRARY_DIR}/cmake/clang")
+  if(NOT Clang_FOUND)
+    message(FATAL_ERROR
+      "OMP_LOWER_ENABLE_CIR is ON but ClangConfig.cmake was not found "
+      "(looked in ${LLVM_LIBRARY_DIR}/cmake/clang). Point MLIR_DIR at an LLVM "
+      "built with -DCLANG_ENABLE_CIR=ON, or configure with "
+      "-DOMP_LOWER_ENABLE_CIR=OFF to build without the C front-end path.")
+  endif()
+  target_include_directories(mlir-opt-omp PRIVATE ${CLANG_INCLUDE_DIRS})
+
   target_link_libraries(mlir-opt-omp PRIVATE
-    # CIR dialect libraries — must come from the BUILD tree because the
-    # install does not contain the generated CIRDialect constructor.
-    ${LLVM_INSTALL_PREFIX}/lib/libMLIRCIR.a
-    ${LLVM_INSTALL_PREFIX}/lib/libMLIRCIRInterfaces.a
-    ${LLVM_INSTALL_PREFIX}/lib/libMLIRCIRTransforms.a
-    ${LLVM_INSTALL_PREFIX}/lib/libclangCIR.a
-    ${LLVM_INSTALL_PREFIX}/lib/libclangCIRLoweringDirectToLLVM.a
-    ${LLVM_INSTALL_PREFIX}/lib/libclangCIRLoweringCommon.a
-    ${LLVM_INSTALL_PREFIX}/lib/libclangCIRFrontendAction.a
+    # CIR dialect libraries — taken from LLVM_LIBRARY_DIR so a build tree works
+    # as well as an install (the install often lacks the generated CIRDialect
+    # constructor, so the build tree is the common case).
+    ${LLVM_LIBRARY_DIR}/libMLIRCIR.a
+    ${LLVM_LIBRARY_DIR}/libMLIRCIRInterfaces.a
+    ${LLVM_LIBRARY_DIR}/libMLIRCIRTransforms.a
+    ${LLVM_LIBRARY_DIR}/libclangCIR.a
+    ${LLVM_LIBRARY_DIR}/libclangCIRLoweringDirectToLLVM.a
+    ${LLVM_LIBRARY_DIR}/libclangCIRLoweringCommon.a
+    ${LLVM_LIBRARY_DIR}/libclangCIRFrontendAction.a
 
     # Clang support libs that CIR depends on
-    ${LLVM_INSTALL_PREFIX}/lib/libclangAST.a
-    ${LLVM_INSTALL_PREFIX}/lib/libclangBasic.a
+    ${LLVM_LIBRARY_DIR}/libclangAST.a
+    ${LLVM_LIBRARY_DIR}/libclangBasic.a
   )
 else()
   message(STATUS "mlir-opt-omp: CIR support OFF — input must be free of cir.*")

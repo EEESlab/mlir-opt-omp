@@ -70,25 +70,42 @@ and `llvm-lit`.
 ## Building
 
 ```sh
-mkdir BUILD && cd BUILD
-cmake .. -DMLIR_DIR=<LLVM_INSTALL_DIR>/lib/cmake/mlir
-cmake --build .
+cmake -S . -B build -G Ninja -DMLIR_DIR=<LLVM_DIR>/lib/cmake/mlir
+cmake --build build
 ```
 
-This produces `BUILD/mlir-opt-omp`. The CIR and clang static libraries are
-picked up from `<LLVM_INSTALL_DIR>/lib`.
+This produces `build/mlir-opt-omp`. Keep the directory named `build`: it is
+what `local.env.example` and the setups in [`docs/setups/`](docs/setups/) use
+for `OMP_TOOL_BIN`, and what the `quick-compile/` scripts fall back to.
+
+`<LLVM_DIR>` can be either an LLVM **install** prefix or an LLVM **build
+tree** — the latter is the common case with ClangIR, which is often built but
+never installed. Everything is resolved through `LLVM_LIBRARY_DIR`, so both
+work without further configuration.
 
 ### Building without ClangIR
 
 The passes work on the `omp` and `llvm` dialects and never inspect a `cir.*`
 operation; the CIR dialect is registered only so modules straight from the C
-front-end still parse. CMake looks for `libMLIRCIR.a` next to the MLIR install
-and links CIR when it is there, so the configure line above needs no change
-either way. Force it with:
+front-end still parse. CMake looks for `libMLIRCIR.a` in `LLVM_LIBRARY_DIR` and
+links CIR when it is there, so the configure line above needs no change either
+way. The configure output says which way it went:
+
+```
+-- mlir-opt-omp: CIR support ON
+```
+
+Force it either way with `-DOMP_LOWER_ENABLE_CIR=ON|OFF`:
 
 ```sh
-cmake .. -DMLIR_DIR=<LLVM_INSTALL_DIR>/lib/cmake/mlir -DOMP_LOWER_ENABLE_CIR=OFF
+cmake -S . -B build -G Ninja -DMLIR_DIR=<LLVM_DIR>/lib/cmake/mlir \
+  -DOMP_LOWER_ENABLE_CIR=OFF
 ```
+
+> Auto-detection only picks the **default**. CMake caches the option, so a
+> directory first configured when CIR was not detectable keeps it off even
+> after the LLVM install is fixed. Reconfigure with an explicit
+> `-DOMP_LOWER_ENABLE_CIR=ON`, or configure into a clean directory.
 
 Such a build lowers hand-written or Flang-produced MLIR exactly like the full
 one. To try it: `quick-compile/compile-from-mlir.sh` takes a small OpenMP kernel
@@ -176,7 +193,7 @@ No C compiler or OpenMP runtime involved, so they are fast and are the place to
 lock in behaviour for every new feature:
 
 ```sh
-cmake --build BUILD --target check-omp
+cmake --build build --target check-omp
 ```
 
 **Integration tests** run the whole pipeline on PolyBench kernels and check the

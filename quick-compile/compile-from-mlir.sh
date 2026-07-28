@@ -14,10 +14,10 @@
 #
 # Tool locations come from <repo>/local.env — the same file the Integration
 # tests read. Without it the tools are taken from PATH, and mlir-opt-omp from
-# ../BUILD.
+# ../build.
 cd "$(dirname "$0")" || exit 1
 OMP_REPO_ROOT="$(cd .. && pwd)"
-OMP_DEFAULT_TOOL_BIN="$OMP_REPO_ROOT/BUILD"
+OMP_DEFAULT_TOOL_BIN="$OMP_REPO_ROOT/build"
 # shellcheck source=../scripts/load-local-env.sh
 . "$OMP_REPO_ROOT/scripts/load-local-env.sh"
 

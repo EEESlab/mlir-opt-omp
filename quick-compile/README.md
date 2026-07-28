@@ -46,7 +46,7 @@ clangir-enabled `clang` and `cir-opt`. The scripts locate them through
 [`local.env`](../local.env.example) at the repo root — the same file the
 Integration tests use — and report at startup anything that is missing or
 points at the wrong place. Without a `local.env` they fall back to whatever is
-on `PATH`, with `mlir-opt-omp` taken from `../BUILD/`.
+on `PATH`, with `mlir-opt-omp` taken from `../build/`.
 
 For the pulp flow, `local.env` also supplies `PULP_LLC` and `PULP_SDK_ENV`,
 which `run.sh` sources for you.
