@@ -1,18 +1,29 @@
 #!/bin/bash
 # Quick pipeline check (iomp): test.c -> CIR -> mlir-opt-omp -> binary,
-# plus a stock-compiler reference (test-ref). Run from this directory.
-rm -f *.o *.ll *.cir *.mlir test test-ref
+# plus a stock-compiler reference (test-ref).
+#
+# Tool locations come from <repo>/local.env — the same file the Integration
+# tests read. Without it the tools are taken from PATH, and mlir-opt-omp from
+# ../BUILD.
+cd "$(dirname "$0")" || exit 1
+OMP_REPO_ROOT="$(cd .. && pwd)"
+OMP_DEFAULT_TOOL_BIN="$OMP_REPO_ROOT/BUILD"
+# shellcheck source=../scripts/load-local-env.sh
+. "$OMP_REPO_ROOT/scripts/load-local-env.sh"
 
-clang -S -Xclang -fclangir -Xclang -emit-cir -fopenmp -I/usr/lib/gcc/x86_64-linux-gnu/12/include test.c -o test.cir
-cir-opt test.cir --cir-to-llvm --reconcile-unrealized-casts -o test-s1.mlir
+# Narrow on purpose: test.mlir is a checked-in source, not an artefact.
+rm -f ./*.o ./*.ll ./*.cir test-s*.mlir test test-ref
+
+"$CLANG" -S -Xclang -fclangir -Xclang -emit-cir -fopenmp -I"$INC_OMP" test.c -o test.cir
+"$CIR_OPT" test.cir --cir-to-llvm --reconcile-unrealized-casts -o test-s1.mlir
 sed -i -E 's/cir\.[^,}]+,? ?//g' test-s1.mlir
-../BUILD/mlir-opt-omp --allow-unregistered-dialect --omp-lower-dsl=../rules.dsl --omp-lower-runtime=iomp --omp-to-omp-lower --omp-outline --omp-lower-plan test-s1.mlir > test-s2.mlir
-mlir-opt test-s2.mlir --canonicalize --cse --sccp --symbol-dce --loop-invariant-code-motion --canonicalize --cse --convert-arith-to-llvm --convert-func-to-llvm --reconcile-unrealized-casts -o test-s3.mlir
-mlir-translate test-s3.mlir --mlir-to-llvmir > test-s4.ll
-opt -O3 test-s4.ll -S -o test-s4.opt.ll
-llc -relocation-model=pic -filetype=obj test-s4.opt.ll -o test.o
-clang -O3 -c main.c -o main.o
-clang -O3 -fopenmp test.o main.o -o test
+"$MLIR_OPT_OMP" --allow-unregistered-dialect --omp-lower-dsl="$RULES" --omp-lower-runtime=iomp --omp-to-omp-lower --omp-outline --omp-lower-plan test-s1.mlir > test-s2.mlir
+"$MLIR_OPT" test-s2.mlir --canonicalize --cse --sccp --symbol-dce --loop-invariant-code-motion --canonicalize --cse --convert-arith-to-llvm --convert-func-to-llvm --reconcile-unrealized-casts -o test-s3.mlir
+"$MLIR_TRANSLATE" test-s3.mlir --mlir-to-llvmir > test-s4.ll
+"$OPT" -O3 test-s4.ll -S -o test-s4.opt.ll
+"$LLC" -relocation-model=pic -filetype=obj test-s4.opt.ll -o test.o
+"$CLANG" -O3 -c main.c -o main.o
+"$CLANG" -O3 -fopenmp test.o main.o -o test
 
 # Reference
-clang -O3 -fopenmp -I/usr/lib/gcc/x86_64-linux-gnu/12/include test.c main.c -o test-ref
+"$CLANG" -O3 -fopenmp -I"$INC_OMP" test.c main.c -o test-ref

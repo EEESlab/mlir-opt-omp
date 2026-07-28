@@ -29,7 +29,7 @@
 # the CSV. Only runs on machines with the GAP SDK + gvsoc installed.
 #
 # All shared setup (config, tools, kernel lists, the compile pipeline) lives in
-# common.sh — same config.env as run_correctness.sh.
+# common.sh — same run.env as run_correctness.sh.
 #
 # Usage:
 #   ./run_performance.sh                              # all kernels, defaults
@@ -57,14 +57,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Perf wants a real workload by default; MINI is dominated by thread-spawn cost.
-# DATASET / config.env still override this (see common.sh).
+# DATASET / run.env still override this (see common.sh).
 DATASET_DEFAULT="LARGE_DATASET"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 # --- Performance-specific config -------------------------------------------
 THREADS="${THREADS:-16}"             # thread count for the parallel cells
-REPS="${REPS:-5}"                    # timed runs per cell (>=3; min+max dropped)
+REPS="${REPS:-10}"                    # timed runs per cell (>=3; min+max dropped)
 VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
 # Results are split per runtime — results/<runtime>/... — so an iomp run only
 # replaces a previous iomp run, never a libgomp/pmsis one.

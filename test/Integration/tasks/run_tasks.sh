@@ -20,7 +20,7 @@
 # visible after the parallel region's implicit barrier).  For [2] the ref and
 # opt outputs must also match.
 #
-# Tool locations come from ../lib/common.sh (config.env / env vars).  libgomp only.
+# Tool locations come from ../lib/common.sh (run.env / env vars).  libgomp only.
 #
 # Usage:
 #   ./run_tasks.sh

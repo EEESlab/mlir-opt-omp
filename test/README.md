@@ -70,7 +70,7 @@ runtime. Three drivers share one compile pipeline (`Integration/lib/common.sh`):
 - `tasks/run_tasks.sh` smoke-tests the `omp.task` lowering (libgomp): a hand-written
   MLIR case and a C case, both run and diffed against a reference.
 
-Fully parametrized via env vars / `config.env` — see [`Integration/README.md`](Integration/README.md).
+Fully parametrized via env vars / `run.env` — see [`Integration/README.md`](Integration/README.md).
 
 These depend on the full toolchain (clang/clangir, cir-opt, mlir tools, the
 OpenMP runtime libraries) and a PolyBench checkout, so they are slower and

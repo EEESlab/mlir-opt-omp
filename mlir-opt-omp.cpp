@@ -13,14 +13,21 @@
 //     --omp-lower-runtime=iomp \
 //     --omp-to-omp-lower \
 //     --omp-lower-plan \
-//     -o out.mlir in.cir
+//     -o out.mlir in.mlir
 
 #include "OmpLoweringOps.h"
 #include "OmpOutliningPass.h"
 #include "OmpToOmpLowerPass.h"
 #include "PlanLoweringPass.h"
 
+// CIR is optional: the passes below never look at cir.* operations, the dialect
+// is registered only so modules coming straight from the C front-end still
+// parse. Configure with -DOMP_LOWER_ENABLE_CIR=OFF to build against a stock
+// LLVM/MLIR and feed the tool MLIR that carries no cir.*.
+#ifdef OMP_LOWER_HAS_CIR
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
+#endif
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -73,13 +80,15 @@ int main(int argc, char **argv) {
 
   mlir::DialectRegistry registry;
   registry.insert<
-    cir::CIRDialect,
     mlir::arith::ArithDialect,
     mlir::func::FuncDialect,
     mlir::LLVM::LLVMDialect,
     mlir::omp::OpenMPDialect,
     mlir::omp_lower::OmpLoweringDialect
   >();
+#ifdef OMP_LOWER_HAS_CIR
+  registry.insert<cir::CIRDialect>();
+#endif
 
   mlir::registerTransformsPasses();
 

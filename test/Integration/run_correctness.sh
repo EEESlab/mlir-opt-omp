@@ -3,14 +3,14 @@
 # run_correctness.sh — MLIR OpenMP end-to-end correctness check
 #
 # Compiles each PolyBench kernel two ways and diffs the dumped arrays:
-#   ref  — a stock OpenMP compiler (clang for iomp, gcc for libgomp; for
+#   ref  — traditional OpenMP compiler (clang for iomp, gcc for libgomp; for
 #          pmsis the PULP-SDK gcc via 'make OMP_NATIVE=1')
 #   opt  — the CIR/MLIR pipeline through mlir-opt-omp (selected runtime)
 #
 # For RUNTIME=pmsis both sides are built and executed on the gvsoc simulator
 # through the PolyBench-PULP harness Makefile (PULP_APP_DIR), and the array
 # dumps are extracted from the gvsoc console log. Only runs on machines with
-# the GAP SDK + gvsoc installed — see config.env.pulp-*.example.
+# the GAP SDK + gvsoc installed — see the PULP section of README.md.
 #
 # A kernel PASSes when the two array dumps are bit-identical. Strict FP flags
 # (-ffp-contract=off + no auto-vectorisation, set in common.sh) are required for
@@ -19,8 +19,8 @@
 # IEEE-correct.
 #
 # All shared setup (config, tools, kernel lists, the compile pipeline) lives in
-# common.sh. Everything is configurable via environment variables / config.env
-# (see config.env.example). Nothing is hard-coded to a particular machine.
+# common.sh. Everything is configurable via environment variables / run.env
+# (see README.md, "Configuration reference"). 
 #
 # Usage:
 #   ./run_correctness.sh                 # all kernels, defaults
