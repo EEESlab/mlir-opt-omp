@@ -17,8 +17,8 @@ config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
 # suffixes: a regression test is a .mlir file with RUN/CHECK annotations.
 config.suffixes = [".mlir"]
 
-# test_source_root: the directory holding this config (the `test/` dir).
-config.test_source_root = os.path.dirname(__file__)
+# test_source_root: Regression/, the only directory holding lit tests.
+config.test_source_root = os.path.join(os.path.dirname(__file__), "Regression")
 
 # test_exec_root: where tests run (inside the build tree).
 config.test_exec_root = os.path.join(config.omp_lower_obj_root, "test")
@@ -46,5 +46,5 @@ llvm_config.add_tool_substitutions(tools, tool_dirs)
 # %rules_dsl expands to the runtime DSL shipped in the repo root, so tests
 # exercise the same rules.dsl that ships with the tool.
 config.substitutions.append(
-    ("%rules_dsl", os.path.join(config.test_source_root, "..", "rules.dsl"))
+    ("%rules_dsl", os.path.join(config.test_source_root, "..", "..", "rules.dsl"))
 )

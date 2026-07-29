@@ -6,7 +6,7 @@ scripts from this directory.
 
 **From MLIR** (`compile-from-mlir.sh`) — just the three passes plus the standard
 LLVM tail. The input is already what `mlir-opt-omp` consumes, so this needs
-**no ClangIR and no `cir-opt`**: a stock LLVM/MLIR install and a built
+**no ClangIR and no `cir-opt`**: LLVM/MLIR 23  and a built
 `mlir-opt-omp` are enough. It ends by checking the output itself, so a bare
 `./compile-from-mlir.sh` is a yes/no answer on whether your build lowers
 correctly.
