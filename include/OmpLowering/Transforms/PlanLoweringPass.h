@@ -5,7 +5,7 @@
 // runtime library (iomp or libgomp) described in the plan attributes.
 //
 // Registration:
-//   #include "PlanLoweringPass.h"
+//   #include "OmpLowering/Transforms/PlanLoweringPass.h"
 //   mlir::registerPlanLoweringPass();  // or add to a PassPipeline
 //
 // Usage in a pass pipeline string:

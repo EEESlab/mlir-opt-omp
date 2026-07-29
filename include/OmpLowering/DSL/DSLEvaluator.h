@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include "DSLParser.h"
+#include "OmpLowering/DSL/DSLParser.h"
 
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"

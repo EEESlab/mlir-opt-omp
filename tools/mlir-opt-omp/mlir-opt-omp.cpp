@@ -15,10 +15,10 @@
 //     --omp-lower-plan \
 //     -o out.mlir in.mlir
 
-#include "OmpLoweringOps.h"
-#include "OmpOutliningPass.h"
-#include "OmpToOmpLowerPass.h"
-#include "PlanLoweringPass.h"
+#include "OmpLowering/IR/OmpLoweringOps.h"
+#include "OmpLowering/Transforms/OmpOutliningPass.h"
+#include "OmpLowering/Transforms/OmpToOmpLowerPass.h"
+#include "OmpLowering/Transforms/PlanLoweringPass.h"
 
 // CIR is optional: the passes below never look at cir.* operations, the dialect
 // is registered only so modules coming straight from the C front-end still

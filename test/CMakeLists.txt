@@ -3,9 +3,10 @@
 # Run with:   ninja check-omp        (from the build directory)
 # or:         llvm-lit -sv test/
 
-# The mlir-opt-omp executable is emitted in the build root (we deliberately do
-# not override LLVM_RUNTIME_OUTPUT_INTDIR, so the Integration configs that
-# point OMP_TOOL_BIN at the build directory keep working).
+# The mlir-opt-omp executable is emitted in the build root: the top-level
+# CMakeLists pins LLVM_RUNTIME_OUTPUT_INTDIR there so declaring the target
+# under tools/ does not move it, and the Integration configs that point
+# OMP_TOOL_BIN at the build directory keep working.
 set(OMP_LOWER_TOOLS_DIR ${CMAKE_BINARY_DIR})
 
 configure_lit_site_cfg(

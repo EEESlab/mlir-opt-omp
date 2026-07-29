@@ -103,14 +103,20 @@ distribution's MLIR development packages.
 
 The passes run on the `omp` and `llvm` dialects and never inspect a `cir.*`
 operation — CIR is registered only so modules straight from the C front-end
-still parse. Such a build lowers hand-written or Flang-produced MLIR exactly
-like the full one, and the whole [Quick start](#quick-start) below works on it.
+parse as CIR instead of as opaque attributes. Such a build lowers hand-written
+or Flang-produced MLIR exactly like the full one, and the whole
+[Quick start](#quick-start) below works on it.
 
-What it cannot do is read a module that still carries `cir.*` attributes:
-unregistered dialect attributes do not parse, and `--allow-unregistered-dialect`
-does not help. Modules from `cir-opt --cir-to-llvm` do keep a few, which is why
-the sample pipelines strip them with `sed` (see
-[`quick-compile/compile-iomp.sh`](quick-compile/compile-iomp.sh)).
+It also handles what `cir-opt --cir-to-llvm` actually leaves behind. That output
+keeps three module-level attributes (`cir.lang`, `cir.module_asm`, `cir.triple`)
+plus `dlti.dl_spec`, and none of those dialects has to be registered to get
+through: `--allow-unregistered-dialect` parses them as opaque attributes and
+prints them back byte-for-byte, so a CIR-less build lowers such a module to the
+same IR — `diff` of the two outputs is empty. That flag is what matters, not the
+CIR link: without it even the CIR-enabled build rejects the module, on
+`dlti.dl_spec`. The `sed` in the sample pipelines (see
+[`quick-compile/compile-iomp.sh`](quick-compile/compile-iomp.sh)) keeps the
+intermediate readable; it is not what makes the module parse.
 
 ### 2. Build mlir-opt-omp
 
@@ -300,19 +306,46 @@ configuration reference, the PULP/gvsoc target, and the reported metrics.
 
 ## Repository layout
 
-| Path | Contents |
+Headers under `include/OmpLowering/`, implementations under `lib/`, the tool
+under `tools/` — the layout of
+[`mlir/examples/standalone`](https://github.com/llvm/llvm-project/tree/main/mlir/examples/standalone),
+the out-of-tree MLIR template this project follows. Sources include their own
+headers by full path (`#include "OmpLowering/IR/OmpLoweringOps.h"`), and the
+generated `.inc` files mirror that same path inside the build tree.
+
+```
+rules.dsl                    the lowering rules for the three runtimes
+include/OmpLowering/
+  IR/                        omp_lower dialect: OmpLoweringOps.{td,h}
+  DSL/                       DSLParser.h, DSLEvaluator.h
+  Transforms/                the three pass headers
+lib/
+  DSL/                       lexer/parser + evaluator — no MLIR dependency
+  IR/                        dialect implementation
+  Transforms/                the three passes
+tools/mlir-opt-omp/          the executable: flag extraction, registration
+test/                        regression + integration suites
+docs/                        lowering specifications
+quick-compile/               one-shot pipeline scripts for a small kernel
+```
+
+| Component | Does |
 |---|---|
 | [`rules.dsl`](rules.dsl) | the lowering rules for the three runtimes |
-| `DSLParser.{h,cpp}` | lexer/parser producing the rule AST |
-| `DSLEvaluator.{h,cpp}` | evaluates rules against an op, producing a lowering plan |
-| `OmpToOmpLowerPass.cpp` | pass 1 — `omp.*` → `omp_lower.construct` |
-| `OmpOutliningPass.cpp` | pass 2 — outlining and `wsloop` lowering |
-| `PlanLoweringPass.cpp` | pass 3 — plans → runtime calls |
-| `OmpLoweringOps.td` | TableGen definition of the `omp_lower` dialect |
-| `mlir-opt-omp.cpp` | the executable: flag extraction, dialect/pass registration |
+| `lib/DSL/DSLParser.cpp` | lexer/parser producing the rule AST |
+| `lib/DSL/DSLEvaluator.cpp` | evaluates rules against an op, producing a lowering plan |
+| `lib/Transforms/OmpToOmpLowerPass.cpp` | pass 1 — `omp.*` → `omp_lower.construct` |
+| `lib/Transforms/OmpOutliningPass.cpp` | pass 2 — outlining and `wsloop` lowering |
+| `lib/Transforms/PlanLoweringPass.cpp` | pass 3 — plans → runtime calls |
+| `include/OmpLowering/IR/OmpLoweringOps.td` | TableGen definition of the `omp_lower` dialect |
+| `tools/mlir-opt-omp/mlir-opt-omp.cpp` | the executable: flag extraction, dialect/pass registration |
 | [`docs/`](docs/) | lowering specifications (`ident_t` parity, `omp.task`) |
 | [`test/`](test/README.md) | regression + integration test suites |
 | [`quick-compile/`](quick-compile/README.md) | one-shot pipeline scripts for a small kernel |
+
+The build mirrors the split into three libraries: `OmpLoweringDSL` (rule file
+front end, links only `LLVMSupport`), `MLIROmpLowering` (the dialect) and
+`MLIROmpLoweringTransforms` (the passes, where the two meet).
 
 ## Extending
 
@@ -322,7 +355,7 @@ To add a construct or a runtime, start from [`rules.dsl`](rules.dsl): each
 change there is picked up at run time — no rebuild needed — which makes it easy
 to iterate with a regression test. Constructs whose lowering needs more than the
 DSL expresses (new `emit` primitives, a different outline shape) also require
-C++ work in `OmpOutliningPass.cpp`.
+C++ work in `lib/Transforms/OmpOutliningPass.cpp`.
 
 Every new feature should come with a regression test under `test/Regression/`;
 [`test/README.md`](test/README.md) documents the format and the available lit
