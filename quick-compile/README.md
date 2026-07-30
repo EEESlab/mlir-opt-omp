@@ -1,8 +1,8 @@
 # quick-compile
 
 The place to start if you want to see the tool work on something small. Two
-entry points, depending on how much of the pipeline you care about — run the
-scripts from this directory.
+entry points, depending on how much of the pipeline you care about — the scripts
+can be called from anywhere and leave their output in this directory.
 
 **From MLIR** (`compile-from-mlir.sh`) — just the three passes plus the standard
 LLVM tail. The input is already what `mlir-opt-omp` consumes, so this needs

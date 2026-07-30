@@ -1,25 +1,23 @@
 # mlir-opt-omp
 
 A custom [`mlir-opt`](https://mlir.llvm.org/docs/Tutorials/MlirOpt/) that lowers
-the MLIR **OpenMP dialect** (`omp.*`) into calls to an OpenMP runtime
-library, driven by a **declarative rule file**, called [`rules.dsl`](rules.dsl) describing the ABI of the supported runtimes (which function to call, in what order, with which
-arguments, how captured variables are passed).
+the MLIR **OpenMP dialect** (`omp.*`) into calls to an OpenMP runtime library,
+driven by a **declarative rule file**, [`rules.dsl`](rules.dsl), describing the
+ABI of each runtime: which function to call, in what order, with which
+arguments, and how captured variables are passed.
 
-Adding support for a new runtime, or changing how an
-existing construct is emitted, normally means editing that file, not the
-compiler. This makes the tool useful for targeting non-standard runtimes, in
-particular embedded ones: alongside the two host runtimes it can lower OpenMP
-onto the **PMSIS** cluster API of PULP/GAP8 microcontrollers.
+Adding a runtime, or changing how a construct is emitted, means editing that
+file rather than the compiler. That makes the tool practical for non-standard
+runtimes, embedded ones in particular: alongside the two host runtimes it lowers
+OpenMP onto the **PMSIS** cluster API of PULP/GAP8 microcontrollers.
 
-Input is MLIR holding `omp.*` operations in the `llvm`
-dialect. 
-This state is reached from C by the ClangIR front-end (`clang -fclangir -emit-cir` →
-`cir-opt --cir-to-llvm`), which is the path this repository is built and tested
-around, but nothing in the passes is tied to it: hand-written MLIR works just
-as well, and so does any other front-end that gets there (Flang after the
-FIR→LLVM conversion, for instance). Output is MLIR in which the OpenMP
-constructs have become plain `func.call` / `llvm.call` operations, ready for
-`mlir-translate` and the usual LLVM back-end.
+Input is MLIR holding `omp.*` operations in the `llvm` dialect, as produced from C
+by the ClangIR front-end (`clang -fclangir -emit-cir` → `cir-opt --cir-to-llvm`).
+That is the path this repository is tested around, but nothing
+in the passes is tied to it: hand-written MLIR works as well, and so does any
+other front-end that gets there (Flang after FIR→LLVM, for instance). Output is
+MLIR where the OpenMP constructs have become plain `func.call` / `llvm.call`,
+ready for `mlir-translate` and the LLVM back-end.
 
 ## Supported runtimes and constructs
 
@@ -30,32 +28,22 @@ constructs have become plain `func.call` / `llvm.call` operations, ready for
 | `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds | ✅ computed thread bounds |
 | `omp.task` | ⏳ planned | ✅ `GOMP_task` | ⏳ API to be defined |
 
-The two capture strategies differ per runtime: `iomp` passes captured variables
-as individual pointer arguments to the microtask (`by_pointer`), while
-`libgomp` and `pmsis` pack them into an environment struct passed as a single
-closure argument (`packed`). See [`docs/`](docs/) for the detailed lowering
-specifications.
 
 ## Build instructions
 
 ### Requirements
 
-- **CMake** ≥ 3.20 and a **C++17** compiler.
-- An **LLVM/MLIR 23** build (currently `main`) — see step 1 for the two ways to
-  get one. LLVM 22 and earlier do not compile the passes: they read the
-  *variadic* `num_threads` of `omp.parallel` (`getNumThreadsDimsCount()`,
-  `getNumThreads(0)`), which upstream added on 2026-01-27 in
-  [#171767](https://github.com/llvm/llvm-project/pull/171767) — two weeks after
-  the LLVM 22 branch point.
-- To run the end-to-end tests is required a traditional OpenMP compiler (clang for
-  `iomp`, gcc for `libgomp`) and, for `pmsis`, the GAP SDK with the **gvsoc**
-  simulator.
+- **CMake** ≥ 3.20 and a **C++17** compiler. The commands below pass
+  `-G Ninja`, the usual choice for LLVM, but any generator works.
+- An **LLVM/MLIR 23** build (currently `main`). See Step 1 for more details.
+- The end-to-end tests also need a standard OpenMP compiler (clang for `iomp`,
+  gcc for `libgomp`) and, for `pmsis`, the GAP SDK with the **gvsoc** simulator.
 
 ### 1. Get an LLVM/MLIR build
 
-Which one you need depends on whether you want to compile **from C** or to use a `.mlir` file as input directly. 
+Which one you need depends on whether you want to compile **from C** or to use a `.mlir` file as input.
 
-#### Option 1: LLVM with ClangIR - lowering from C
+#### Option 1: With ClangIR for lowering from C
 
 ClangIR is the front-end that turns C into the MLIR this tool consumes, and the
 OpenMP part of it is not upstream yet: upstream ClangIR emits `omp.parallel`
@@ -65,58 +53,43 @@ and `omp.barrier`, while `#pragma omp for`, `parallel for` and `task` still hit
 ```sh
 git clone -b users/lucap/cir-omp-clauses \
   https://github.com/EEESlab/llvm-project.git
+git -C llvm-project checkout 9be70f177d9b     # last known-good, see below
 ```
 
-and build it with CIR enabled:
+and build it with CIR enabled — the paths below are relative to the directory
+holding the clone:
 
 ```sh
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=OFF \
-  -DCMAKE_INSTALL_PREFIX="<LLVM_INSTALL_DIR>" \
+cmake -S llvm-project/llvm -B llvm-project/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=OFF \
   -DLLVM_ENABLE_PROJECTS="clang;mlir;lld" -DCLANG_ENABLE_CIR=ON \
   -DLLVM_TARGETS_TO_BUILD="X86;RISCV" \
   -DLLVM_DEFAULT_TARGET_TRIPLE="x86_64-unknown-linux-gnu" \
   -DLLVM_OPTIMIZED_TABLEGEN=ON -DLLVM_BUILD_TESTS=ON -DLLVM_INSTALL_UTILS=ON \
   -DLLVM_USE_LINKER=lld -DLLVM_PARALLEL_LINK_JOBS=1 \
   -DBUILD_SHARED_LIBS=OFF -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON \
-  -DMLIR_BUILD_MLIR_C_DYLIB=ON \
-  <LLVM_SRC_DIR>/llvm-project/llvm
-ninja
+  -DMLIR_BUILD_MLIR_C_DYLIB=ON
+cmake --build llvm-project/build
 ```
 
 Notes:
 
-- Last known-good commit: `9be70f177d9b` (`clang --version` reports
-  `23.0.0git … EEESlab/llvm-project`), which is what the C pipelines below are
-  tested against.
+- `9be70f177d9b` is the commit the C pipelines below are tested against
+  (`clang --version` then reports `23.0.0git … EEESlab/llvm-project`). Skip the
+  `git checkout` to take the branch tip instead.
 - `RISCV` in `LLVM_TARGETS_TO_BUILD` is only needed for the PULP/`pmsis` target.
-- `LLVM_INSTALL_UTILS=ON` matters for the test suite — it provides `FileCheck`
-  and `llvm-lit`.
-- `ninja install` is optional. The build tree works as-is (see step 2), which is
-  the common case since ClangIR is often built and never installed.
+- `LLVM_INSTALL_UTILS=ON` installs `FileCheck`, for Regression tests.
+- No install step is needed: step 2 works against this build tree as it is. Add
+  `-DCMAKE_INSTALL_PREFIX=<prefix>` above if you do want to install it.
 
-#### Option 2: LLVM/MLIR — MLIR input only
+#### Option 2: MLIR input only
 
-Any LLVM/MLIR 23 build or install works: the same command as above without
-`-DCLANG_ENABLE_CIR=ON` (and with `mlir` alone in `LLVM_ENABLE_PROJECTS`, since
-clang is only there for the C front-end), or — once 23 is released — your
-distribution's MLIR development packages.
+Any LLVM/MLIR 23 build or install works — the passes run on the `omp` and `llvm`
+dialects.
 
-The passes run on the `omp` and `llvm` dialects and never inspect a `cir.*`
-operation — CIR is registered only so modules straight from the C front-end
-parse as CIR instead of as opaque attributes. Such a build lowers hand-written
-or Flang-produced MLIR exactly like the full one, and the whole
-[Quick start](#quick-start) below works on it.
+An install has to have been configured with `-DLLVM_INSTALL_UTILS=ON`, though:
+without it there is no `FileCheck`, and the regression suite cannot run.
 
-It also handles what `cir-opt --cir-to-llvm` actually leaves behind. That output
-keeps three module-level attributes (`cir.lang`, `cir.module_asm`, `cir.triple`)
-plus `dlti.dl_spec`, and none of those dialects has to be registered to get
-through: `--allow-unregistered-dialect` parses them as opaque attributes and
-prints them back byte-for-byte, so a CIR-less build lowers such a module to the
-same IR — `diff` of the two outputs is empty. That flag is what matters, not the
-CIR link: without it even the CIR-enabled build rejects the module, on
-`dlti.dl_spec`. The `sed` in the sample pipelines (see
-[`quick-compile/compile-iomp.sh`](quick-compile/compile-iomp.sh)) keeps the
-intermediate readable; it is not what makes the module parse.
 
 ### 2. Build mlir-opt-omp
 
@@ -125,27 +98,21 @@ cmake -S . -B build -G Ninja -DMLIR_DIR=<LLVM_DIR>/lib/cmake/mlir
 cmake --build build
 ```
 
-`<LLVM_DIR>` can be either an LLVM **install** prefix or an LLVM **build tree**;
-everything resolves through `LLVM_LIBRARY_DIR`, so both work unchanged.
+`<LLVM_DIR>` is the **build tree** from step 1 — `<…>/llvm-project/build` — or an
+LLVM **install** prefix, if you installed it. Everything resolves through
+`LLVM_LIBRARY_DIR`, so both work unchanged.
 
 Keep the build directory named `build`: it is what `local.env.example` and the
 setups in [`docs/setups/`](docs/setups/) use for `OMP_TOOL_BIN`, and what the
 `quick-compile/` scripts fall back to.
 
-CMake decides whether to link ClangIR by looking for `libMLIRCIR.a` in
-`LLVM_LIBRARY_DIR`, so neither option above needs a different configure line.
-The output says which way it went:
+If `<LLVM_DIR>` is an install prefix and its build tree is gone, CMake warns
+here that it found no `lit` and the regression suite will not run. Either
+install one (`pipx install lit`, or `pip install --user lit`) — any `lit` on
+`PATH` is picked up automatically — or add
+`-DLLVM_EXTERNAL_LIT=<llvm-build-tree>/bin/llvm-lit` to the line above. Both are
+read at configure time, so re-run `cmake -S . -B build` after either.
 
-```
--- mlir-opt-omp: CIR support ON
-```
-
-Force it either way with `-DOMP_LOWER_ENABLE_CIR=ON|OFF`.
-
-> Auto-detection only picks the **default**. CMake caches the option, so a
-> directory first configured when CIR was not detectable keeps it off even
-> after the LLVM build is fixed. Reconfigure with an explicit
-> `-DOMP_LOWER_ENABLE_CIR=ON`, or configure into a clean directory.
 
 ## Quick start
 
@@ -160,7 +127,7 @@ cmake --build build --target check-omp
 ```
 
 **2. Watch the rule file decide the output.** The same module, lowered for two
-different runtimes — nothing to link, nothing to install:
+different runtimes.
 
 ```sh
 build/mlir-opt-omp quick-compile/test.mlir --omp-lower-dsl=rules.dsl \
@@ -186,13 +153,14 @@ call @GOMP_barrier() : () -> ()
 call @GOMP_parallel(...)
 ```
 
-Neither shape is written in C++: both come from [`rules.dsl`](rules.dsl), and
-`--omp-lower-runtime` picks which `runtime` block to read.
 
-**3. Run a real binary.** Takes the same MLIR to a linked executable and checks
-the numbers it prints (needs `gcc` and `libgomp`):
+**3. Run binary.** Takes the same MLIR to a linked executable and checks the
+numbers it prints. Besides `gcc` and `libgomp` it drives `mlir-opt`,
+`mlir-translate`, `opt` and `llc`, which it locates through `local.env` — so
+either copy the template first or have them on `PATH`:
 
 ```sh
+cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN
 quick-compile/compile-from-mlir.sh
 ```
 
@@ -212,10 +180,8 @@ Beyond the standard `mlir-opt` options, the tool adds two flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--omp-lower-dsl=<file>` | `rules.dsl` | the rule file describing the runtimes |
-| `--omp-lower-runtime=<name>` | `iomp` | which `runtime` block of that file to use |
+| `--omp-lower-runtime=<name>` | `iomp` | the `runtime` to target with the lowering |
 
-Both are consumed before `MlirOptMain` parses the command line, so they must be
-passed as `--flag=value` (not as two separate arguments).
 
 The lowering runs as three passes, in this order:
 
@@ -268,8 +234,7 @@ clang -O3 -fopenmp test.o main.o -o test
 ```
 
 Runnable versions of this, per runtime, are in
-[`quick-compile/`](quick-compile/README.md) — the fastest way to try the tool on
-a small kernel.
+[`quick-compile/`](quick-compile/README.md)
 
 ## Testing
 
@@ -309,9 +274,9 @@ configuration reference, the PULP/gvsoc target, and the reported metrics.
 Headers under `include/OmpLowering/`, implementations under `lib/`, the tool
 under `tools/` — the layout of
 [`mlir/examples/standalone`](https://github.com/llvm/llvm-project/tree/main/mlir/examples/standalone),
-the out-of-tree MLIR template this project follows. Sources include their own
-headers by full path (`#include "OmpLowering/IR/OmpLoweringOps.h"`), and the
-generated `.inc` files mirror that same path inside the build tree.
+the out-of-tree MLIR template this project follows. Headers are included by full
+path (`#include "OmpLowering/IR/OmpLoweringOps.h"`), and the generated `.inc`
+files mirror that same path inside the build tree.
 
 ```
 rules.dsl                    the lowering rules for the three runtimes
@@ -325,26 +290,28 @@ lib/
   Transforms/                the three passes
 tools/mlir-opt-omp/          the executable: flag extraction, registration
 test/                        regression + integration suites
-docs/                        lowering specifications
+docs/
+  lowering-specs/            lowering specifications (ident_t parity, omp.task)
+  setups/                    ready-made local.env files, per dev machine
 quick-compile/               one-shot pipeline scripts for a small kernel
+scripts/                     load-local-env.sh — the tool-path resolution the
+                             test drivers and quick-compile/ share
 ```
 
-| Component | Does |
+The sources behind it:
+
+| File | Does |
 |---|---|
-| [`rules.dsl`](rules.dsl) | the lowering rules for the three runtimes |
 | `lib/DSL/DSLParser.cpp` | lexer/parser producing the rule AST |
 | `lib/DSL/DSLEvaluator.cpp` | evaluates rules against an op, producing a lowering plan |
 | `lib/Transforms/OmpToOmpLowerPass.cpp` | pass 1 — `omp.*` → `omp_lower.construct` |
 | `lib/Transforms/OmpOutliningPass.cpp` | pass 2 — outlining and `wsloop` lowering |
 | `lib/Transforms/PlanLoweringPass.cpp` | pass 3 — plans → runtime calls |
 | `include/OmpLowering/IR/OmpLoweringOps.td` | TableGen definition of the `omp_lower` dialect |
-| `tools/mlir-opt-omp/mlir-opt-omp.cpp` | the executable: flag extraction, dialect/pass registration |
-| [`docs/`](docs/) | lowering specifications (`ident_t` parity, `omp.task`) |
-| [`test/`](test/README.md) | regression + integration test suites |
-| [`quick-compile/`](quick-compile/README.md) | one-shot pipeline scripts for a small kernel |
+| `tools/mlir-opt-omp/mlir-opt-omp.cpp` | flag extraction, dialect/pass registration |
 
-The build mirrors the split into three libraries: `OmpLoweringDSL` (rule file
-front end, links only `LLVMSupport`), `MLIROmpLowering` (the dialect) and
+They build into three libraries: `OmpLoweringDSL` (rule file front end, links
+only `LLVMSupport`), `MLIROmpLowering` (the dialect) and
 `MLIROmpLoweringTransforms` (the passes, where the two meet).
 
 ## Extending

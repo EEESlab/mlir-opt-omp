@@ -1,12 +1,7 @@
     runtime iomp {
-      // Chunk size for the static work-sharing schedule; flows into the final
-      // `chunk` argument of __kmpc_for_static_init_4 (wsloop construct).
       let default_chunk = 1;
 
       construct parallel {
-        // ABI tag, matched head-only (.find("microtask")).  The args
-        // (ptr_tid, ptr_btid, captures) were decorative so they are dropped;
-        // the actual microtask shape is built in C++ (see outlineConstruct).
         outline_signature = microtask();
         capture_strategy = "by_pointer";
 
@@ -46,7 +41,7 @@
 
 runtime libgomp {
   construct parallel {
-    outline_signature = closure();   // ABI tag, head-only matched; env_ptr is kept (used by the invoke), just not as a decorative signature arg
+    outline_signature = closure();
     capture_strategy = "packed";
     pre {}
     invoke {
@@ -73,7 +68,7 @@ runtime libgomp {
     }
   }
   construct task {
-    outline_signature = closure();   // ABI tag, head-only matched; env_ptr is kept (used by the invoke), just not as a decorative signature arg
+    outline_signature = closure();  
     capture_strategy  = "packed";
     invoke {
       when has(if_clause) =>
@@ -91,7 +86,7 @@ runtime libgomp {
 
 runtime pmsis {
   construct parallel {
-    outline_signature = closure();   // ABI tag, head-only matched; env_ptr is kept (used by the invoke), just not as a decorative signature arg
+    outline_signature = closure();
     capture_strategy = "packed";
     pre {}
     invoke {

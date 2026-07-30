@@ -58,6 +58,20 @@ __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose on
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
 SUITE="${SUITE:-bundled}"            # bundled | full
 
+# PolyBench silently maps an unknown name to LARGE_DATASET — on GAP8 that dies
+# in pi_l2_malloc — and setting DATASET at all disables the pmsis guard below.
+case "$DATASET" in
+    MINI_DATASET|SMALL_DATASET|MEDIUM_DATASET|LARGE_DATASET|EXTRALARGE_DATASET) ;;
+    *)
+        echo "ERROR: DATASET='$DATASET' is not a PolyBench dataset macro." >&2
+        echo "       Use the full name: MINI_DATASET, SMALL_DATASET," >&2
+        echo "       MEDIUM_DATASET, LARGE_DATASET or EXTRALARGE_DATASET." >&2
+        echo "       Leave it unset to take the per-driver default" >&2
+        echo "       (MINI_DATASET, forced on pmsis)." >&2
+        exit 2
+        ;;
+esac
+
 export OMP_PLACES="${OMP_PLACES:-cores}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 

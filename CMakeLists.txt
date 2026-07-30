@@ -9,42 +9,33 @@ include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
 
-# Default options passed to `lit` by the check-omp target.
+# Options passed to lit by the check-omp target.
 set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
 
-# Put the executable in the build root even though it is declared under
-# tools/. The Integration configs point OMP_TOOL_BIN at the build directory
-# and the quick-compile/ scripts fall back to <repo>/build, so the binary has
-# to stay where it has always been.
+# The binary goes in the build root, not build/bin: that is where OMP_TOOL_BIN
+# and the quick-compile/ scripts look for it.
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR})
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
 
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${LLVM_INCLUDE_DIRS})
-# Sources include their own headers by full path ("OmpLowering/IR/...").
-# The binary tree is on the path too: TableGen writes the generated .inc files
-# to <build>/include/OmpLowering/IR/, so they are reached the same way.
+# Headers are included by full path ("OmpLowering/IR/..."); the binary tree is
+# on the path too, since TableGen writes its .inc files under the same subpath.
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 
 # ---------------------------------------------------------------------------
 # Optional CIR support
 # ---------------------------------------------------------------------------
-# The passes never look at CIR operations: they run on omp + llvm dialect IR.
-# CIR is linked in only so the tool can parse modules that still carry cir.*,
-# i.e. the C front-end path. Against a stock LLVM/MLIR install the option turns
-# itself off and the tool still builds, for hand-written or Flang-produced MLIR.
+# The passes run on omp + llvm dialect IR; CIR is linked in only so the tool
+# can parse modules that still carry cir.*, i.e. the C front-end path. Without
+# it the tool still builds, for hand-written or Flang-produced MLIR.
 #
-# Probe LLVM_LIBRARY_DIR, not LLVM_INSTALL_PREFIX: the latter is the install
-# prefix, which is unset when MLIR_DIR points at an LLVM *build tree* — the
-# usual ClangIR setup, since CIR is often built but never installed. The former
-# is set correctly by LLVMConfig.cmake for both build trees and installs.
+# Probe LLVM_LIBRARY_DIR rather than LLVM_INSTALL_PREFIX: the latter is unset
+# when MLIR_DIR points at an LLVM build tree, the usual ClangIR setup.
 #
-# Note this only picks the *default*. option() honours a cached value, so a
-# build directory configured while CIR was undetectable keeps it off; force it
-# with -DOMP_LOWER_ENABLE_CIR=ON or configure into a clean directory.
-#
-# The link itself happens in tools/mlir-opt-omp/, the only target that needs it.
+# This only picks the default; option() honours the cache, so a build directory
+# configured before CIR existed keeps it off until -DOMP_LOWER_ENABLE_CIR=ON.
 if(EXISTS "${LLVM_LIBRARY_DIR}/libMLIRCIR.a")
   set(OMP_LOWER_CIR_DEFAULT ON)
 else()
@@ -63,8 +54,6 @@ endif()
 # ---------------------------------------------------------------------------
 # Subdirectories
 # ---------------------------------------------------------------------------
-# include/ only runs TableGen; the libraries live in lib/, the executable in
-# tools/, the lit suite in test/.
 add_subdirectory(include/OmpLowering)
 add_subdirectory(lib)
 add_subdirectory(tools)
