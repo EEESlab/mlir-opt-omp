@@ -108,7 +108,8 @@ The entry must load `shareds` from `task_t` before unpacking captures. This does
 
 PMSIS provides the fork/barrier team model (`ext_pi_cl_team_fork`,
 `ext_pi_cl_team_barrier` — shims over the PMSIS API, see
-[`pmsis-interface-adapter.c`](pmsis-interface-adapter.c)) but **no standard
+[`quick-compile/pulp/interface-adapter.c`](../quick-compile/pulp/interface-adapter.c))
+but **no standard
 deferred-task API**. A task mapping
 must be defined explicitly (e.g. a custom `ext_pi_cl_task_push` / wait pair, or
 declaring tasks unsupported on this target). No invented API is assumed here.

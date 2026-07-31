@@ -2,8 +2,8 @@
 //
 // C++ port of evaluator.py.
 
-#include "DSLEvaluator.h"
-#include "DSLParser.h"
+#include "OmpLowering/DSL/DSLEvaluator.h"
+#include "OmpLowering/DSL/DSLParser.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"

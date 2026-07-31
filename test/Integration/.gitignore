@@ -1,8 +1,13 @@
 # Per-machine config — never commit local paths.
-config.env
+run.env
 
 # Build/run artefacts.
 results/
+
+# Intermediates the tasks driver leaves next to its test cases.
+tasks/*.ll
+tasks/*.o
+tasks/*.cir
 
 # Local python venv for the plot (see README "Speedup chart").
 .venv/

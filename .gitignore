@@ -1,0 +1,30 @@
+# Out-of-source build trees.
+BUILD/
+build/
+build-*/
+
+# In-source CMake leftovers.
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/Makefile
+compile_commands.json
+
+# Per-machine tool paths (see local.env.example).
+/local.env
+
+# Local Claude Code settings (per-developer permissions, not shared).
+.claude/settings.local.json
+
+# Editors / IDEs.
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS cruft.
+.DS_Store
+Thumbs.db
+
+# Note: build artefacts of the helper trees are ignored by their own
+# .gitignore files — quick-compile/, quick-compile/pulp/, test/Integration/.

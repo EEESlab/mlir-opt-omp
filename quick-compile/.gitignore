@@ -1,7 +1,8 @@
-# compile-*.sh build artefacts.
+# compile-*.sh build artefacts. test.mlir is a source file, not an artefact.
 *.o
 *.ll
 *.cir
 *.mlir
+!test.mlir
 test
 test-ref

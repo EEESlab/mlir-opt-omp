@@ -1,7 +1,6 @@
-/* PMSIS interface adapter — resolves the ext_pi_* shims that kernels lowered
- * with --omp-lower-runtime=pmsis call into the real PMSIS API. Copy of the
- * canonical reference in docs/pmsis-interface-adapter.c; keep the two in
- * sync. */
+/* PMSIS interface adapter.
+ * rules.dsl emits ext_pi_* calls when lowering for pmsis; this file provides
+ * those symbols at link time. */
 
 #include <pmsis.h>
 

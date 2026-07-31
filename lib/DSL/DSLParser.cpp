@@ -2,7 +2,7 @@
 //
 // C++ port of the lexer and parser from parser.py.
 
-#include "DSLParser.h"
+#include "OmpLowering/DSL/DSLParser.h"
 
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
