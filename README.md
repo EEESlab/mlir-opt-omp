@@ -14,7 +14,7 @@ OpenMP onto the **PMSIS** cluster API of PULP/GAP8 microcontrollers.
 Input is MLIR holding `omp.*` operations in the `llvm` dialect, as produced from C
 by the ClangIR front-end (`clang -fclangir -emit-cir` → `cir-opt --cir-to-llvm`).
 That is the path this repository is tested around, but nothing
-in the passes is tied to it: hand-written MLIR works as well, and so does any
+in the passes is tied to it: MLIR works as well, and so does any
 other front-end that gets there (Flang after FIR→LLVM, for instance). Output is
 MLIR where the OpenMP constructs have become plain `func.call` / `llvm.call`,
 ready for `mlir-translate` and the LLVM back-end.
@@ -35,7 +35,7 @@ ready for `mlir-translate` and the LLVM back-end.
 
 - **CMake** ≥ 3.20 and a **C++17** compiler. The commands below pass
   `-G Ninja`, the usual choice for LLVM, but any generator works.
-- An **LLVM/MLIR 23** build (currently `main`). See Step 1 for more details.
+- An **LLVM/MLIR 23** build. See Step 1 for more details.
 - The end-to-end tests also need a standard OpenMP compiler (clang for `iomp`,
   gcc for `libgomp`) and, for `pmsis`, the GAP SDK with the **gvsoc** simulator.
 
