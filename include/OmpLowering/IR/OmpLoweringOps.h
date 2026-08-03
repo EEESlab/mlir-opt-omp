@@ -22,12 +22,12 @@
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 
 // Step 1: dialect class declaration.
-#include "OmpLoweringOps.dialect.h.inc"
+#include "OmpLowering/IR/OmpLoweringOps.dialect.h.inc"
 
 // Step 2: attribute class declarations (PlanCallAttr, PlanEmitAttr).
 #define GET_ATTRDEF_CLASSES
-#include "OmpLoweringAttrs.h.inc"
+#include "OmpLowering/IR/OmpLoweringAttrs.h.inc"
 
 // Step 3: op class declarations (ConstructOp).
 #define GET_OP_CLASSES
-#include "OmpLoweringOps.h.inc"
+#include "OmpLowering/IR/OmpLoweringOps.h.inc"

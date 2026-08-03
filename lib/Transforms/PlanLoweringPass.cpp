@@ -3,8 +3,8 @@
 // Converts every omp_lower.construct op into concrete func.call operations
 // targeting the selected OpenMP runtime (iomp or libgomp).
 
-#include "PlanLoweringPass.h"
-#include "OmpLoweringOps.h"
+#include "OmpLowering/Transforms/PlanLoweringPass.h"
+#include "OmpLowering/IR/OmpLoweringOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"

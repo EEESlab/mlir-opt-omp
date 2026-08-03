@@ -20,10 +20,10 @@
 //    - Emit plan.pre (runtime init call OR `emit thread_bounds` → block chunk),
 //      then an explicit loop, then plan.post
 
-#include "OmpOutliningPass.h"
-#include "OmpLoweringOps.h"
-#include "DSLEvaluator.h"
-#include "DSLParser.h"
+#include "OmpLowering/Transforms/OmpOutliningPass.h"
+#include "OmpLowering/IR/OmpLoweringOps.h"
+#include "OmpLowering/DSL/DSLEvaluator.h"
+#include "OmpLowering/DSL/DSLParser.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"

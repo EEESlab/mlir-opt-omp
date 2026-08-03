@@ -3,7 +3,7 @@
 # common.sh — shared setup for the Integration test drivers
 # (run_correctness.sh, run_performance.sh, tasks/run_tasks.sh).
 #
-# This file holds the configuration: config.env loading, tool/path resolution
+# This file holds the configuration: run.env loading, tool/path resolution
 # and the per-runtime knobs. The rest is sourced from sibling files at the end:
 #   kernels.sh  kernel lists + selection helpers
 #   native.sh   compile_opt()/compile_ref() — the host pipelines
@@ -16,9 +16,11 @@
 # =============================================================================
 
 # COMMON_DIR is this lib/ directory; INTEGRATION_DIR is the test/Integration
-# root (config.env, the vendored kernels/ and the drivers live there).
+# root (run.env, the vendored kernels/ and the drivers live there);
+# REPO_ROOT holds local.env and rules.dsl.
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTEGRATION_DIR="$(cd "$COMMON_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$INTEGRATION_DIR/../.." && pwd)"
 
 # --- Colours ----------------------------------------------------------------
 if [ -t 1 ]; then
@@ -28,44 +30,16 @@ else
     GREEN=''; RED=''; CYAN=''; YELLOW=''; BOLD=''; RESET=''
 fi
 
-# --- Optional per-machine config -------------------------------------------
-# read from config.env
-
-if [ -f "$INTEGRATION_DIR/config.env" ]; then
-    __preset=""
-    for __v in LLVM_BIN OMP_TOOL_BIN CLANG GCC OPT LLC CIR_OPT MLIR_OPT \
-               MLIR_TRANSLATE MLIR_OPT_OMP POLYBENCH POLYBENCH_UTIL RULES \
-               INC_OMP OUTDIR RUNTIME DATASET THREADS SUITE KERNELS REPS \
-               VARIANCE_ACCEPTED PLOT PLOT_PYTHON POLYBENCH_LFLAGS CLANG_STRICT_FP GCC_STRICT_FP \
-               OMP_PLACES OMP_PROC_BIND WARN_SUPPRESS \
-               PULP_APP_DIR PULP_PLATFORM PULP_MAKE PULP_MAKE_ARGS PULP_OPT \
-               PULP_LLC PULP_OPT_FLAGS PULP_LLC_FLAGS PULP_BUILD_BIN \
-               PULP_POLYBENCH_DEFS PULP_SDK_ENV PULP_TOOLCHAIN_BIN PULP_VERBOSE; do
-        [ -n "${!__v+x}" ] && __preset="$__preset $__v=$(printf '%q' "${!__v}")"
-    done
-    # shellcheck disable=SC1091
-    set -a; . "$INTEGRATION_DIR/config.env"; set +a
-    [ -n "$__preset" ] && eval "$__preset"   # inline overrides reclaim priority
-    unset __preset __v
-fi
-
-# --- Tool locations --------------------------------------------------------
-# LLVM_BIN / OMP_TOOL_BIN, if set, are prepended to PATH so the bare tool
-# names below resolve to the right build.
-LLVM_BIN="${LLVM_BIN:-}"
-OMP_TOOL_BIN="${OMP_TOOL_BIN:-}"
-[ -n "$LLVM_BIN" ]     && PATH="$LLVM_BIN:$PATH"
-[ -n "$OMP_TOOL_BIN" ] && PATH="$OMP_TOOL_BIN:$PATH"
-export PATH
-
-CLANG="${CLANG:-clang}"
-GCC="${GCC:-gcc}"
-OPT="${OPT:-opt}"
-LLC="${LLC:-llc}"
-CIR_OPT="${CIR_OPT:-cir-opt}"
-MLIR_OPT="${MLIR_OPT:-mlir-opt}"
-MLIR_TRANSLATE="${MLIR_TRANSLATE:-mlir-translate}"
-MLIR_OPT_OMP="${MLIR_OPT_OMP:-mlir-opt-omp}"
+# --- Config ------------------------------------------------------------------
+# Two files, both optional and both git-ignored:
+#   <repo>/local.env      where the tools are — shared with quick-compile/
+#   Integration/run.env   what to run
+# The shared loader handles both, plus the tool defaults, PATH and the sanity
+# checks. run.env wins over local.env, and anything already in the environment
+# wins over both, so `RUNTIME=libgomp ./run_correctness.sh` still overrides them.
+OMP_REPO_ROOT="$REPO_ROOT"
+# shellcheck source=../../../scripts/load-local-env.sh
+. "$REPO_ROOT/scripts/load-local-env.sh" "$INTEGRATION_DIR/run.env"
 
 # --- Paths -----------------------------------------------------------------
 # Defaults to the kernels vendored in this repo, so the tests are
@@ -73,19 +47,30 @@ MLIR_OPT_OMP="${MLIR_OPT_OMP:-mlir-opt-omp}"
 # SUITE=full) to run the whole benchmark set.
 POLYBENCH="${POLYBENCH:-$INTEGRATION_DIR/kernels}"
 INC="${POLYBENCH_UTIL:-$POLYBENCH/utilities}"
-RULES="${RULES:-$INTEGRATION_DIR/../../rules.dsl}"
-# OpenMP headers used by the clang->CIR front-end. Adjust to your GCC version.
-INC_OMP="${INC_OMP:-/usr/lib/gcc/x86_64-linux-gnu/13/include}"
 # Serial OpenMP stubs, linked into the sequential builds (see compile_*).
 OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
 
 # --- Run parameters --------------------------------------------------------
 # DATASET_DEFAULT lets a driver pick its own default (e.g. LARGE for perf)
-# while still letting the user/config.env override via DATASET.
+# while still letting the user/run.env override via DATASET.
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp | pmsis (pulp/gvsoc)
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
 SUITE="${SUITE:-bundled}"            # bundled | full
+
+# PolyBench silently maps an unknown name to LARGE_DATASET — on GAP8 that dies
+# in pi_l2_malloc — and setting DATASET at all disables the pmsis guard below.
+case "$DATASET" in
+    MINI_DATASET|SMALL_DATASET|MEDIUM_DATASET|LARGE_DATASET|EXTRALARGE_DATASET) ;;
+    *)
+        echo "ERROR: DATASET='$DATASET' is not a PolyBench dataset macro." >&2
+        echo "       Use the full name: MINI_DATASET, SMALL_DATASET," >&2
+        echo "       MEDIUM_DATASET, LARGE_DATASET or EXTRALARGE_DATASET." >&2
+        echo "       Leave it unset to take the per-driver default" >&2
+        echo "       (MINI_DATASET, forced on pmsis)." >&2
+        exit 2
+        ;;
+esac
 
 export OMP_PLACES="${OMP_PLACES:-cores}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"

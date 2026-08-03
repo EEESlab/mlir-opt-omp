@@ -22,6 +22,7 @@
 # =============================================================================
 
 # --- PULP / gvsoc knobs ------------------------------------------------------
+
 # GAP RISC-V GCC toolchain used by the PULP-SDK make (prepended to PATH),
 # e.g. .../gap_riscv_toolchain_ubuntu/INSTALL/bin.
 PULP_TOOLCHAIN_BIN="${PULP_TOOLCHAIN_BIN:-}"
@@ -68,7 +69,16 @@ PULP_BUILD_BIN="${PULP_BUILD_BIN:-BUILD/GAP8_V3/GCC_RISCV_PULPOS/test}"
 # Makefile uses for the native (ref) builds, or ref/opt would not be
 # comparable: the harness defines both TIME and DUMP_ARRAYS, so we do too
 # (on gvsoc everything ends up in the same console log anyway).
-PULP_POLYBENCH_DEFS="${PULP_POLYBENCH_DEFS:--DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME}"
+#
+# DATA_TYPE_IS_FLOAT is the one that bites. The harness builds the ref for
+# GAP8's 32-bit FPU, so PolyBench's DATA_TYPE is float there; without the same
+# define here our kernel.o silently falls back to PolyBench's default, double.
+# The two then disagree in the last bits, which at the dump's "%0.2f" surfaces
+# as a handful of elements off by 0.01 while the rest match — a correctness
+# FAIL that looks like a lowering bug and is not one. It also made the opt side
+# do double-precision arithmetic the ref never paid for, so it skewed the
+# performance numbers the same way.
+PULP_POLYBENCH_DEFS="${PULP_POLYBENCH_DEFS:--DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME -DDATA_TYPE_IS_FLOAT}"
 PULP_VERBOSE="${PULP_VERBOSE:-0}"            # 1: stream make/gvsoc output
 
 # --- Helpers -----------------------------------------------------------------

@@ -4,10 +4,10 @@
 // ops by evaluating the user-provided DSL file.  Wsloops are left in place
 // (nested inside their parallel) and lowered later by OmpOutliningPass.
 
-#include "OmpToOmpLowerPass.h"
-#include "OmpLoweringOps.h"
-#include "DSLParser.h"
-#include "DSLEvaluator.h"
+#include "OmpLowering/Transforms/OmpToOmpLowerPass.h"
+#include "OmpLowering/IR/OmpLoweringOps.h"
+#include "OmpLowering/DSL/DSLParser.h"
+#include "OmpLowering/DSL/DSLEvaluator.h"
 
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Builders.h"

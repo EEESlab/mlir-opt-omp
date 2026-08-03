@@ -54,7 +54,7 @@
 # opt outputs must also match.
 #
 # Tool locations and the per-runtime knobs (REF_CC, OPT_FOPENMP,
-# OPT_EXTRA_LIBS) come from ../lib/common.sh (config.env / env vars).
+# OPT_EXTRA_LIBS) come from ../lib/common.sh (run.env / env vars).
 #
 # Usage:
 #   ./run_tasks.sh [libgomp|iomp]     # default: libgomp (or $RUNTIME if set)
