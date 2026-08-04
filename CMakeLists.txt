@@ -9,8 +9,10 @@ include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
 
-# Options passed to lit by the check-omp target.
-set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
+# Options passed to lit by the check-omp target.  --show-xfail names the
+# expected failures instead of only counting them: an XFAIL here marks a known
+# gap (see test/README.md), which is worth nothing if you cannot see which one.
+set(LLVM_LIT_ARGS "-sv --show-xfail" CACHE STRING "Default options for lit")
 
 # The binary goes in the build root, not build/bin: that is where OMP_TOOL_BIN
 # and the quick-compile/ scripts look for it.
