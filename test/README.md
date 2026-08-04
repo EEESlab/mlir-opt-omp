@@ -72,6 +72,24 @@ dropped or mislowered. Every `✗` is a latent wrong-code path:
   and is lowered as a static block distribution. iomp and libgomp guard theirs
   with `when schedule == static`, so there it fails loudly instead (`!`).
 
+### Encoding a gap
+
+A green suite must not imply a feature exists, so unimplemented behaviour is
+recorded one of two ways depending on what the tool does today:
+
+- **Rejected cleanly** — name the test `*-unsupported-*.mlir` and assert the
+  diagnostic with `-verify-diagnostics`. It passes, and what it locks in is a
+  real property: the tool refuses the input instead of mislowering it. Grep for
+  `-unsupported-` to list these.
+- **Silently wrong** — write the test against the behaviour the tool *should*
+  have and mark it `// XFAIL: *`. It fails, lit counts it under
+  `Expected Failures`, and the gap stays visible in every run. When the fix
+  lands the test XPASSes, which lit reports as a failure — that is the prompt to
+  drop the `XFAIL` line.
+
+Never delete a failing test for an unimplemented feature: an `XFAIL` is the
+record that the gap is known, a missing test is not.
+
 ### Running
 
 From the build directory:
