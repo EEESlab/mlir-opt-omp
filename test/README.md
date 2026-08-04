@@ -41,14 +41,14 @@ Clauses supported by the lowering, and whether a regression test covers them:
 |---|---|:--:|:--:|:--:|
 | `parallel` | — | ✓ | ✓ | ✓ |
 | | `if` | ✓ | ✓ | ! |
-| | `num_threads` | — | — | — |
-| | `proc_bind` | — | — | — |
+| | `num_threads` | ✓ | ✓ | ✗ |
+| | `proc_bind` | ✗ | ✗ | ✗ |
 | | `private` | — | — | — |
 | | `firstprivate` | — | — | — |
-| `wsloop` | — | ✓ | — | ✓ |
-| | `schedule(static)` | — | — | — |
-| | `schedule(dynamic)` | — | — | — |
-| | `nowait` | — | — | — |
+| `wsloop` | — | ✓ | ✓ | ✓ |
+| | `schedule(static)` | ✓ | — | — |
+| | `schedule(dynamic)` | ! | ✗ | ✗ |
+| | `nowait` | ✓ | ✓ | ✓ |
 | `barrier` | — | ✓ | ✓ | ✓ |
 | `task` | — | ✓ | ✓ | n/a |
 | | `if` | ✓ | ✓ | n/a |
@@ -56,9 +56,21 @@ Clauses supported by the lowering, and whether a regression test covers them:
 | `taskwait` | — | ✓ | ✓ | n/a |
 
 `✓` a test exists, `—` supported but untested, `n/a` the runtime has no such
-construct (`rules.dsl` declares no `task`/`taskwait` for pmsis), `!` the runtime
-does *not* support the clause and a test asserts the diagnostic rather than a
-lowering.
+construct (`rules.dsl` declares no `task`/`taskwait` for pmsis), `!` the clause
+is *not* supported and a test asserts the diagnostic rather than a lowering,
+`✗` not supported **and not diagnosed** — the clause is accepted and silently
+dropped or mislowered. Every `✗` is a latent wrong-code path:
+
+- **`proc_bind`** is declared only in the iomp DSL, and even there it is broken:
+  the clause reaches the plan as the *string* `"close"`/`"spread"`, and the
+  outlining pass resolves unknown string tokens to `llvm.mlir.undef : !llvm.ptr`
+  — so `__kmpc_push_proc_bind` is handed an undef pointer where it expects an
+  i32 enum. libgomp and pmsis never mention the clause at all.
+- **`num_threads` on pmsis** is ignored: `ext_pi_cl_team_fork` is called with a
+  team size hardcoded to 8 in `rules.dsl`.
+- **`schedule(dynamic)` on pmsis** matches the *unguarded* `construct wsloop`
+  and is lowered as a static block distribution. iomp and libgomp guard theirs
+  with `when schedule == static`, so there it fails loudly instead (`!`).
 
 ### Running
 
