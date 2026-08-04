@@ -1710,13 +1710,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         // packed `void *args` (argc <= 1), incompatible with the by_pointer
         // capture convention that passes each capture as its own vararg.
         ifClauseUsed = true;
-        Value gtidVal = gtidAtCallSite;
-        if (!gtidVal) {
-          auto gtidDecl = getOrInsertDeclWithReturn(module,
-            "__kmpc_global_thread_num", {ptrTy(ctx)}, i32Ty(ctx), builder);
-          gtidVal = func::CallOp::create(builder, loc, gtidDecl,
-            ValueRange{identVal}).getResult(0);
-        }
+        Value gtidVal = getGtid();
         auto i64t = IntegerType::get(ctx, 64);
         Value one64 = LLVM::ConstantOp::create(builder, loc, i64t,
           IntegerAttr::get(i64t, 1));
@@ -1747,7 +1741,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         auto serDecl = getOrInsertDecl(module, "__kmpc_serialized_parallel",
           {ptrTy(ctx), i32Ty(ctx)}, builder);
         func::CallOp::create(builder, loc, serDecl,
-          ValueRange{identVal, gtidVal});
+          ValueRange{getIdent(), gtidVal});
         // callArgs[3..] are exactly the capture args of the microtask.
         SmallVector<Value> directArgs{gtidAddr, btidAddr};
         for (size_t ai = 3; ai < callArgs.size(); ++ai)
@@ -1756,7 +1750,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         auto endSerDecl = getOrInsertDecl(module,
           "__kmpc_end_serialized_parallel", {ptrTy(ctx), i32Ty(ctx)}, builder);
         func::CallOp::create(builder, loc, endSerDecl,
-          ValueRange{identVal, gtidVal});
+          ValueRange{getIdent(), gtidVal});
         LLVM::BrOp::create(builder, loc, contBlock);
 
         builder.setInsertionPoint(op);
