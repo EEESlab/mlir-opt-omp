@@ -9,7 +9,7 @@
 //   KMPC                    = 0x02  = 2   -> @__omp_ident_2
 //
 // All idents share the single @__omp_src_loc_default psource (reserved_3 = 22).
-// See docs/ident-lowering-spec.md.
+// See docs/lowering-specs/ident-lowering-spec.md.
 //
 // NOTE: if omp.wsloop / omp.loop_nest syntax differs in your pinned LLVM,
 // adjust the loop below — the behaviour under test is the emitted ident

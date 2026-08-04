@@ -10,7 +10,7 @@
 // flags value (dedup by construction via lookupSymbol), and they all share a
 // single psource string @__omp_src_loc_default = ";unknown;unknown;0;0;;"
 // whose length (NUL excluded) is stored in reserved_3 = 22.
-// See docs/ident-lowering-spec.md.
+// See docs/lowering-specs/ident-lowering-spec.md.
 //
 // The @sink call after the barrier keeps it from being the region's trailing
 // op, so it is NOT elided (that elision is covered by barrier-elision-iomp.mlir)

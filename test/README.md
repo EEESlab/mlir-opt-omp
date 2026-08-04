@@ -13,6 +13,51 @@ Are the right place to lock in behaviour for every new feature.
 Mirrors `mlir/examples/standalone/test/` in llvm-project, the canonical
 out-of-tree MLIR test setup.
 
+### Layout
+
+One directory per construct, one subdirectory per clause. Tests that exercise a
+construct as a whole rather than one clause sit directly in the construct
+directory; `dialects.mlir` covers no construct and stays at the root.
+
+```
+Regression/
+  parallel/   if/  num_threads/  proc_bind/  private/  firstprivate/
+  wsloop/     schedule-static/  schedule-dynamic/  nowait/
+  barrier/
+  task/       if/  firstprivate/
+  taskwait/
+```
+
+lit recurses, so a test is picked up wherever it lands. **Clause directories are
+kept even when empty** — they are the checklist of what is supported but not yet
+covered, so an empty one is a gap to fill rather than a directory to delete.
+Git does not track empty directories, hence the `.gitkeep` in each.
+
+### Coverage
+
+Clauses supported by the lowering, and whether a regression test covers them:
+
+| Construct | Clause | iomp | libgomp | pmsis |
+|---|---|:--:|:--:|:--:|
+| `parallel` | — | ✓ | ✓ | — |
+| | `if` | ✓ | ✓ | — |
+| | `num_threads` | — | — | — |
+| | `proc_bind` | — | — | — |
+| | `private` | — | — | — |
+| | `firstprivate` | — | — | — |
+| `wsloop` | `schedule(static)` | — | — | — |
+| | `schedule(dynamic)` | — | — | — |
+| | `nowait` | — | — | — |
+| `barrier` | — | ✓ | ✓ | — |
+| `task` | — | ✓ | ✓ | n/a |
+| | `if` | ✓ | ✓ | n/a |
+| | `firstprivate` | ✓ | ✓ | n/a |
+| `taskwait` | — | ✓ | ✓ | n/a |
+
+`✓` a test exists, `—` supported but untested, `n/a` the runtime has no such
+construct (`rules.dsl` declares no `task`/`taskwait` for pmsis). Note that **no
+regression test targets pmsis at all**, even for the constructs it does support.
+
 ### Running
 
 From the build directory:
@@ -23,7 +68,7 @@ cmake --build . --target check-omp
 
 ### Adding a test
 
-Create `Regression/<name>.mlir`:
+Create `Regression/<construct>/<clause>/<name>.mlir`:
 
 ```mlir
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \

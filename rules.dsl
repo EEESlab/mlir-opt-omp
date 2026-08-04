@@ -75,8 +75,9 @@
         kmp_task_t = struct(ptr, ptr, i32, ptr, ptr);
         // Task allocation flags for __kmpc_omp_task_alloc.  1 = tied; the
         // value lives here (like `default_chunk`) so the runtime ABI constant
-        // is DSL-owned rather than hardcoded in the pass.  if/final TBD: those
-        // would OR extra bits in via a `when has(...)` chain.
+        // is DSL-owned rather than hardcoded in the pass.  final TBD: it would
+        // OR an extra bit in via a `when has(...)` chain.  `if` needs no flag
+        // bit — it is a call-site branch, see the invoke block below.
         let task_flags = 1;
         // No pre block: unlike parallel every task invoke call uses
         // both ident and global_tid, so there is no optionality.
@@ -84,7 +85,8 @@
           // `let task = call ...` binds the __kmpc_omp_task_alloc result;
           // `populate_shareds(task)` is a C++-backed verb that writes the
           // captures into task->shareds (more documented in
-          // docs/task-lowering-spec.md).  task_flags is the `let` above.
+          // docs/lowering-specs/task-lowering-spec.md).  task_flags is the
+          // `let` above.
           // if(cond) is handled in C++ around the __kmpc_omp_task call (a
           // runtime-value branch the flat plan cannot express): cond false
           // takes the undeferred begin_if0 / direct entry call / complete_if0

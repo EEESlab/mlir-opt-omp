@@ -5,7 +5,7 @@ Status:
 | Runtime | Status        |
 |---------|---------------|
 | libgomp | **implemented** (v2) |
-| iomp    | **implemented** (tied tasks + explicit firstprivate; `if`/`final` deferred) |
+| iomp    | **implemented** (tied tasks + explicit firstprivate + `if`; `final` deferred) |
 | pmsis   | planned (phase 3, API to be defined) |
 
 v1: **closure/packed reuse**, **DataLayout with fallback-16** for the env-struct alignment.
@@ -348,14 +348,14 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
 
 ## 7. Testing
 
-- **`test/Regression/task-libgomp.mlir`** — `--omp-to-omp-lower` on an empty
+- **`test/Regression/task/task-libgomp.mlir`** — `--omp-to-omp-lower` on an empty
   task: checks `omp_lower.construct` with `runtime = "libgomp"`,
   `construct = "task"`, and `GOMP_task` in the invoke plan.
-- **`test/Regression/task-outline-libgomp.mlir`** — full
+- **`test/Regression/task/task-outline-libgomp.mlir`** — full
   `--omp-to-omp-lower --omp-outline` on a task with a capture and an `if`
   clause: checks the `outlined_task_0` closure, the `i1 → i8` widening of the
   if-clause, and the `GOMP_task` call.
-- **`test/Regression/task-nested-libgomp.mlir`** — a `parallel { task }`:
+- **`test/Regression/task/task-nested-libgomp.mlir`** — a `parallel { task }`:
   checks the task is outlined into its own closure, the `GOMP_task` call lands
   inside the parallel's outlined function, and the outer function forks via
   `GOMP_parallel`.
@@ -380,23 +380,30 @@ The `otherwise` branch (no `if`) is identical except the boolean argument is the
   - `tasks/taskwait_toplevel.mlir` — a top-level task + top-level `omp.taskwait`
     (outside any parallel); prints `42`. Exercises `lowerTopLevelLeaf` (real gtid
     from `__kmpc_global_thread_num`), the path that previously crashed iomp.
-- **`test/Regression/task-iomp.mlir`** — an iomp task: checks the
+- **`test/Regression/task/task-iomp.mlir`** — an iomp task: checks the
   `i32(i32 gtid, ptr task) -> i32` entry and the `__kmpc_global_thread_num` /
   `__kmpc_omp_task_alloc` / `__kmpc_omp_task` call sequence.
-- **`test/Regression/taskwait-toplevel-iomp.mlir`** — a top-level `omp.taskwait`
+- **`test/Regression/taskwait/taskwait-toplevel-iomp.mlir`** — a top-level `omp.taskwait`
   lowers (in the outlining pass) to `__kmpc_global_thread_num` +
   `__kmpc_omp_taskwait` with a real gtid, leaving no `omp_lower.construct`.
-- **`test/Regression/task-firstprivate-{iomp,libgomp}.mlir`** — a task with an
+- **`test/Regression/task/firstprivate/task-firstprivate-{iomp,libgomp}.mlir`** — a task with an
   explicit firstprivate clause: checks the copy-in (a task-private `llvm.alloca`)
   and that no firstprivate parameter leaks into the outlined signature.
-- **`test/Regression/task-firstprivate-snapshot-{iomp,libgomp}.mlir`** — the
+- **`test/Regression/task/firstprivate/task-firstprivate-snapshot-{iomp,libgomp}.mlir`** — the
   snapshot-timing property: the scalar firstprivate source is loaded by value at
   the call site (task creation), not dereferenced at entry. Both runtimes pass.
-- **`test/Regression/task-firstprivate-unsupported-{iomp,libgomp}.mlir`** — an
+- **`test/Regression/task/firstprivate/task-firstprivate-unsupported-{iomp,libgomp}.mlir`** — an
   unsupported firstprivate shape (block arg used without a scalar load, so the
   element type can't be inferred) is diagnosed on both paths (`-verify-diagnostics`)
   instead of silently emitting a wrong-ABI outlined function.
-- Future (iomp): the `if0` begin/complete (`if`/`final`) path; pure `private`
+- **`test/Regression/{task,parallel}/if/`** — the `if` clause
+  on both constructs and both runtimes. iomp branches on the condition at the
+  call site: a task takes the undeferred `__kmpc_omp_task_begin_if0` / direct
+  entry call / `_complete_if0` protocol, a parallel takes
+  `__kmpc_serialized_parallel` + a direct microtask call. libgomp needs no
+  branch: the task hands the condition to `GOMP_task` as its `_Bool` parameter
+  (i1 zero-extended to i8), and the parallel forces `num_threads` to 1.
+- Future (iomp): `final`, which reuses the same if0 machinery; pure `private`
   clause wiring.
 
 ---
