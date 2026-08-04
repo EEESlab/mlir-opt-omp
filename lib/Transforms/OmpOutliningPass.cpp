@@ -1160,7 +1160,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // Snapshot firstprivate values at creation for the packed strategy (the
   // by-value capture struct).  Only the packed path consumes these buckets; the
   // by_pointer path passes captures as individual args.  See helper.
-  if (isPacked)
+  if (abi == CaptureAbi::Packed)
     forceFirstprivateByValue(body, captures, privateCaptures,
                              scalarAllocaCaptures, ptrAllocaCaptures);
 
@@ -1485,7 +1485,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
 
     // Bindings for the pre-block resolver: num_threads when the clause is set.
     llvm::StringMap<Value> preBindings;
-    if (Value ct = getClauseOperand(op)) preBindings["num_threads"] = ct;
+    if (Value ct = getClauseOperand(op, "num_threads"))
+      preBindings["num_threads"] = ct;
 
     // Emit pre-block calls (push_num_threads, push_proc_bind, etc.)
     for (auto attr : op.getPre()) {
@@ -1565,7 +1566,8 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       invokeBindings["outlined_parallel"] = fnPtrCast;
       invokeBindings["outlined_task"]     = fnPtrCast;
       invokeBindings["env_ptr"]           = structAlloca;
-      if (Value ct = getClauseOperand(op)) invokeBindings["num_threads"] = ct;
+      if (Value ct = getClauseOperand(op, "num_threads"))
+        invokeBindings["num_threads"] = ct;
 
       // Build call args from DSL invoke args, resolving symbolic names.
       for (auto attr : op.getInvoke()) {
@@ -1692,7 +1694,9 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
           LLVM::Linkage::External);
       }
 
-      Value ifCond = isPacked ? Value() : getClauseOperand(op, "if_clause");
+      Value ifCond = abi == CaptureAbi::Packed
+                         ? Value()
+                         : getClauseOperand(op, "if_clause");
       if (!ifCond) {
         LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
       } else {
