@@ -39,24 +39,26 @@ Clauses supported by the lowering, and whether a regression test covers them:
 
 | Construct | Clause | iomp | libgomp | pmsis |
 |---|---|:--:|:--:|:--:|
-| `parallel` | — | ✓ | ✓ | — |
-| | `if` | ✓ | ✓ | — |
+| `parallel` | — | ✓ | ✓ | ✓ |
+| | `if` | ✓ | ✓ | ! |
 | | `num_threads` | — | — | — |
 | | `proc_bind` | — | — | — |
 | | `private` | — | — | — |
 | | `firstprivate` | — | — | — |
-| `wsloop` | `schedule(static)` | — | — | — |
+| `wsloop` | — | ✓ | — | ✓ |
+| | `schedule(static)` | — | — | — |
 | | `schedule(dynamic)` | — | — | — |
 | | `nowait` | — | — | — |
-| `barrier` | — | ✓ | ✓ | — |
+| `barrier` | — | ✓ | ✓ | ✓ |
 | `task` | — | ✓ | ✓ | n/a |
 | | `if` | ✓ | ✓ | n/a |
 | | `firstprivate` | ✓ | ✓ | n/a |
 | `taskwait` | — | ✓ | ✓ | n/a |
 
 `✓` a test exists, `—` supported but untested, `n/a` the runtime has no such
-construct (`rules.dsl` declares no `task`/`taskwait` for pmsis). Note that **no
-regression test targets pmsis at all**, even for the constructs it does support.
+construct (`rules.dsl` declares no `task`/`taskwait` for pmsis), `!` the runtime
+does *not* support the clause and a test asserts the diagnostic rather than a
+lowering.
 
 ### Running
 
