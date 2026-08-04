@@ -18,7 +18,9 @@ func.func @parallel_if(%arg0: !llvm.ptr, %cond: i1) {
   return
 }
 
-// CHECK: func.func {{.*}}@[[MICRO:outlined_parallel_[0-9]+]](%{{.*}}: !llvm.ptr, %{{.*}}: !llvm.ptr, %{{.*}}: !llvm.ptr)
+// The capture pointer carries llvm.noalias (see noalias-captures-iomp.mlir);
+// gtid/btid do not.
+// CHECK: func.func {{.*}}@[[MICRO:outlined_parallel_[0-9]+]](%{{.*}}: !llvm.ptr, %{{.*}}: !llvm.ptr, %{{.*}}: !llvm.ptr {llvm.noalias})
 
 // CHECK-LABEL: func.func @parallel_if
 // CHECK:       %[[GTID:.*]] = call @__kmpc_global_thread_num
