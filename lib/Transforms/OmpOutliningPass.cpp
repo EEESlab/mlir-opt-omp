@@ -797,12 +797,41 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
 //
 // The binding travels as a regular operand plus its name in clause_names, the
 // same channel the clause values use.
+// Does any action in this plan block name %gtid?  Recurses into branch arms.
+static bool blockNamesGtid(ArrayAttr block) {
+  if (!block) return false;
+  auto isGtid = [](Attribute a) {
+    auto s = llvm::dyn_cast<StringAttr>(a);
+    return s && s.getValue() == "%gtid";
+  };
+  for (Attribute a : block) {
+    if (auto call = llvm::dyn_cast<PlanCallAttr>(a)) {
+      for (Attribute arg : call.getArgs())
+        if (isGtid(arg)) return true;
+      continue;
+    }
+    if (auto br = llvm::dyn_cast<PlanBranchAttr>(a)) {
+      if (isGtid(br.getCond())) return true;
+      if (blockNamesGtid(br.getIfTrue()) || blockNamesGtid(br.getIfFalse()))
+        return true;
+    }
+  }
+  return false;
+}
+
 static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
                              llvm::function_ref<Value(OpBuilder &, Location)>
                                  makeGtid) {
+  // Only leaves whose plan actually names %gtid: binding the rest would
+  // materialise a thread id nothing reads, and on the closure runtimes
+  // (libgomp, pmsis) that is a dead undef at the top of every outlined
+  // function — GOMP_barrier and friends take no arguments.
   SmallVector<ConstructOp> leaves;
   outlinedFn.walk([&](ConstructOp c) {
-    if (c.getBody().empty()) leaves.push_back(c);
+    if (c.getBody().empty() &&
+        (blockNamesGtid(c.getPre()) || blockNamesGtid(c.getInvoke()) ||
+         blockNamesGtid(c.getPost())))
+      leaves.push_back(c);
   });
   if (leaves.empty()) return;
 
