@@ -1467,6 +1467,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
           LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
           bind("gtid_addr", gtidAddr);
           bind("btid_addr", btidAddr);
+          // Hand the thread id over too: the serialized calls need it, and the
+          // store above already had to materialise it.  Without this the plan
+          // pass would emit a second __kmpc_global_thread_num of its own.
+          bind("%gtid", getGtid());
         }
 
         // captures is a list: every operand under this name belongs to it, and
