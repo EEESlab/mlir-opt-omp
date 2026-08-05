@@ -22,6 +22,9 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::omp_lower;
@@ -105,6 +108,11 @@ struct ConstructEmitter {
     ArrayAttr argAttrs = callAttr.getArgs();
     SmallVector<Value> args;
     SmallVector<Type>  argTypes;
+    // Where the first spliced list started, i.e. how many arguments are fixed.
+    // A call that splices a list is variadic by construction: the same callee
+    // is reached from parallel regions with different capture counts, so it
+    // cannot be declared with one fixed signature.
+    std::optional<size_t> fixedArgs;
     args.reserve(argAttrs.size());
     argTypes.reserve(argAttrs.size());
     for (Attribute a : argAttrs) {
@@ -112,6 +120,7 @@ struct ConstructEmitter {
       if (auto s = llvm::dyn_cast<StringAttr>(a)) {
         auto it = listBindings.find(s.getValue());
         if (it != listBindings.end()) {
+          if (!fixedArgs) fixedArgs = args.size();
           for (Value v : it->second) {
             args.push_back(v);
             argTypes.push_back(v.getType());
@@ -123,8 +132,36 @@ struct ConstructEmitter {
       args.push_back(v);
       argTypes.push_back(v.getType());
     }
-    func::FuncOp decl = getOrInsertDecl(
-        module, callAttr.getCallee().getValue(), argTypes, builder);
+
+    llvm::StringRef callee = callAttr.getCallee().getValue();
+
+    // A callee that names a binding is a function *value*, not a symbol: the
+    // outlined function's real name is only known to the outlining pass, which
+    // hands its address over as `body`.  Call through the pointer.
+    if (auto bound = bindings.find(callee); bound != bindings.end()) {
+      auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(ctx),
+                                              argTypes, /*isVarArg=*/false);
+      LLVM::CallOp::create(builder, loc, fnTy, bound->second, args);
+      return;
+    }
+
+    if (fixedArgs) {
+      auto fnTy = LLVM::LLVMFunctionType::get(
+          LLVM::LLVMVoidType::get(ctx),
+          ArrayRef<Type>(argTypes).take_front(*fixedArgs), /*isVarArg=*/true);
+      LLVM::LLVMFuncOp decl =
+          module.lookupSymbol<LLVM::LLVMFuncOp>(callee);
+      if (!decl) {
+        OpBuilder::InsertionGuard g(builder);
+        builder.setInsertionPointToStart(module.getBody());
+        decl = LLVM::LLVMFuncOp::create(builder, UnknownLoc::get(ctx), callee,
+                                        fnTy, LLVM::Linkage::External);
+      }
+      LLVM::CallOp::create(builder, loc, decl, args);
+      return;
+    }
+
+    func::FuncOp decl = getOrInsertDecl(module, callee, argTypes, builder);
     func::CallOp::create(builder, loc, decl, args);
   }
 
@@ -202,11 +239,26 @@ static LogicalResult lowerConstruct(ConstructOp op) {
     // outlining pass binds to the microtask's thread id for leaf constructs
     // that ended up inside an outlined function.  Bindings are consulted first,
     // so a bound %gtid wins over materialising a fresh __kmpc_global_thread_num.
+    // Names declared as lists get an entry even when no operand carries them,
+    // so an empty list stays a list: `captures` on a parallel that captures
+    // nothing must splice into zero arguments, not fall through to undef.
+    llvm::StringSet<> isList;
+    if (auto lists = op.getListNames())
+      for (Attribute n : *lists) {
+        auto name = llvm::cast<StringAttr>(n).getValue();
+        isList.insert(name);
+        emitter.listBindings[name];
+      }
+
     if (auto names = op.getClauseNames()) {
       auto operands = op.getClauseOperands();
       for (auto [i, n] : llvm::enumerate(*names)) {
         if (i >= operands.size()) break;
-        emitter.bindings[llvm::cast<StringAttr>(n).getValue()] = operands[i];
+        auto name = llvm::cast<StringAttr>(n).getValue();
+        if (isList.contains(name))
+          emitter.listBindings[name].push_back(operands[i]);
+        else
+          emitter.bindings[name] = operands[i];
       }
     }
 

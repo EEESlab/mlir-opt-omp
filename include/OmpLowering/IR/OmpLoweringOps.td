@@ -121,7 +121,14 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     ArrayAttr:$post,
     // Clause name of each clause_operands entry, same order.  Optional so
     // constructs without clause operands (barrier, taskwait) stay unchanged.
-    OptionalAttr<StrArrayAttr>:$clause_names
+    OptionalAttr<StrArrayAttr>:$clause_names,
+    // Names in clause_names that stand for a *list* rather than one value, so
+    // every operand carrying that name belongs to it: `captures` is the case,
+    // spliced into as many call arguments as there are entries.  Recorded
+    // separately because a list can legitimately be empty — a parallel with no
+    // captures has no operand at all, and only this attribute distinguishes
+    // "empty list" from "not a list".
+    OptionalAttr<StrArrayAttr>:$list_names
   );
 
   let results = (outs);

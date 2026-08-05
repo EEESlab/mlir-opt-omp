@@ -1413,26 +1413,19 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
       // -----------------------------------------------------------------------
       // BY_POINTER (iomp): ident, argc, fn_ptr, captures...
       // -----------------------------------------------------------------------
-      callArgs.push_back(getIdent()); callTypes.push_back(ptrTy(ctx));
-
-      Value argcVal = arith::ConstantOp::create(builder, loc,
-        builder.getI32Type(),
-        builder.getI32IntegerAttr((int32_t)captures.size()));
-      callArgs.push_back(argcVal); callTypes.push_back(i32Ty(ctx));
-
       Value fnPtr = func::ConstantOp::create(builder, loc,
         outlinedFn.getFunctionType(),
         FlatSymbolRefAttr::get(ctx, fnName));
       Value fnPtrCast = UnrealizedConversionCastOp::create(
         builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
-      callArgs.push_back(fnPtrCast); callTypes.push_back(ptrTy(ctx));
 
+      // The values actually passed: a private capture (a loop IV) gets a fresh
+      // local alloca so each thread has its own copy rather than sharing the
+      // caller's.
+      SmallVector<Value> capVals;
       for (auto cap : captures) {
         Value capVal = cap;
-        // For private captures (loop IVs), pass a fresh local alloca.
         if (privateCaptures.contains(cap)) {
-          // Private capture — pass a fresh local alloca so each core has
-          // its own copy (not shared through the original caller alloca).
           auto srcAlloca = cap.getDefiningOp<LLVM::AllocaOp>();
           Value cnt = LLVM::ConstantOp::create(builder, loc,
             IntegerType::get(ctx, 64),
@@ -1440,6 +1433,66 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
           capVal = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
             srcAlloca.getElemType(), cnt);
         }
+        capVals.push_back(capVal);
+      }
+
+      if (getPropStr(op, "lower_in") == "plan") {
+        SmallVector<Value> operands(op.getClauseOperands().begin(),
+                                    op.getClauseOperands().end());
+        SmallVector<Attribute> names;
+        if (auto existing = op.getClauseNames())
+          names.assign(existing->begin(), existing->end());
+        auto bind = [&](llvm::StringRef n, Value v) {
+          operands.push_back(v);
+          names.push_back(StringAttr::get(ctx, n));
+        };
+        bind("body", fnPtrCast);
+        bind("outlined_parallel", fnPtrCast);
+
+        // The serialized side of `if` calls the microtask directly, and the
+        // microtask ABI takes gtid and btid *by pointer* — two slots only this
+        // pass can make.  Emitted just for that path, so a parallel with no if
+        // clause gets neither.
+        if (getClauseOperand(op, "if_clause")) {
+          auto i64t = IntegerType::get(ctx, 64);
+          Value one64 = LLVM::ConstantOp::create(builder, loc, i64t,
+            IntegerAttr::get(i64t, 1));
+          Value zero32 = LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
+            IntegerAttr::get(i32Ty(ctx), 0));
+          Value gtidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+            i32Ty(ctx), one64);
+          Value btidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+            i32Ty(ctx), one64);
+          LLVM::StoreOp::create(builder, loc, getGtid(), gtidAddr);
+          LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
+          bind("gtid_addr", gtidAddr);
+          bind("btid_addr", btidAddr);
+        }
+
+        // captures is a list: every operand under this name belongs to it, and
+        // list_names keeps it a list even when there are none.
+        for (Value v : capVals) bind("%captures", v);
+        op->setOperands(operands);
+        op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+        op.setListNamesAttr(ArrayAttr::get(ctx,
+            {StringAttr::get(ctx, "%captures")}));
+        if (getClauseOperand(op, "if_clause") &&
+            !planNamesToken(op, "if_clause"))
+          op.emitWarning("omp-outline: `if` clause is not supported by this "
+                         "runtime/construct lowering and was ignored");
+        return;   // deliberately not erased: the plan pass consumes it
+      }
+
+      callArgs.push_back(getIdent()); callTypes.push_back(ptrTy(ctx));
+
+      Value argcVal = arith::ConstantOp::create(builder, loc,
+        builder.getI32Type(),
+        builder.getI32IntegerAttr((int32_t)captures.size()));
+      callArgs.push_back(argcVal); callTypes.push_back(i32Ty(ctx));
+
+      callArgs.push_back(fnPtrCast); callTypes.push_back(ptrTy(ctx));
+
+      for (Value capVal : capVals) {
         callArgs.push_back(capVal); callTypes.push_back(capVal.getType());
       }
     }

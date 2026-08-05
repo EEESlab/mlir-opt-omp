@@ -4,7 +4,7 @@
 // parallel without the clause must emit no push at all (and, since the push is
 // the only pre call here, no global_tid either — it is materialised on demand).
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

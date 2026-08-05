@@ -5,8 +5,13 @@
 // microtask called directly (gtid/btid passed by pointer, btid = 0).
 // __kmpc_fork_call_if is NOT used: it takes a single packed void* argument
 // (argc <= 1), incompatible with the by_pointer capture convention.
+// Both sides are now stated in rules.dsl as a `branch` and emitted by
+// PlanLoweringPass.  The microtask call on the serialized side goes through the
+// bound function pointer rather than the symbol, because the outlined function's
+// real name is known only to the outlining pass.
+//
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 
@@ -34,7 +39,9 @@ func.func @parallel_if(%arg0: !llvm.ptr, %cond: i1) {
 // false → serialized parallel with a direct microtask call.
 // CHECK:       ^[[SER]]:
 // CHECK:         call @__kmpc_serialized_parallel({{.*}}, %[[GTID]])
-// CHECK:         call @[[MICRO]](
+// The direct microtask call, through the bound pointer: gtid and btid by
+// pointer, then the captures.
+// CHECK:         llvm.call %{{.*}}(%{{.*}}, %{{.*}}, %{{.*}}) : !llvm.ptr,
 // CHECK:         call @__kmpc_end_serialized_parallel({{.*}}, %[[GTID]])
 // CHECK:         llvm.br ^[[CONT]]
 

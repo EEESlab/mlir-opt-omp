@@ -11,6 +11,10 @@
         // void(ptr gtid, ptr btid, cap0, cap1, ...), built in C++ (see
         // outlineConstruct): each capture is passed as its own trailing arg.
         capture_strategy = by_pointer;
+        // Emitted by PlanLoweringPass.  `captures` reaches it as a list binding
+        // and splices into one argument each, which is also what makes the fork
+        // call variadic.
+        lower_in = plan;
 
         pre {
           // No `emit` for ident or global_tid: both are materialised on demand
@@ -24,13 +28,23 @@
         }
 
         invoke {
-          // if(cond) is a branch on a runtime VALUE, which the flat plan
-          // cannot express: the outlining pass emits it in C++ around this
-          // call (cond true → __kmpc_fork_call; cond false → serialized
-          // parallel + direct microtask call).  __kmpc_fork_call_if is not
-          // usable here: it takes a single packed void* (argc <= 1), while
-          // by_pointer passes each capture as its own vararg.
-          call "__kmpc_fork_call"(ident, argc(captures), body, captures);
+          // if(cond) branches on a runtime value, so it is a `branch` and not a
+          // `when`.  With no if clause the condition is null and only the fork
+          // survives.  __kmpc_fork_call_if is deliberately not used: it takes a
+          // single packed void* (argc <= 1), while by_pointer passes each
+          // capture as its own vararg.
+          branch if_clause {
+            true  => call "__kmpc_fork_call"(ident, argc(captures), body, captures);
+            // Serialized: run the region on this thread between the runtime's
+            // begin/end pair.  The microtask ABI takes gtid and btid by
+            // pointer, so the two slots come from the outlining pass; the
+            // callee is `body` itself, a bound value rather than a name.
+            false => {
+              call "__kmpc_serialized_parallel"(ident, global_tid);
+              call body(gtid_addr, btid_addr, captures);
+              call "__kmpc_end_serialized_parallel"(ident, global_tid);
+            }
+          }
         }
       }
 
