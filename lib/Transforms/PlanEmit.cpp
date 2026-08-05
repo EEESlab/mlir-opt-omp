@@ -160,6 +160,13 @@ Value mlir::omp_lower::resolveIdentToken(uint32_t flags, ModuleOp module,
              : getOrCreateIdent(module, builder, loc, ctx, flags);
 }
 
+Value mlir::omp_lower::clauseToI1(OpBuilder &builder, Location loc, Value v) {
+  if (v.getType().isInteger(1)) return v;
+  Value zero = LLVM::ConstantOp::create(builder, loc, v.getType(),
+    IntegerAttr::get(v.getType(), 0));
+  return LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne, v, zero);
+}
+
 // ---------------------------------------------------------------------------
 // Symbolic token resolution
 // ---------------------------------------------------------------------------
