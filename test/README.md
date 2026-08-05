@@ -134,6 +134,31 @@ mlir-opt-omp input.mlir --omp-lower-dsl=../rules.dsl --omp-lower-runtime=iomp \
   --omp-to-omp-lower --omp-outline --omp-lower-plan
 ```
 
+### Making sure the test can fail
+
+A test only pays for itself if it goes red when the behaviour it names breaks.
+Two ways of getting that wrong have already slipped through here, both of which
+left the suite green while nothing was being checked.
+
+**Watch which stage the pipeline stops at.** Naming a runtime function is not
+the same as checking it gets emitted. A test that stops at `--omp-to-omp-lower`
+and matches `ext_pi_cl_team_fork` is reading it out of the *plan attribute* —
+which says what the rules decided, not what came out. Moving that emission to a
+different pass broke it without a single test noticing, because the only ones
+naming the symbol looked at it a stage too early. When you change how something
+is emitted, check that a test runs far enough down the pipeline to see it.
+
+**A test with only `CHECK-NOT` asserts nothing.** "No `ident_t` is emitted for
+libgomp" also holds for an empty module, so such a test cannot tell a correct
+absence from a total failure to lower. Anchor it with a positive check that the
+lowering did happen. The two often need separate `--check-prefix` runs: a
+`CHECK-NOT` only covers up to the first positive match, and globals print above
+the functions, so folding them into one prefix silently shrinks what the
+negative check guards.
+
+The quick self-test when writing one: *if I deleted the feature, would this
+test fail?* If the answer needs thinking about, the test is not pinning it.
+
 ## Integration tests (`Integration/`)
 
 End-to-end pipeline (C → CIR → MLIR → LLVM IR → object → linked binary) for each
