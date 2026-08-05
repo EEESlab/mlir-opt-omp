@@ -3,7 +3,7 @@
 // __kmpc_omp_taskwait(ident, gtid).  Here it follows a spawned task, the common
 // `parallel { task; taskwait }` shape.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

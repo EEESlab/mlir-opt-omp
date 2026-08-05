@@ -304,28 +304,22 @@ struct OmpToOmpLowerPass
     // afterwards into nested ConstructOps.  Pre-order walk guarantees an outer
     // task is processed before a task nested inside it.
     module.walk([&](omp::TaskOp op) { tasks.push_back(op); });
-    // Only collect barriers that are NOT nested inside a parallel.  Those inside
-    // a parallel are part of its body region and will be handled by the
-    // outlining pass after the parallel body is moved.  Wsloops are always
-    // nested inside a parallel and are lowered entirely by the outlining pass,
-    // so they are not collected here.
-    module.walk([&](omp::BarrierOp op) {
-      if (!op->getParentOfType<omp::ParallelOp>())
-        barriers.push_back(op);
-    });
-    // taskwait mirrors barrier: those inside a parallel ride into its body
-    // region and are lowered by the outlining pass; only collect the rest.
+    // Collect every barrier, nested in a parallel or not.  Those inside a
+    // parallel ride into its body region and end up in the outlined function,
+    // where the outlining pass binds the microtask's gtid to them; either way
+    // it is PlanLoweringPass that turns them into calls.  Wsloops are the
+    // exception: they are lowered entirely by the outlining pass (the loop is
+    // codegen, not a plan), so they are not collected here.
+    module.walk([&](omp::BarrierOp op) { barriers.push_back(op); });
+    // taskwait mirrors barrier.
     module.walk([&](omp::TaskwaitOp op) {
       // v1 lowers taskwait as an unconditional, full wait: the depend and nowait
       // clauses are not modelled yet.  Warn rather than dropping them silently,
-      // so a caller relying on those semantics isn't misled.  This walk sees
-      // every taskwait (in-parallel ones included), so the diagnostic fires
-      // regardless of which lowering path the op eventually takes.
+      // so a caller relying on those semantics isn't misled.
       if (op->getNumOperands() > 0 || op->hasAttr("nowait"))
         op.emitWarning("omp-to-omp-lower: taskwait depend/nowait clauses are "
                        "ignored in v1; lowering as a full, unconditional wait");
-      if (!op->getParentOfType<omp::ParallelOp>())
-        taskwaits.push_back(op);
+      taskwaits.push_back(op);
     });
 
     // Build plan and replace each op with an omp_lower.construct

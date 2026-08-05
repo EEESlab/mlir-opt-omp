@@ -9,7 +9,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "llvm/Support/StringExtras.h"
+#include "llvm/ADT/StringExtras.h"
 
 using namespace mlir;
 using namespace mlir::omp_lower;

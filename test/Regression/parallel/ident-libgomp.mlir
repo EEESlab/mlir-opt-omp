@@ -4,7 +4,7 @@
 // See docs/lowering-specs/ident-lowering-spec.md.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 func.func @parallel_with_barrier() {
   omp.parallel {

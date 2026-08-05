@@ -3,7 +3,7 @@
 // a no-argument GOMP_taskwait().  Here it follows a spawned task, the common
 // `parallel { task; taskwait }` shape.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

@@ -3,7 +3,7 @@
 // The iomp task entry uses the shareds ABI i32(i32 gtid, ptr task), so %gtid is
 // arg 0 by value; the taskwait becomes __kmpc_omp_taskwait(ident, gtid).
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

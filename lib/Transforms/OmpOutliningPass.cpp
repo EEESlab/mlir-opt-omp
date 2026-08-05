@@ -480,13 +480,11 @@ static void replaceTerminatorsWithReturn(
 // wired (diagnosed, not miscompiled); no final clause; task_flags = 1 (tied);
 // depend/nowait on taskwait ignored; omp.barrier is illegal in a task region
 // and diagnosed.
-static void
-lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module, MLIRContext *ctx,
-                   llvm::StringRef opName, const dsl::LoweringPlan &plan,
-                   llvm::function_ref<Value(OpBuilder &, Location)> resolveGtid);
+static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
+                             llvm::function_ref<Value(OpBuilder &, Location)>
+                                 makeGtid);
 
-static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
-                             const dsl::LoweringPlan *taskwaitPlan) {
+static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -614,29 +612,20 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
     func::ReturnOp::create(tb, l, ValueRange{zero});
   });
 
-  // Lower an omp.taskwait nested directly in the task body — e.g.
-  // `parallel { task { taskwait } }`, where it rides in as a still-unconverted
-  // omp.taskwait.  The shareds entry ABI is i32(i32 gtid, ptr task), so %gtid is
-  // arg 0 *by value* (not the microtask ptr-to-i32); the leaf helper is reused
-  // with that gtid source.  An omp.barrier is illegal inside a task region in
-  // OpenMP, so it is diagnosed rather than lowered.
-  if (taskwaitPlan) {
-    auto taskGtid = [&](OpBuilder &, Location) -> Value {
-      return outlinedFn.getBody().front().getArgument(0); // i32 gtid value
-    };
-    lowerLeafConstruct(outlinedFn, module, ctx, "omp.taskwait", *taskwaitPlan,
-                       taskGtid);
-  } else {
-    outlinedFn.walk([&](Operation *inner) {
-      if (inner->getName().getStringRef() == "omp.taskwait")
-        inner->emitError(
-            "omp-outline: selected runtime has no `construct taskwait`");
-    });
-  }
-  outlinedFn.walk([&](Operation *inner) {
-    if (inner->getName().getStringRef() == "omp.barrier")
+  // A barrier is illegal inside a task region in OpenMP.  Diagnose it before
+  // binding below, so it is reported rather than lowered.
+  outlinedFn.walk([&](ConstructOp inner) {
+    if (inner.getConstructName() == "barrier")
       inner->emitError(
           "omp-outline: 'omp.barrier' is not valid inside a task region");
+  });
+
+  // A taskwait nested directly in the task body — `parallel { task { taskwait } }`
+  // — is lowered by PlanLoweringPass like any other leaf.  Bind the thread id it
+  // cannot derive: the shareds entry ABI is i32(i32 gtid, ptr task), so %gtid is
+  // arg 0 *by value*, not the microtask's ptr-to-i32.
+  bindGtidOnLeaves(outlinedFn, ctx, [&](OpBuilder &, Location) -> Value {
+    return outlinedFn.getBody().front().getArgument(0);
   });
 
   // ---- Call site ----
@@ -804,47 +793,41 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter,
 // enclosing function's ABI, so the caller supplies it via resolveGtid:
 //   - microtask entry  void(ptr gtid, ptr btid, ...):  load arg 0 (ptr to i32);
 //   - task entry       i32(i32 gtid, ptr task):        arg 0 is the gtid value.
-static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
-                               MLIRContext *ctx, llvm::StringRef opName,
-                               const dsl::LoweringPlan &plan,
-                               llvm::function_ref<Value(OpBuilder &, Location)>
-                                   resolveGtid) {
-  SmallVector<Operation *> targets;
-  for (auto &block : outlinedFn.getBody())
-    for (auto &innerOp : block)
-      if (innerOp.getName().getStringRef() == opName)
-        targets.push_back(&innerOp);
-  for (auto *leafOp : targets) {
-    OpBuilder bb(leafOp);
-    Location bloc = leafOp->getLoc();
+// Bind %gtid on every leaf ConstructOp inside an outlined function.
+//
+// A barrier or taskwait nested in a parallel/task rides into the outlined body
+// as an empty-body ConstructOp carrying its own plan.  PlanLoweringPass emits
+// the calls; the only thing it cannot derive is the thread id, which comes from
+// the signature outlining just created.  `makeGtid` produces it (a load of the
+// microtask's arg 0, or the task entry's by-value arg), and it is materialised
+// once at the top of the entry block so it dominates every leaf below.
+//
+// The binding travels as a regular operand plus its name in clause_names, the
+// same channel the clause values use.
+static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
+                             llvm::function_ref<Value(OpBuilder &, Location)>
+                                 makeGtid) {
+  SmallVector<ConstructOp> leaves;
+  outlinedFn.walk([&](ConstructOp c) {
+    if (c.getBody().empty()) leaves.push_back(c);
+  });
+  if (leaves.empty()) return;
 
-    auto resolveArg = [&](const dsl::Value &v) -> Value {
-      if (auto *sv = std::get_if<dsl::StrVal>(&v))
-        return resolveSymbolToken(
-            sv->value, bb, bloc,
-            [&](uint32_t flags) {
-              return getOrCreateIdent(module, bb, bloc, ctx, flags);
-            },
-            [&]() -> Value { return resolveGtid(bb, bloc); });
-      if (auto *iv = std::get_if<dsl::IntVal>(&v))
-        return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
-          IntegerAttr::get(i32Ty(ctx), iv->value));
-      return LLVM::UndefOp::create(bb, bloc, ptrTy(ctx));
-    };
+  auto &entry = outlinedFn.getBody().front();
+  OpBuilder bb(ctx);
+  bb.setInsertionPointToStart(&entry);
+  Value gtid = makeGtid(bb, outlinedFn.getLoc());
 
-    for (auto &action : plan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, bb);
-        func::CallOp::create(bb, bloc, decl, args);
-      }
-    }
-    leafOp->erase();
+  for (auto c : leaves) {
+    SmallVector<Value> operands(c.getClauseOperands().begin(),
+                                c.getClauseOperands().end());
+    SmallVector<Attribute> names;
+    if (auto existing = c.getClauseNames())
+      names.assign(existing->begin(), existing->end());
+    operands.push_back(gtid);
+    names.push_back(StringAttr::get(ctx, "%gtid"));
+    c->setOperands(operands);
+    c.setClauseNamesAttr(ArrayAttr::get(ctx, names));
   }
 }
 
@@ -853,9 +836,7 @@ static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
 // 1. PARALLEL OUTLINING
 // ---------------------------------------------------------------------------
 
-static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
-                              const dsl::LoweringPlan &barrierPlan,
-                              const dsl::LoweringPlan *taskwaitPlan) {
+static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
@@ -876,7 +857,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
   // shareds block, emitted via the __kmpc_omp_task_alloc/task two-call
   // sequence.
   if (abi == CaptureAbi::Shareds) {
-    outlineTaskEntry(op, module, counter, taskwaitPlan);
+    outlineTaskEntry(op, module, counter);
     return;
   }
 
@@ -1142,30 +1123,18 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     func::ReturnOp::create(tb, l);
   });
 
-  // Lower omp.barrier / omp.taskwait inside the outlined function — DSL-driven.
-  // The plans (one per runtime) are built once in runOnOperation; the helper
-  // only resolves the symbolic args (%ident, %gtid) at each call site.  This is
-  // the microtask entry, so %gtid is a load of arg 0 (a ptr to i32 gtid).
-  auto microtaskGtid = [&](OpBuilder &bb, Location bloc) -> Value {
+  // Leaf constructs (barrier, taskwait) that rode into the outlined function
+  // carry their own plan and are lowered by PlanLoweringPass.  The one thing it
+  // cannot know is the thread id: this is the microtask entry, so %gtid is a
+  // load of arg 0 (a ptr to i32 gtid), which only exists because of outlining.
+  // Bind it here, materialised once in the entry block so it dominates every
+  // leaf in the function.
+  bindGtidOnLeaves(outlinedFn, ctx, [&](OpBuilder &bb, Location bloc) -> Value {
     auto &fnEntry = outlinedFn.getBody().front();
     if (fnEntry.getNumArguments() >= 2)
       return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx), fnEntry.getArgument(0));
     return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
-  };
-  lowerLeafConstruct(outlinedFn, module, ctx, "omp.barrier", barrierPlan,
-                     microtaskGtid);
-  if (taskwaitPlan) {
-    lowerLeafConstruct(outlinedFn, module, ctx, "omp.taskwait", *taskwaitPlan,
-                       microtaskGtid);
-  } else {
-    // No taskwait plan for the selected runtime: a taskwait inside a parallel
-    // cannot be lowered.  Flag it rather than silently dropping the wait.
-    outlinedFn.walk([&](Operation *innerOp) {
-      if (innerOp->getName().getStringRef() == "omp.taskwait")
-        innerOp->emitError(
-            "omp-outline: selected runtime has no `construct taskwait`");
-    });
-  }
+  });
 
   // ---- Emit the runtime call at the call site ----
   std::string runtimeCallee;
@@ -1856,35 +1825,10 @@ struct OmpOutliningPass
     }
     dsl::Evaluator evaluator(*program);
 
-    // Pre-compute the barrier plan once; the same plan is reused for every
-    // omp.barrier inside outlined parallel functions.
-    llvm::StringMap<dsl::Value> barrierCtx;
-    barrierCtx["ident"]      = dsl::makeStr("%ident");
-    barrierCtx["global_tid"] = dsl::makeStr("%gtid");
-    auto barrierPlan = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
-    if (!barrierPlan) {
-      module.emitError("omp-outline: barrier DSL evaluation failed: ")
-        << llvm::toString(barrierPlan.takeError());
-      return signalPassFailure();
-    }
-
-    // Taskwait plan is optional: only runtimes that define `construct taskwait`
-    // (iomp and libgomp; not pmsis) support it.  Build it when present; leave it
-    // null otherwise so runtimes without it are unaffected unless a taskwait op
-    // is actually used (that case is diagnosed in outlineConstruct).
-    std::optional<dsl::LoweringPlan> taskwaitPlan;
-    {
-      llvm::StringMap<dsl::Value> taskwaitCtx;
-      taskwaitCtx["ident"]      = dsl::makeStr("%ident");
-      taskwaitCtx["global_tid"] = dsl::makeStr("%gtid");
-      auto p = evaluator.buildPlan(runtimeName, "taskwait", taskwaitCtx);
-      if (p)
-        taskwaitPlan = std::move(*p);
-      else
-        llvm::consumeError(p.takeError());
-    }
-    const dsl::LoweringPlan *taskwaitPlanPtr =
-        taskwaitPlan ? &*taskwaitPlan : nullptr;
+    // No barrier/taskwait plans are needed here any more: OmpToOmpLowerPass now
+    // converts every barrier and taskwait — nested in a parallel or not — into a
+    // ConstructOp carrying its own plan, and PlanLoweringPass emits the calls.
+    // This pass only binds the thread id they cannot derive (bindGtidOnLeaves).
 
     // Step 1: outline parallel constructs.
     SmallVector<ConstructOp> constructs;
@@ -1893,7 +1837,7 @@ struct OmpOutliningPass
     });
     int counter = 0;
     for (auto op : constructs)
-      outlineConstruct(op, module, counter, *barrierPlan, taskwaitPlanPtr);
+      outlineConstruct(op, module, counter);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;
@@ -1940,31 +1884,53 @@ struct OmpOutliningPass
     // per parallel region, which is significant for kernels that fork many
     // short regions (e.g. stencils looping over thousands of time steps).
     //
-    // The barrier callee is runtime-specific (iomp __kmpc_barrier, libgomp
-    // GOMP_barrier, ...), so we take it from the barrier plan.  Only the *last*
-    // barrier before the return is dropped, so a barrier that separates two
-    // work-sharing loops inside the same region is preserved.  Tasks are not
-    // fork/joined this way, so only outlined_parallel_* functions qualify.
+    // A trailing barrier comes in two shapes at this point.  An explicit
+    // omp.barrier is still an unlowered ConstructOp — PlanLoweringPass turns it
+    // into calls later — and is recognised by its construct name.  A wsloop's
+    // implicit barrier was emitted here by lowerWsloop as a real call, so it is
+    // recognised by callee; that name is runtime-specific (iomp __kmpc_barrier,
+    // libgomp GOMP_barrier, ...) and comes from the barrier plan.  A runtime
+    // without a `construct barrier` simply has nothing to match.
+    //
+    // Only the *last* barrier before the return is dropped, so a barrier that
+    // separates two work-sharing loops inside the same region is preserved.
+    // Tasks are not fork/joined this way, so only outlined_parallel_* qualify.
     std::string barrierCallee;
-    for (auto &action : barrierPlan->invoke)
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        barrierCallee = ca->callee;
-        break;
+    {
+      llvm::StringMap<dsl::Value> barrierCtx;
+      barrierCtx["ident"]      = dsl::makeStr("%ident");
+      barrierCtx["global_tid"] = dsl::makeStr("%gtid");
+      auto p = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
+      if (p) {
+        for (auto &action : p->invoke)
+          if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
+            barrierCallee = ca->callee;
+            break;
+          }
+      } else {
+        llvm::consumeError(p.takeError());
       }
-    if (!barrierCallee.empty()) {
-      module.walk([&](func::FuncOp fn) {
-        if (!fn.getName().starts_with("outlined_parallel_"))
-          return;
-        for (Block &blk : fn.getBody()) {
-          auto ret = llvm::dyn_cast_or_null<func::ReturnOp>(blk.getTerminator());
-          if (!ret)
-            continue;
-          auto call = llvm::dyn_cast_or_null<func::CallOp>(ret->getPrevNode());
-          if (call && call.getCallee() == barrierCallee)
-            call.erase();
-        }
-      });
     }
+    module.walk([&](func::FuncOp fn) {
+      if (!fn.getName().starts_with("outlined_parallel_"))
+        return;
+      for (Block &blk : fn.getBody()) {
+        auto ret = llvm::dyn_cast_or_null<func::ReturnOp>(blk.getTerminator());
+        if (!ret)
+          continue;
+        Operation *prev = ret->getPrevNode();
+        if (!prev)
+          continue;
+        if (auto c = llvm::dyn_cast<ConstructOp>(prev)) {
+          if (c.getConstructName() == "barrier")
+            c.erase();
+          continue;
+        }
+        auto call = llvm::dyn_cast<func::CallOp>(prev);
+        if (call && !barrierCallee.empty() && call.getCallee() == barrierCallee)
+          call.erase();
+      }
+    });
   }
 };
 

@@ -138,6 +138,21 @@ struct ConstructOpLowering : public OpConversionPattern<ConstructOp> {
     builder.setInsertionPoint(op);
 
     ConstructEmitter emitter{module, builder, op.getLoc(), op.getContext()};
+
+    // Seed the bindings from the construct's operands.  The 1:1 names array
+    // says what each one is: a clause value ("num_threads", "if_clause") or a
+    // value only the earlier passes could produce — notably "%gtid", which the
+    // outlining pass binds to the microtask's thread id for leaf constructs
+    // that ended up inside an outlined function.  Bindings are consulted first,
+    // so a bound %gtid wins over materialising a fresh __kmpc_global_thread_num.
+    if (auto names = op.getClauseNames()) {
+      auto operands = op.getClauseOperands();
+      for (auto [i, n] : llvm::enumerate(*names)) {
+        if (i >= operands.size()) break;
+        emitter.bindings[llvm::cast<StringAttr>(n).getValue()] = operands[i];
+      }
+    }
+
     emitter.lowerBlock(op.getPre());
     emitter.lowerBlock(op.getInvoke());
     emitter.lowerBlock(op.getPost());
