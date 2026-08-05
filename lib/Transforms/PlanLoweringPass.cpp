@@ -3,12 +3,15 @@
 // Converts every omp_lower.construct op into concrete func.call operations
 // targeting the selected OpenMP runtime (iomp, libgomp or pmsis).
 //
-// This is where a plan becomes calls.  Constructs with a body are consumed
-// earlier by OmpOutliningPass, which has to emit their calls itself: the
-// arguments depend on outlining artifacts (the outlined function, the capture
-// struct) and the `if` clause needs a branch on a runtime value, which a flat
-// plan cannot express.  Everything else — barrier, taskwait — reaches this pass
-// and is lowered here.
+// This is where a plan becomes calls — every plan, for every construct.
+// OmpOutliningPass runs first and produces what only it can: the outlined
+// function, the capture struct, the resolved capture values, the ABI sizes.
+// It attaches those to the construct as named operands and leaves it standing;
+// nothing about the call sequence is decided there.
+//
+// Consequently a runtime is retargeted by editing rules.dsl alone.  `branch`
+// covers the cases that used to force a construct back into C++ — a choice on a
+// runtime value, such as `if` on parallel and task.
 
 #include "OmpLowering/Transforms/PlanLoweringPass.h"
 #include "OmpLowering/IR/OmpLoweringOps.h"
@@ -57,6 +60,9 @@ struct ConstructEmitter {
   // can be settled while the rules are evaluated, because the outlining pass
   // has not collected the captures yet.
   llvm::StringMap<SmallVector<Value>> listBindings;
+  // The construct's kmp_task_t layout, when it declares one (iomp task).  Null
+  // otherwise — `populate_shareds` is the only action that reaches through it.
+  LLVM::LLVMStructType kmpTaskTy;
   Value identCache;
   Value gtidCache;
 
@@ -160,9 +166,25 @@ struct ConstructEmitter {
 
     llvm::StringRef callee = callAttr.getCallee().getValue();
 
+    // `let <name> = call ...`: the call yields a handle the rest of the plan
+    // refers to as "%<name>" — the kmp_task_t the alloc returns, which every
+    // later task call takes.  Runtime entry points that hand back a handle
+    // return a pointer; the ones whose result the plan drops are declared void
+    // below (a C symbol is not type-checked at link time, and no caller reads
+    // the discarded value).
+    if (auto resultName = callAttr.getResult()) {
+      func::FuncOp decl = getOrInsertDeclWithReturn(module, callee, argTypes,
+                                                    ptrTy(ctx), builder);
+      Value res = func::CallOp::create(builder, loc, decl, args).getResult(0);
+      bindings["%" + resultName.getValue().str()] = res;
+      return;
+    }
+
     // A callee that names a binding is a function *value*, not a symbol: the
     // outlined function's real name is only known to the outlining pass, which
-    // hands its address over as `body`.  Call through the pointer.
+    // hands its address over as `body`.  Call through the pointer, typed void:
+    // an entry that does return something (the task entry returns i32) is called
+    // for its effect only, and dropping the result is what the plan asked for.
     if (auto bound = bindings.find(callee); bound != bindings.end()) {
       auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(ctx),
                                               argTypes, /*isVarArg=*/false);
@@ -193,6 +215,38 @@ struct ConstructEmitter {
 
     func::FuncOp decl = getOrInsertDecl(module, callee, argTypes, builder);
     func::CallOp::create(builder, loc, decl, args);
+  }
+
+  // `emit populate_shareds(<task>)`: write the captures into the block the
+  // runtime allocated alongside the task, reached as load(task->shareds).
+  //
+  // The outlining pass resolved what each field receives — a private slot is
+  // undef, a scalar or pointer alloca is loaded by value, a plain capture is
+  // passed as-is — because that classification is its knowledge alone, and
+  // handed the values over as the `%captures` list.  What is left here is
+  // mechanical: the shareds struct is one field per bound value, in order, so
+  // its type follows from their types, exactly as the entry prolog rebuilds it.
+  void lowerPopulateShareds(PlanEmitAttr emitAttr) {
+    auto it = listBindings.find("%captures");
+    if (it == listBindings.end() || it->second.empty()) return;
+    if (!kmpTaskTy) return;
+    ArrayRef<Value> capVals = it->second;
+
+    Value base = resolveArg(emitAttr.getValue());
+    auto ptr = ptrTy(ctx);
+    Value sg = LLVM::GEPOp::create(builder, loc, ptr, kmpTaskTy, base,
+                                   ArrayRef<LLVM::GEPArg>{0, 0});
+    Value sh = LLVM::LoadOp::create(builder, loc, ptr, sg);
+
+    SmallVector<Type> fieldTypes;
+    for (Value v : capVals) fieldTypes.push_back(v.getType());
+    auto sharedsTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+
+    for (auto [i, v] : llvm::enumerate(capVals)) {
+      Value gep = LLVM::GEPOp::create(builder, loc, ptr, sharedsTy, sh,
+                                      ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      LLVM::StoreOp::create(builder, loc, v, gep);
+    }
   }
 
   // `branch <cond> { true => ... false => ... }`: the one plan action that is
@@ -259,6 +313,10 @@ struct ConstructEmitter {
     for (Attribute actionAttr : block) {
       if (auto emitAttr = llvm::dyn_cast<PlanEmitAttr>(actionAttr)) {
         llvm::StringRef nm = emitAttr.getSymName().getValue();
+        if (nm == "populate_shareds") {
+          lowerPopulateShareds(emitAttr);
+          continue;
+        }
         if (!bindings.count(nm))
           bindings[nm] = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
         continue;
@@ -282,6 +340,15 @@ struct ConstructEmitter {
 // Lowering one construct
 // ---------------------------------------------------------------------------
 
+// Read a string-valued DSL property off the construct.
+static llvm::StringRef getPropStr(ConstructOp op, llvm::StringRef key) {
+  auto dict = op.getPropDict();
+  if (!dict) return {};
+  if (auto sa = llvm::dyn_cast_or_null<StringAttr>(dict.get(key)))
+    return sa.getValue();
+  return {};
+}
+
 // A plain walk rather than a dialect conversion: `branch` splits the block it
 // is emitted into, and the conversion framework tracks IR changes in a way that
 // direct block surgery does not fit.  The outlining pass emits its own control
@@ -295,6 +362,15 @@ static LogicalResult lowerConstruct(ConstructOp op) {
     builder.setInsertionPoint(op);
 
     ConstructEmitter emitter{module, builder, op.getLoc(), op.getContext()};
+
+    // The kmp_task_t layout is DSL-owned (`kmp_task_t = struct(...)` on the
+    // task construct) and reaches here as the same "%struct:..." token the
+    // outlining pass expands for the entry prolog.  Only field 0, the shareds
+    // pointer, is read here; the header size the alloc call needs was computed
+    // by the outlining pass, which has the module DataLayout.
+    if (llvm::StringRef layout = getPropStr(op, "kmp_task_t"); !layout.empty())
+      emitter.kmpTaskTy =
+          parseStructProp(op.getContext(), layout, LLVM::LLVMStructType());
 
     // Seed the bindings from the construct's operands.  The 1:1 names array
     // says what each one is: a clause value ("num_threads", "if_clause") or a

@@ -92,19 +92,31 @@
         // No pre block: unlike parallel every task invoke call uses
         // both ident and global_tid, so there is no optionality.
         invoke {
-          // `let task = call ...` binds the __kmpc_omp_task_alloc result;
-          // `populate_shareds(task)` is a C++-backed verb that writes the
-          // captures into task->shareds (more documented in
-          // docs/lowering-specs/task-lowering-spec.md).  task_flags is the
+          // `let task = call ...` binds the __kmpc_omp_task_alloc result, which
+          // every call below takes; `populate_shareds(task)` is a C++-backed
+          // verb that writes the captures into task->shareds (more documented
+          // in docs/lowering-specs/task-lowering-spec.md).  task_flags is the
           // `let` above.
-          // if(cond) is handled in C++ around the __kmpc_omp_task call (a
-          // runtime-value branch the flat plan cannot express): cond false
-          // takes the undeferred begin_if0 / direct entry call / complete_if0
-          // path instead.
           let task = call "__kmpc_omp_task_alloc"(ident, global_tid, task_flags,
                                                   task_size, shareds_size, body);
           emit populate_shareds(task);
-          call "__kmpc_omp_task"(ident, global_tid, task);
+          // if(cond) branches on a runtime value, so it is a `branch` and not a
+          // `when`.  The task is allocated and populated either way — the
+          // undeferred path takes a kmp_task_t* too.  With no if clause the
+          // condition is null and only the deferred call survives.
+          branch if_clause {
+            // Deferred: hand the task to the runtime's scheduler.
+            true  => call "__kmpc_omp_task"(ident, global_tid, task);
+            // Undeferred: run it now on the spawning thread, between the
+            // runtime's begin/end pair.  The entry is called through the bound
+            // pointer rather than by name, because the outlined function's real
+            // name is known only to the outlining pass.
+            false => {
+              call "__kmpc_omp_task_begin_if0"(ident, global_tid, task);
+              call body(global_tid, task);
+              call "__kmpc_omp_task_complete_if0"(ident, global_tid, task);
+            }
+          }
         }
       }
     }

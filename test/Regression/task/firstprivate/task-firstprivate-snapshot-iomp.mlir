@@ -8,12 +8,17 @@
 // This is a runtime-scheduling-sensitive bug, so it cannot be pinned by an
 // end-to-end run (an eager task would read the right value even when broken).
 // Instead we assert the structural fix: the source scalar is captured BY VALUE,
-// so at the call site — right after __kmpc_omp_task_alloc, while populating
-// shareds — it is loaded (snapshotted) and stored into the shareds block.  The
-// broken lowering stores the source POINTER instead, with no i32 load here.
+// so at the call site it is loaded (snapshotted) and that scalar — not the
+// source POINTER — is what gets stored into the shareds block.
+//
+// The two halves come from different passes, which is why the load precedes the
+// allocation: the outlining pass resolves what each capture field receives (it
+// alone knows the classification) and the plan pass writes the values into the
+// block the runtime just handed back.  Only their order changes; the snapshot
+// still happens at task creation, which is what the test is about.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 omp.private {type = firstprivate} @fp_i32 : i32 copy {
 ^bb0(%src: !llvm.ptr, %dst: !llvm.ptr):
@@ -40,10 +45,11 @@ func.func @snapshot() {
 // The entry keeps its two-parameter ABI:
 // CHECK: func.func {{.*}}@outlined_task_{{[0-9]+}}(%{{[^,)]*}}: i32, %{{[^,)]*}}: !llvm.ptr) -> i32
 
-// At the call site the firstprivate value is snapshotted: after allocating the
-// task, the source scalar is loaded by value (not the pointer) and stored into
-// shareds, before scheduling the task.
+// At the call site the firstprivate value is snapshotted: the source scalar is
+// loaded by value (not the pointer), and that same value is the one stored into
+// the shareds block, before the task is scheduled.
 // CHECK-LABEL: func.func @snapshot
+// CHECK:   %[[SNAP:.*]] = llvm.load %{{.*}} : !llvm.ptr -> i32
 // CHECK:   call @__kmpc_omp_task_alloc
-// CHECK:   llvm.load %{{.*}} : !llvm.ptr -> i32
+// CHECK:   llvm.store %[[SNAP]], %{{.*}} : i32, !llvm.ptr
 // CHECK:   call @__kmpc_omp_task

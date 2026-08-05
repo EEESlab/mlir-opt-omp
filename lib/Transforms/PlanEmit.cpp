@@ -27,6 +27,32 @@ Type mlir::omp_lower::i32Ty(MLIRContext *ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// DSL-owned ABI layouts
+// ---------------------------------------------------------------------------
+
+Type mlir::omp_lower::parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
+  if (t == "ptr") return ptrTy(ctx);
+  if (t == "i32") return i32Ty(ctx);
+  if (t == "i64") return IntegerType::get(ctx, 64);
+  if (t == "i8")  return IntegerType::get(ctx, 8);
+  return ptrTy(ctx);
+}
+
+LLVM::LLVMStructType mlir::omp_lower::parseStructProp(
+    MLIRContext *ctx, llvm::StringRef prop, LLVM::LLVMStructType fallback) {
+  if (!prop.consume_front("%struct:")) return fallback;
+  SmallVector<llvm::StringRef> toks;
+  prop.split(toks, ',');
+  SmallVector<Type> fields;
+  for (auto tok : toks) {
+    tok = tok.trim();
+    if (!tok.empty()) fields.push_back(parseAbiType(ctx, tok));
+  }
+  if (fields.empty()) return fallback;
+  return LLVM::LLVMStructType::getLiteral(ctx, fields);
+}
+
+// ---------------------------------------------------------------------------
 // Runtime declarations
 // ---------------------------------------------------------------------------
 

@@ -247,33 +247,11 @@ static std::optional<CaptureAbi> parseCaptureAbi(llvm::StringRef s) {
   return std::nullopt;
 }
 
-// Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
-// type.  Kept small on purpose: extend as new layouts need more field types.
-static Type parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
-  if (t == "ptr") return ptrTy(ctx);
-  if (t == "i32") return i32Ty(ctx);
-  if (t == "i64") return IntegerType::get(ctx, 64);
-  if (t == "i8")  return IntegerType::get(ctx, 8);
-  return ptrTy(ctx);
-}
-
-// Read a DSL-owned struct-layout property of the form "%struct:t0,t1,..." into
-// an LLVM literal struct type.  Absent or malformed property falls back to the
-// caller's default so older DSL files keep working.
+// Read a DSL-owned struct-layout property into an LLVM literal struct type.
+// The expansion itself lives in PlanEmit: the plan pass reads the same layout.
 static LLVM::LLVMStructType getPropStructType(ConstructOp op, llvm::StringRef key,
     MLIRContext *ctx, LLVM::LLVMStructType fallback) {
-  std::string s = getPropStr(op, key);
-  llvm::StringRef body(s);
-  if (!body.consume_front("%struct:")) return fallback;
-  SmallVector<llvm::StringRef> toks;
-  body.split(toks, ',');
-  SmallVector<Type> fields;
-  for (auto tok : toks) {
-    tok = tok.trim();
-    if (!tok.empty()) fields.push_back(parseAbiType(ctx, tok));
-  }
-  if (fields.empty()) return fallback;
-  return LLVM::LLVMStructType::getLiteral(ctx, fields);
+  return parseStructProp(ctx, getPropStr(op, key), fallback);
 }
 
 // Emit a call to a no-arg function returning i32 (e.g. pi_core_id).
@@ -369,16 +347,22 @@ static void unpackCapturesFromBase(
   }
 }
 
-// At the call site (builder `b`), store each capture into the struct at
-// `structBase`.  Mirrors unpackCapturesFromBase: a private slot is left undef,
-// a scalar/ptr alloca is loaded by value, a plain capture is stored as-is.
-static void storeCapturesToBase(
-    OpBuilder &b, Location loc, Value structBase,
-    LLVM::LLVMStructType structTy, ArrayRef<Value> captures,
+// At the call site (builder `b`), compute the value that goes into each capture
+// field.  Mirrors unpackCapturesFromBase: a private slot is left undef, a
+// scalar/ptr alloca is loaded by value, a plain capture is passed as-is.
+//
+// Separate from the store below because the two halves can happen in different
+// passes.  The iomp task writes its captures into a block the *plan* pass
+// allocates (task->shareds), and only this pass knows the classification, so it
+// resolves the values here and hands them over as bindings; the plan pass then
+// only has to GEP and store them in order.
+static void resolveCaptureValues(
+    OpBuilder &b, Location loc, ArrayRef<Value> captures,
     ArrayRef<Type> fieldTypes,
     const llvm::SetVector<Value> &privateCaptures,
     const llvm::SetVector<Value> &scalarAllocaCaptures,
-    const llvm::SetVector<Value> &ptrAllocaCaptures) {
+    const llvm::SetVector<Value> &ptrAllocaCaptures,
+    SmallVectorImpl<Value> &out) {
   auto ptr = ptrTy(b.getContext());
   for (size_t i = 0; i < captures.size(); i++) {
     Value capVal;
@@ -391,9 +375,27 @@ static void storeCapturesToBase(
       capVal = LLVM::LoadOp::create(b, loc, ptr, captures[i]);
     else
       capVal = captures[i];
+    out.push_back(capVal);
+  }
+}
+
+// Resolve the captures and store them into the struct at `structBase`, for the
+// paths that build the struct themselves (the packed/closure call site).
+static void storeCapturesToBase(
+    OpBuilder &b, Location loc, Value structBase,
+    LLVM::LLVMStructType structTy, ArrayRef<Value> captures,
+    ArrayRef<Type> fieldTypes,
+    const llvm::SetVector<Value> &privateCaptures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures) {
+  SmallVector<Value> capVals;
+  resolveCaptureValues(b, loc, captures, fieldTypes, privateCaptures,
+                       scalarAllocaCaptures, ptrAllocaCaptures, capVals);
+  auto ptr = ptrTy(b.getContext());
+  for (size_t i = 0; i < capVals.size(); i++) {
     Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
       ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-    LLVM::StoreOp::create(b, loc, capVal, gep);
+    LLVM::StoreOp::create(b, loc, capVals[i], gep);
   }
 }
 
@@ -457,25 +459,24 @@ static void replaceTerminatorsWithReturn(
 // ---------------------------------------------------------------------------
 // 1a. IOMP TASK OUTLINING  (capture_strategy = shareds)
 // ---------------------------------------------------------------------------
-// Lowers an omp_lower.construct for an iomp task:
-//   - outlines the body into an entry function  i32(i32 gtid, ptr task) that
-//     loads task->shareds and unpacks the captures from it;
-//   - at the call site emits __kmpc_omp_task_alloc, populates task->shareds
-//     with the captures, then __kmpc_omp_task.
-// An omp.taskwait nested in the task body is lowered here too (via the shared
-// leaf helper) when the runtime provides a taskwait plan; %gtid is the entry's
-// arg 0 (an i32 value, unlike the microtask ptr-to-i32 convention).
+// Outlines an omp_lower.construct for an iomp task into an entry function
+// i32(i32 gtid, ptr task) that loads task->shareds and unpacks the captures
+// from it, then hands the construct to PlanLoweringPass with the entry pointer,
+// the two ABI sizes and the resolved capture values bound to it.  The call
+// sequence itself — alloc, the write into task->shareds, and the if0 branch —
+// is stated in rules.dsl and emitted there.
+// An omp.taskwait nested in the task body is lowered by the plan pass like any
+// other leaf; %gtid is bound here to the entry's arg 0 (an i32 value, unlike
+// the microtask ptr-to-i32 convention).
 // Supports implicit captures and explicit firstprivate clauses (copy-in into a
-// task-private slot, mirroring the packed path), and the if clause via a
-// runtime branch: deferred __kmpc_omp_task when the condition holds, the
-// undeferred __kmpc_omp_task_begin_if0 / direct entry call / _complete_if0
-// protocol when it does not.  v1 limitations: pure `private` clauses are not
-// wired (diagnosed, not miscompiled); no final clause; task_flags = 1 (tied);
-// depend/nowait on taskwait ignored; omp.barrier is illegal in a task region
-// and diagnosed.
+// task-private slot, mirroring the packed path).  v1 limitations: pure
+// `private` clauses are not wired (diagnosed, not miscompiled); no final
+// clause; task_flags = 1 (tied); depend/nowait on taskwait ignored;
+// omp.barrier is illegal in a task region and diagnosed.
 static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
                              llvm::function_ref<Value(OpBuilder &, Location)>
                                  makeGtid);
+static bool planNamesToken(ConstructOp op, llvm::StringRef token);
 
 static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   Region &body = op.getBody();
@@ -622,161 +623,64 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   });
 
   // ---- Call site ----
+  // Hand the construct over to PlanLoweringPass, like every other region
+  // construct.  This pass attaches only what it alone can produce — the entry
+  // pointer, the two ABI sizes and the resolved capture values — and leaves the
+  // construct standing.  Everything else is stated in rules.dsl and emitted
+  // there: the alloc call and the binding of its result, the write into
+  // task->shareds, and the if0 branch.
+  //
+  // ident and the global thread id are not bound: the plan pass materialises
+  // both on first reference, as it does for barrier and taskwait.
   builder.setInsertionPoint(op);
-
-  // ident and global_tid are resolved on demand from the invoke args (same
-  // model as parallel/barrier/wsloop — no DSL `emit`).  Unlike parallel, where
-  // gtid is optional, every task invoke call uses both, so materialising them
-  // eagerly here is equivalent to lazy and keeps the code simpler: one ident
-  // global and one global_tid_function call (DSL property, iomp:
-  // __kmpc_global_thread_num) shared by the two invoke calls.  gtid seeds off
-  // the default (KMPC-flagged) ident, matching the runtime's contract.
-  Value identVal = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
-  std::string gtidFnName = getPropStr(op, "global_tid_function");
-  Value gtid;
-  if (gtidFnName.empty()) {
-    // No global_tid_function DSL property (non-iomp runtime): there is no gtid
-    // source, and declaring a nameless function would fail the verifier.
-    op.emitWarning("task lowering: runtime defines no global_tid_function; "
-                   "using undef gtid");
-    gtid = LLVM::UndefOp::create(builder, loc, i32t);
-  } else {
-    auto gtidDecl = getOrInsertDeclWithReturn(module,
-      gtidFnName, {ptr}, i32t, builder);
-    gtid = func::CallOp::create(builder, loc, gtidDecl,
-      ValueRange{identVal}).getResult(0);
-  }
 
   DataLayout dl(module);
   uint64_t taskSize    = dl.getTypeSize(kmpTaskTy).getFixedValue();
   uint64_t sharedsSize = dl.getTypeSize(sharedsTy).getFixedValue();
-  Value taskSizeV = LLVM::ConstantOp::create(builder, loc, i64t,
-    IntegerAttr::get(i64t, (int64_t)taskSize));
-  Value sharedsSizeV = LLVM::ConstantOp::create(builder, loc, i64t,
-    IntegerAttr::get(i64t, (int64_t)sharedsSize));
 
   Value fnPtr = func::ConstantOp::create(builder, loc,
     outlinedFn.getFunctionType(), FlatSymbolRefAttr::get(ctx, fnName));
   Value fnPtrCast = UnrealizedConversionCastOp::create(builder, loc,
     TypeRange{ptr}, ValueRange{fnPtr}).getResult(0);
 
-  // Emit the invoke actions in DSL order.  A `let <name> = call ...` binds the
-  // call's SSA result under the token "%<name>"; later arg tokens and the
-  // `populate_shareds` verb resolve against this map (Approach B, see
-  // docs/dsl-result-binding-proposal.md).  The construct's built-in tokens
-  // (task_size/shareds_size/body) seed the same map; because the map lookup
-  // runs first, a `let` result shadows a built-in of the same name.
-  // task_flags is not a symbolic token: it is a `let task_flags = 1;` in
-  // rules.dsl, so it reaches the invoke as an IntegerAttr and is handled by the
-  // integer branch of the arg loop below.
-  llvm::StringMap<Value> boundResults;
-  boundResults["task_size"]    = taskSizeV;
-  boundResults["shareds_size"] = sharedsSizeV;
-  boundResults["body"]         = fnPtrCast;
+  // The values the shareds fields receive.  Resolved here because the
+  // private / scalar-alloca / ptr-alloca classification is outlining knowledge;
+  // the plan pass only GEPs and stores them, in this order.
+  SmallVector<Value> capVals;
+  resolveCaptureValues(builder, loc, captures, fieldTypes, privateCaptures,
+                       scalarAllocaCaptures, ptrAllocaCaptures, capVals);
 
-  // Resolve one symbolic string arg to an SSA value (see resolveSymbolToken).
-  // The default (KMPC) ident reuses the value materialised above; %gtid is the
-  // gtid emitted eagerly at the call site (every task invoke call needs it).
-  auto resolveToken = [&](llvm::StringRef s) -> Value {
-    return resolveSymbolToken(
-        s, builder, loc, boundResults,
-        [&](uint32_t flags) {
-          return resolveIdentToken(flags, module, builder, loc, ctx,
-                                   [&] { return identVal; });
-        },
-        [&] { return gtid; });
+  SmallVector<Value> operands(op.getClauseOperands().begin(),
+                              op.getClauseOperands().end());
+  SmallVector<Attribute> names;
+  if (auto existing = op.getClauseNames())
+    names.assign(existing->begin(), existing->end());
+  auto bind = [&](llvm::StringRef n, Value v) {
+    operands.push_back(v);
+    names.push_back(StringAttr::get(ctx, n));
   };
+  // The entry address, under the one name the task plan uses for it: as the
+  // alloc call's `body` argument, and as the callee of the direct call on the
+  // undeferred side of `if`.
+  bind("body", fnPtrCast);
+  // __kmpc_omp_task_alloc's two size arguments: the kmp_task_t header (so the
+  // runtime's writes to it stay in bounds) and the shareds block.
+  bind("task_size", LLVM::ConstantOp::create(builder, loc, i64t,
+                      IntegerAttr::get(i64t, (int64_t)taskSize)));
+  bind("shareds_size", LLVM::ConstantOp::create(builder, loc, i64t,
+                         IntegerAttr::get(i64t, (int64_t)sharedsSize)));
+  // captures is a list: every operand under this name belongs to it, and
+  // list_names keeps it a list even when there are none.
+  for (Value v : capVals) bind("%captures", v);
 
-  for (auto attr : op.getInvoke()) {
-    // `emit populate_shareds(<task>)`: write the captures into task->shareds.
-    if (auto ea = llvm::dyn_cast<PlanEmitAttr>(attr)) {
-      if (ea.getSymName().getValue() != "populate_shareds") continue;
-      if (captures.empty()) continue;
-      Value base;
-      if (auto sv = llvm::dyn_cast<StringAttr>(ea.getValue()))
-        base = resolveToken(sv.getValue());
-      else
-        base = LLVM::UndefOp::create(builder, loc, ptr);
-      Value sg = LLVM::GEPOp::create(builder, loc, ptr, kmpTaskTy, base,
-        ArrayRef<LLVM::GEPArg>{0, 0});
-      Value sh = LLVM::LoadOp::create(builder, loc, ptr, sg);
-      storeCapturesToBase(builder, loc, sh, sharedsTy, captures, fieldTypes,
-        privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
-      continue;
-    }
-
-    auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
-    if (!ca) continue;
-    llvm::StringRef callee = ca.getCallee().getValue();
-    SmallVector<Value> args;
-    SmallVector<Type>  types;
-    for (auto argAttr : ca.getArgs()) {
-      Value v;
-      if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-        v = resolveToken(sa.getValue());
-      } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
-        v = arith::ConstantOp::create(builder, loc, i32t,
-          IntegerAttr::get(i32t, ia.getInt()));
-      } else {
-        v = LLVM::UndefOp::create(builder, loc, ptr);
-      }
-      args.push_back(v);
-      types.push_back(v.getType());
-    }
-
-    // A bound call returns a handle (ptr); a fire-and-forget call returns i32
-    // and its result is dropped.
-    if (auto resultName = ca.getResult()) {
-      auto decl = getOrInsertDeclWithReturn(module, callee, types, ptr, builder);
-      Value res = func::CallOp::create(builder, loc, decl, args).getResult(0);
-      boundResults["%" + resultName.getValue().str()] = res;
-    } else if (callee == "__kmpc_omp_task" && !args.empty() &&
-               getClauseOperand(op, "if_clause")) {
-      // if(cond) needs a branch on the runtime value (the flat DSL plan can
-      // only branch on clause *presence*), so it is emitted here:
-      //   cond true  → deferred:   __kmpc_omp_task(ident, gtid, task)
-      //   cond false → undeferred: the if0 protocol — begin_if0, direct call
-      //                of the entry on the current thread, complete_if0.
-      // The task is allocated either way (the if0 calls also take kmp_task_t*).
-      // The task handle is the call's last resolved arg (the DSL `task`
-      // binding in `call "__kmpc_omp_task"(ident, global_tid, task)`).
-      Value taskV = args.back();
-      Value cond = clauseToI1(builder, loc, getClauseOperand(op, "if_clause"));
-      Block *curBlock = builder.getInsertionBlock();
-      // op and everything after it continue in contBlock.
-      Block *contBlock = curBlock->splitBlock(op);
-      Block *deferredBlock = builder.createBlock(contBlock);
-      Block *if0Block = builder.createBlock(contBlock);
-
-      builder.setInsertionPointToEnd(curBlock);
-      LLVM::CondBrOp::create(builder, loc, cond, deferredBlock, if0Block);
-
-      builder.setInsertionPointToEnd(deferredBlock);
-      auto decl = getOrInsertDeclWithReturn(module, callee, types, i32t, builder);
-      func::CallOp::create(builder, loc, decl, args);
-      LLVM::BrOp::create(builder, loc, contBlock);
-
-      builder.setInsertionPointToEnd(if0Block);
-      auto beginDecl = getOrInsertDecl(module, "__kmpc_omp_task_begin_if0",
-        {ptr, i32t, ptr}, builder);
-      func::CallOp::create(builder, loc, beginDecl,
-        ValueRange{identVal, gtid, taskV});
-      func::CallOp::create(builder, loc, outlinedFn,
-        ValueRange{gtid, taskV});
-      auto completeDecl = getOrInsertDecl(module, "__kmpc_omp_task_complete_if0",
-        {ptr, i32t, ptr}, builder);
-      func::CallOp::create(builder, loc, completeDecl,
-        ValueRange{identVal, gtid, taskV});
-      LLVM::BrOp::create(builder, loc, contBlock);
-
-      builder.setInsertionPoint(op);
-    } else {
-      auto decl = getOrInsertDeclWithReturn(module, callee, types, i32t, builder);
-      func::CallOp::create(builder, loc, decl, args);
-    }
-  }
-
-  op.erase();
+  op->setOperands(operands);
+  op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+  op.setListNamesAttr(ArrayAttr::get(ctx,
+      {StringAttr::get(ctx, "%captures")}));
+  if (getClauseOperand(op, "if_clause") && !planNamesToken(op, "if_clause"))
+    op.emitWarning("omp-outline: `if` clause is not supported by this "
+                   "runtime/construct lowering and was ignored");
+  return;   // deliberately not erased: the plan pass consumes it
 }
 
 // Lower leaf omp ops (omp.barrier, omp.taskwait) that ride inside an outlined

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
@@ -30,6 +31,19 @@ namespace omp_lower {
 // --- Type helpers -----------------------------------------------------------
 Type ptrTy(MLIRContext *ctx);
 Type i32Ty(MLIRContext *ctx);
+
+// --- DSL-owned ABI layouts --------------------------------------------------
+// Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
+// type.  Kept small on purpose: extend as new layouts need more field types.
+Type parseAbiType(MLIRContext *ctx, llvm::StringRef t);
+
+// Expand a DSL struct-layout property of the form "%struct:t0,t1,..." into an
+// LLVM literal struct type.  An absent or malformed property falls back to the
+// caller's default so older DSL files keep working.  Shared because both passes
+// read the same layout: the outlining pass builds the entry prolog from it, the
+// plan pass reaches task->shareds through it.
+LLVM::LLVMStructType parseStructProp(MLIRContext *ctx, llvm::StringRef prop,
+                                     LLVM::LLVMStructType fallback);
 
 // --- Runtime declarations ---------------------------------------------------
 // Get (creating on first use) a private external func declaration for a runtime

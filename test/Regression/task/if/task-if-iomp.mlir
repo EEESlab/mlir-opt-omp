@@ -3,8 +3,12 @@
 // when false it must run undeferred on the spawning thread, via the
 // __kmpc_omp_task_begin_if0 / direct entry call / __kmpc_omp_task_complete_if0
 // protocol.  The task is allocated (and shareds populated) either way.
+// Both sides are stated in rules.dsl as a `branch` and emitted by
+// PlanLoweringPass.  The entry call on the undeferred side goes through the
+// bound function pointer rather than the symbol, because the outlined
+// function's real name is known only to the outlining pass.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 
@@ -17,7 +21,7 @@ func.func @task_if(%arg0: !llvm.ptr, %cond: i1) {
 }
 
 // The body is outlined into the kmp task-entry signature, returning i32.
-// CHECK: func.func {{.*}}@[[ENTRY:outlined_task_[0-9]+]](%{{.*}}: i32, %{{.*}}: !llvm.ptr) -> i32
+// CHECK: func.func {{.*}}@outlined_task_{{[0-9]+}}(%{{.*}}: i32, %{{.*}}: !llvm.ptr) -> i32
 
 // The call site allocates the task unconditionally, then branches on the
 // condition value.
@@ -31,9 +35,10 @@ func.func @task_if(%arg0: !llvm.ptr, %cond: i1) {
 // CHECK:         call @__kmpc_omp_task({{.*}}%[[GTID]], %[[TASK]])
 // CHECK:         llvm.br ^[[CONT:bb[0-9]+]]
 
-// false → undeferred: begin_if0, direct call of the entry, complete_if0.
+// false → undeferred: begin_if0, a direct call of the entry through the bound
+// pointer, complete_if0.
 // CHECK:       ^[[IF0]]:
 // CHECK:         call @__kmpc_omp_task_begin_if0({{.*}}%[[GTID]], %[[TASK]])
-// CHECK:         call @[[ENTRY]](%[[GTID]], %[[TASK]])
+// CHECK:         llvm.call %{{.*}}(%[[GTID]], %[[TASK]]) : !llvm.ptr,
 // CHECK:         call @__kmpc_omp_task_complete_if0({{.*}}%[[GTID]], %[[TASK]])
 // CHECK:         llvm.br ^[[CONT]]

@@ -2,8 +2,11 @@
 // __kmpc_omp_task sequence: the body is outlined into an i32(i32 gtid, ptr task)
 // entry that reads its captures from task->shareds, and the call site allocates
 // the task, populates shareds, and schedules it.
+// The whole call sequence is stated in rules.dsl and emitted by
+// PlanLoweringPass; the outlining pass contributes only the entry pointer, the
+// two ABI sizes and the resolved capture values.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 //
 // The DSL-owned kmp_task_t layout reaches the construct's prop_dict as the
 // symbolic `%struct:...` token, which the outlining pass re-expands.
@@ -26,8 +29,14 @@ func.func @task(%arg0: !llvm.ptr) {
 // CHECK: func.func {{.*}}@outlined_task_{{[0-9]+}}(%{{.*}}: i32, %{{.*}}: !llvm.ptr) -> i32
 // CHECK:   llvm.call @use
 
-// The call site allocates the task and schedules it.
+// The call site allocates the task, writes the captures into the block the
+// runtime allocated alongside it — reached through field 0 of kmp_task_t, whose
+// layout is the DSL's — and schedules it.
 // CHECK-LABEL: func.func @task
 // CHECK:       call @__kmpc_global_thread_num
-// CHECK:       call @__kmpc_omp_task_alloc
-// CHECK:       call @__kmpc_omp_task
+// CHECK:       %[[TASK:.*]] = call @__kmpc_omp_task_alloc
+// CHECK:       %[[SHGEP:.*]] = llvm.getelementptr %[[TASK]][0, 0] {{.*}}!llvm.struct<(ptr, ptr, i32, ptr, ptr)>
+// CHECK:       %[[SHAREDS:.*]] = llvm.load %[[SHGEP]]
+// CHECK:       %[[F0:.*]] = llvm.getelementptr %[[SHAREDS]][0, 0]
+// CHECK:       llvm.store %[[CAP:.*]], %[[F0]]
+// CHECK:       call @__kmpc_omp_task({{.*}}, %[[TASK]])
