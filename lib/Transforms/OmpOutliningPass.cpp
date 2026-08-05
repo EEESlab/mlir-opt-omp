@@ -828,6 +828,25 @@ static bool planNamesToken(ConstructOp op, llvm::StringRef token) {
          blockNamesToken(op.getPost(), token);
 }
 
+// The callee of the first call in a plan block, looking inside branch arms.
+//
+// This drives which emission path runs below, so it has to see through a
+// branch: libgomp's parallel invoke is one, and stopping at the top level
+// would report "no call at all" and skip the whole call-site emission.
+static std::string firstPlanCallee(ArrayAttr block) {
+  if (!block) return "";
+  for (Attribute a : block) {
+    if (auto call = llvm::dyn_cast<PlanCallAttr>(a))
+      return call.getCallee().getValue().str();
+    if (auto br = llvm::dyn_cast<PlanBranchAttr>(a)) {
+      std::string c = firstPlanCallee(br.getIfTrue());
+      if (c.empty()) c = firstPlanCallee(br.getIfFalse());
+      if (!c.empty()) return c;
+    }
+  }
+  return "";
+}
+
 static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
                              llvm::function_ref<Value(OpBuilder &, Location)>
                                  makeGtid) {
@@ -1166,12 +1185,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
   });
 
   // ---- Emit the runtime call at the call site ----
-  std::string runtimeCallee;
-  for (auto attr : op.getInvoke())
-    if (auto ca = llvm::dyn_cast<PlanCallAttr>(attr)) {
-      runtimeCallee = ca.getCallee().getValue().str();
-      break;
-    }
+  std::string runtimeCallee = firstPlanCallee(op.getInvoke());
 
   // Set by whichever emission path consumes the if clause; checked after
   // emission so an unconsumed if is flagged instead of silently dropped.
