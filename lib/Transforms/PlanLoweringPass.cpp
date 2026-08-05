@@ -1,10 +1,18 @@
 // PlanLoweringPass.cpp
 //
 // Converts every omp_lower.construct op into concrete func.call operations
-// targeting the selected OpenMP runtime (iomp or libgomp).
+// targeting the selected OpenMP runtime (iomp, libgomp or pmsis).
+//
+// This is where a plan becomes calls.  Constructs with a body are consumed
+// earlier by OmpOutliningPass, which has to emit their calls itself: the
+// arguments depend on outlining artifacts (the outlined function, the capture
+// struct) and the `if` clause needs a branch on a runtime value, which a flat
+// plan cannot express.  Everything else — barrier, taskwait — reaches this pass
+// and is lowered here.
 
 #include "OmpLowering/Transforms/PlanLoweringPass.h"
 #include "OmpLowering/IR/OmpLoweringOps.h"
+#include "PlanEmit.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -25,98 +33,92 @@ using namespace mlir::omp_lower;
 
 namespace {
 
-static Type opaquePtr(MLIRContext *ctx) {
-  return LLVM::LLVMPointerType::get(ctx);
-}
+// Emission state for one construct.  The default ident and the global thread id
+// are materialised on first reference and then reused, so a plan naming them
+// several times still emits one global and one __kmpc_global_thread_num call.
+//
+// Resolution goes through the shared vocabulary in PlanEmit.h — the same one the
+// outlining pass uses.  Before that was shared, this pass resolved every token
+// it did not recognise to an undef pointer, which is why top-level barrier and
+// taskwait had to be lowered in the outlining pass instead: an undef where iomp
+// expects a gtid crashes the runtime.
+struct ConstructEmitter {
+  ModuleOp module;
+  OpBuilder &builder;
+  Location loc;
+  MLIRContext *ctx;
+  // `emit`-declared symbols, bound as they are encountered.
+  llvm::StringMap<Value> bindings;
+  Value identCache;
+  Value gtidCache;
 
-// Resolve a plan argument attribute to an SSA Value.
-static Value resolveArg(Attribute arg,
-                        llvm::StringMap<Value> &valueMap,
-                        OpBuilder &builder,
-                        Location loc) {
-  if (auto intAttr = llvm::dyn_cast<IntegerAttr>(arg))
-    return arith::ConstantOp::create(builder, loc,
-        builder.getI32Type(),
-        builder.getI32IntegerAttr(
-            static_cast<int32_t>(intAttr.getInt())));
-
-  if (auto strAttr = llvm::dyn_cast<StringAttr>(arg)) {
-    llvm::StringRef nm = strAttr.getValue();
-    auto it = valueMap.find(nm);
-    if (it != valueMap.end())
-      return it->second;
-    Value ph = LLVM::UndefOp::create(builder, loc, opaquePtr(builder.getContext()));
-    valueMap[nm] = ph;
-    return ph;
+  Value getIdent() {
+    if (!identCache)
+      identCache = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
+    return identCache;
   }
 
-  // Nested ArrayAttr (e.g. a captures list) – opaque pointer placeholder.
-  return LLVM::UndefOp::create(builder, loc, opaquePtr(builder.getContext()));
-}
+  Value getGtid() {
+    if (!gtidCache) {
+      auto decl = getOrInsertDeclWithReturn(module, "__kmpc_global_thread_num",
+                                            {ptrTy(ctx)}, i32Ty(ctx), builder);
+      gtidCache = func::CallOp::create(builder, loc, decl,
+                                       ValueRange{getIdent()}).getResult(0);
+    }
+    return gtidCache;
+  }
 
-// Ensure a private external func declaration exists for the callee,
-// using the actual argument types provided.
-static func::FuncOp getOrInsertRuntimeDecl(ModuleOp module,
-                                           llvm::StringRef callee,
-                                           ArrayRef<Type> argTypes,
-                                           OpBuilder &builder) {
-  if (auto existing = module.lookupSymbol<func::FuncOp>(callee))
-    return existing;
+  Value resolveArg(Attribute arg) {
+    if (auto intAttr = llvm::dyn_cast<IntegerAttr>(arg))
+      return arith::ConstantOp::create(builder, loc, i32Ty(ctx),
+          IntegerAttr::get(i32Ty(ctx), intAttr.getInt()));
 
-  MLIRContext *ctx = module.getContext();
-  auto fnType = builder.getFunctionType(argTypes, {});
+    if (auto strAttr = llvm::dyn_cast<StringAttr>(arg))
+      return resolveSymbolToken(
+          strAttr.getValue(), builder, loc, bindings,
+          [&](uint32_t flags) {
+            return resolveIdentToken(flags, module, builder, loc, ctx,
+                                     [&] { return getIdent(); });
+          },
+          [&] { return getGtid(); });
 
-  OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  auto decl = func::FuncOp::create(builder.getUnknownLoc(), callee, fnType);
-  module.getBody()->push_back(decl);
-  decl.setVisibility(SymbolTable::Visibility::Private);
-  decl->setAttr("llvm.linkage",
-                LLVM::LinkageAttr::get(ctx, LLVM::Linkage::External));
-  return decl;
-}
+    // Nested ArrayAttr (e.g. a captures list) – opaque pointer placeholder.
+    return LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+  }
 
-// Lower one plan block (pre / invoke / post).
-static void lowerBlock(ArrayAttr block,
-                       ModuleOp module,
-                       OpBuilder &builder,
-                       Location loc,
-                       llvm::StringMap<Value> &valueMap) {
-  if (!block) return;
+  // Lower one plan block (pre / invoke / post).
+  void lowerBlock(ArrayAttr block) {
+    if (!block) return;
 
-  for (Attribute actionAttr : block) {
-    if (auto emitAttr = llvm::dyn_cast<PlanEmitAttr>(actionAttr)) {
-      llvm::StringRef nm = emitAttr.getSymName().getValue();
-      if (!valueMap.count(nm)) {
-        Value v = LLVM::UndefOp::create(builder, loc,
-                      opaquePtr(builder.getContext()));
-        valueMap[nm] = v;
+    for (Attribute actionAttr : block) {
+      if (auto emitAttr = llvm::dyn_cast<PlanEmitAttr>(actionAttr)) {
+        llvm::StringRef nm = emitAttr.getSymName().getValue();
+        if (!bindings.count(nm))
+          bindings[nm] = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+        continue;
       }
-      continue;
-    }
 
-    if (auto callAttr = llvm::dyn_cast<PlanCallAttr>(actionAttr)) {
-      llvm::StringRef callee = callAttr.getCallee().getValue();
-      ArrayAttr argAttrs = callAttr.getArgs();
+      if (auto callAttr = llvm::dyn_cast<PlanCallAttr>(actionAttr)) {
+        ArrayAttr argAttrs = callAttr.getArgs();
 
-      SmallVector<Value> args;
-      args.reserve(argAttrs.size());
-      for (Attribute a : argAttrs)
-        args.push_back(resolveArg(a, valueMap, builder, loc));
+        SmallVector<Value> args;
+        SmallVector<Type>  argTypes;
+        args.reserve(argAttrs.size());
+        argTypes.reserve(argAttrs.size());
+        for (Attribute a : argAttrs) {
+          Value v = resolveArg(a);
+          args.push_back(v);
+          argTypes.push_back(v.getType());
+        }
 
-      // Collect the actual types from the resolved SSA values.
-      SmallVector<Type> argTypes;
-      argTypes.reserve(args.size());
-      for (auto v : args)
-        argTypes.push_back(v.getType());
-
-      func::FuncOp decl =
-          getOrInsertRuntimeDecl(module, callee, argTypes, builder);
-      func::CallOp::create(builder, loc, decl, args);
-      continue;
+        func::FuncOp decl = getOrInsertDecl(
+            module, callAttr.getCallee().getValue(), argTypes, builder);
+        func::CallOp::create(builder, loc, decl, args);
+        continue;
+      }
     }
   }
-}
+};
 
 // ---------------------------------------------------------------------------
 // Rewrite pattern
@@ -132,14 +134,13 @@ struct ConstructOpLowering : public OpConversionPattern<ConstructOp> {
     if (!module)
       return op.emitOpError("expected parent ModuleOp");
 
-    llvm::StringMap<Value> valueMap;
     OpBuilder builder(rewriter);
     builder.setInsertionPoint(op);
-    Location loc = op.getLoc();
 
-    lowerBlock(op.getPre(),    module, builder, loc, valueMap);
-    lowerBlock(op.getInvoke(), module, builder, loc, valueMap);
-    lowerBlock(op.getPost(),   module, builder, loc, valueMap);
+    ConstructEmitter emitter{module, builder, op.getLoc(), op.getContext()};
+    emitter.lowerBlock(op.getPre());
+    emitter.lowerBlock(op.getInvoke());
+    emitter.lowerBlock(op.getPost());
 
     rewriter.eraseOp(op);
     return success();

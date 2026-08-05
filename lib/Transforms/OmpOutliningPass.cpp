@@ -24,6 +24,7 @@
 #include "OmpLowering/IR/OmpLoweringOps.h"
 #include "OmpLowering/DSL/DSLEvaluator.h"
 #include "OmpLowering/DSL/DSLParser.h"
+#include "PlanEmit.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -47,18 +48,6 @@ using namespace mlir;
 using namespace mlir::omp_lower;
 
 namespace {
-
-// ---------------------------------------------------------------------------
-// Type helpers
-// ---------------------------------------------------------------------------
-
-static Type ptrTy(MLIRContext *ctx) {
-  return LLVM::LLVMPointerType::get(ctx);
-}
-
-static Type i32Ty(MLIRContext *ctx) {
-  return IntegerType::get(ctx, 32);
-}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -294,42 +283,6 @@ static LLVM::LLVMStructType getPropStructType(ConstructOp op, llvm::StringRef ke
   return LLVM::LLVMStructType::getLiteral(ctx, fields);
 }
 
-static func::FuncOp getOrInsertDecl(ModuleOp module,
-                                    llvm::StringRef name,
-                                    ArrayRef<Type> argTypes,
-                                    OpBuilder &builder) {
-  if (auto f = module.lookupSymbol<func::FuncOp>(name)) return f;
-  auto fnType = builder.getFunctionType(argTypes, {});
-  OpBuilder::InsertionGuard g(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  auto decl = func::FuncOp::create(builder.getUnknownLoc(), name, fnType);
-  module.getBody()->push_back(decl);
-  decl.setVisibility(SymbolTable::Visibility::Private);
-  decl->setAttr("llvm.linkage",
-                LLVM::LinkageAttr::get(module.getContext(),
-                                       LLVM::Linkage::External));
-  return decl;
-}
-
-static func::FuncOp getOrInsertDeclWithReturn(ModuleOp module,
-                                              llvm::StringRef name,
-                                              ArrayRef<Type> argTypes,
-                                              Type returnType,
-                                              OpBuilder &builder) {
-  if (auto f = module.lookupSymbol<func::FuncOp>(name)) return f;
-  SmallVector<Type> resultTypes = {returnType};
-  auto fnType = builder.getFunctionType(argTypes, resultTypes);
-  OpBuilder::InsertionGuard g(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  auto decl = func::FuncOp::create(builder.getUnknownLoc(), name, fnType);
-  module.getBody()->push_back(decl);
-  decl.setVisibility(SymbolTable::Visibility::Private);
-  decl->setAttr("llvm.linkage",
-                LLVM::LinkageAttr::get(module.getContext(),
-                                       LLVM::Linkage::External));
-  return decl;
-}
-
 // Emit a call to a no-arg function returning i32 (e.g. pi_core_id).
 // Handles both func.func and llvm.func declarations.
 static Value emitNoArgI32Call(ModuleOp module, OpBuilder &builder,
@@ -342,153 +295,6 @@ static Value emitNoArgI32Call(ModuleOp module, OpBuilder &builder,
   }
   auto decl = getOrInsertDeclWithReturn(module, name, {}, i32t, builder);
   return func::CallOp::create(builder, loc, decl, ValueRange{}).getResult(0);
-}
-
-// KMP_IDENT_KMPC: the default ident flag, always set, mirroring
-// OMPIRBuilder::getOrCreateIdent.  Idents with exactly these flags are the
-// "default ident" that fork/gtid calls seed off and that call sites cache.
-static constexpr uint32_t kIdentKmpc = 0x02;
-
-// Map a DSL ident flag token to the effective `ident_t.flags` bitmask.
-// Values match clang's OpenMPLocationFlags (CGOpenMPRuntime.cpp).
-static uint32_t identFlagBits(llvm::StringRef tok) {
-  uint32_t kmpc = kIdentKmpc;
-  if (tok.empty() || tok == "kmpc")        return kmpc;
-  if (tok == "barrier_expl")               return kmpc | 0x20;
-  if (tok == "barrier_impl" ||
-      tok == "barrier_impl_for")           return kmpc | 0x40;
-  if (tok == "barrier_impl_sections")      return kmpc | 0xC0;
-  if (tok == "barrier_impl_single")        return kmpc | 0x140;
-  if (tok == "work_loop")                  return kmpc | 0x200;
-  if (tok == "work_sections")              return kmpc | 0x400;
-  if (tok == "work_distribute")            return kmpc | 0x800;
-  return kmpc; // unknown token → plain KMPC
-}
-
-// Recognise a symbolic ident reference: "ident", "%ident", or "%ident:<flag>".
-// On match, set `flagsOut` to the effective flag bits and return true.
-static bool parseIdentRef(llvm::StringRef s, uint32_t &flagsOut) {
-  if (!(s.consume_front("%ident") || s.consume_front("ident")))
-    return false;
-  llvm::StringRef flag = "";
-  if (s.consume_front(":"))
-    flag = s;
-  else if (!s.empty())
-    return false; // e.g. "identity" must not match
-  flagsOut = identFlagBits(flag);
-  return true;
-}
-
-// Get (creating on first use) the address of the `ident_t` global for a given
-// flags value. Mirrors OMPIRBuilder::getOrCreateIdent: one private constant
-// global per distinct flags value, all sharing a single default psource string
-// ";unknown;unknown;0;0;;" (reserved_3 = its length, NUL excluded).
-static Value getOrCreateIdent(ModuleOp module, OpBuilder &builder, Location loc,
-                              MLIRContext *ctx, uint32_t flags) {
-  auto i32t = IntegerType::get(ctx, 32);
-  auto ptr  = ptrTy(ctx);
-
-  // Shared default source-location string, NUL-terminated like
-  // ConstantDataArray::getString. reserved_3 stores the length without NUL.
-  llvm::StringRef srcName = "__omp_src_loc_default";
-  const std::string srcText = ";unknown;unknown;0;0;;";
-  if (!module.lookupSymbol(srcName)) {
-    std::string data = srcText;
-    data.push_back('\0');
-    auto arrTy = LLVM::LLVMArrayType::get(IntegerType::get(ctx, 8), data.size());
-    OpBuilder gb(ctx);
-    gb.setInsertionPointToStart(module.getBody());
-    LLVM::GlobalOp::create(gb, loc, arrTy, /*isConstant=*/true,
-      LLVM::Linkage::Private, srcName, StringAttr::get(ctx, data));
-  }
-
-  std::string identName = "__omp_ident_" + llvm::utohexstr(flags, true);
-  if (!module.lookupSymbol(identName)) {
-    auto identStructTy = LLVM::LLVMStructType::getLiteral(
-      ctx, {i32t, i32t, i32t, i32t, ptr});
-    OpBuilder gb(ctx);
-    gb.setInsertionPointToStart(module.getBody());
-    auto global = LLVM::GlobalOp::create(gb, loc, identStructTy,
-      /*isConstant=*/true, LLVM::Linkage::Private, identName, Attribute{},
-      /*alignment=*/8);
-    global.setUnnamedAddr(LLVM::UnnamedAddr::Global);
-    Block *initBlock = new Block();
-    global.getInitializerRegion().push_back(initBlock);
-    OpBuilder ib(ctx);
-    ib.setInsertionPointToStart(initBlock);
-    auto ci = [&](int64_t v) -> Value {
-      return LLVM::ConstantOp::create(ib, loc, i32t, IntegerAttr::get(i32t, v));
-    };
-    auto ins = [&](Value v, Value st, unsigned idx) -> Value {
-      return LLVM::InsertValueOp::create(ib, loc, identStructTy, st, v,
-        ArrayRef<int64_t>{(int64_t)idx});
-    };
-    Value s = LLVM::UndefOp::create(ib, loc, identStructTy);
-    s = ins(ci(0),                       s, 0); // reserved_1
-    s = ins(ci((int64_t)flags),          s, 1); // flags (incl. KMPC)
-    s = ins(ci(0),                       s, 2); // reserved_2
-    s = ins(ci((int64_t)srcText.size()), s, 3); // reserved_3 = strlen(psource)
-    Value srcAddr = LLVM::AddressOfOp::create(ib, loc, ptr,
-      FlatSymbolRefAttr::get(ctx, srcName));
-    s = ins(srcAddr, s, 4);                     // psource
-    LLVM::ReturnOp::create(ib, loc, s);
-  }
-  return LLVM::AddressOfOp::create(builder, loc, ptr,
-    FlatSymbolRefAttr::get(ctx, identName));
-}
-
-// ---------------------------------------------------------------------------
-// Symbolic token resolution
-// ---------------------------------------------------------------------------
-// Every lowering path resolves DSL argument tokens (strings like "%gtid",
-// "ident", "%lb", "env_ptr", ...) to SSA Values against one shared vocabulary:
-//   1. a site-specific binding (looked up first, so a construct's own tokens and
-//      `let`-bound results shadow the built-ins);
-//   2. an ident reference ("ident"/"%ident"/"%ident:<flag>") -> resolveIdent;
-//   3. "%gtid"                                                -> resolveGtid;
-//   4. anything unrecognised                                  -> an undef ptr.
-// resolveIdent/resolveGtid are seams so each caller keeps its own caching and
-// lazy-materialisation policy (e.g. the fork path only emits the gtid call when
-// a token actually references it).  Literal (integer/bool) arguments stay in
-// each caller's arg loop: most sites emit the same arith i32 constant, but
-// wsloop types them as the induction variable (LLVM constant) and the packed
-// invoke adds i8-bool / i64-size forms.
-static Value resolveSymbolToken(
-    llvm::StringRef s, OpBuilder &builder, Location loc,
-    const llvm::StringMap<Value> &bindings,
-    llvm::function_ref<Value(uint32_t)> resolveIdent,
-    llvm::function_ref<Value()> resolveGtid) {
-  if (auto it = bindings.find(s); it != bindings.end())
-    return it->second;
-  uint32_t flags;
-  if (parseIdentRef(s, flags))
-    return resolveIdent(flags);
-  if (s == "%gtid")
-    return resolveGtid();
-  return LLVM::UndefOp::create(builder, loc, ptrTy(builder.getContext()));
-}
-
-// No-bindings overload for sites whose only symbolic tokens are ident/%gtid
-// (e.g. barrier).
-static Value resolveSymbolToken(
-    llvm::StringRef s, OpBuilder &builder, Location loc,
-    llvm::function_ref<Value(uint32_t)> resolveIdent,
-    llvm::function_ref<Value()> resolveGtid) {
-  static const llvm::StringMap<Value> noBindings;
-  return resolveSymbolToken(s, builder, loc, noBindings, resolveIdent,
-                            resolveGtid);
-}
-
-// Shared policy for the resolveIdent seam: default (KMPC) flags reuse the
-// caller's cached default ident; any other flags get their own global
-// (deduped by symbol name inside getOrCreateIdent).
-static Value resolveIdentToken(uint32_t flags, ModuleOp module,
-                               OpBuilder &builder, Location loc,
-                               MLIRContext *ctx,
-                               llvm::function_ref<Value()> defaultIdent) {
-  return flags == kIdentKmpc
-             ? defaultIdent()
-             : getOrCreateIdent(module, builder, loc, ctx, flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,70 +848,6 @@ static void lowerLeafConstruct(func::FuncOp outlinedFn, ModuleOp module,
   }
 }
 
-// Lower a top-level leaf construct (barrier / taskwait NOT inside a parallel):
-// it reaches the outlining pass as an empty-body ConstructOp carrying its plan
-// as attributes.  We handle it here rather than in PlanLoweringPass because
-// there %ident/%gtid resolve to `undef` — for iomp that means
-// __kmpc_omp_taskwait(undef, undef), which crashes at runtime.  With no
-// enclosing microtask to read gtid from, %gtid is a real
-// __kmpc_global_thread_num call (seeded off the default ident).
-static void lowerTopLevelLeaf(ConstructOp op, ModuleOp module) {
-  MLIRContext *ctx = op.getContext();
-  Location loc = op.getLoc();
-  OpBuilder builder(op);
-  auto ptr  = ptrTy(ctx);
-  auto i32t = i32Ty(ctx);
-
-  // gtid is emitted lazily and memoised (one call shared by all args).
-  Value gtidVal;
-  auto getGtid = [&]() -> Value {
-    if (!gtidVal) {
-      Value id = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
-      auto decl = getOrInsertDeclWithReturn(module, "__kmpc_global_thread_num",
-                                            {ptr}, i32t, builder);
-      gtidVal = func::CallOp::create(builder, loc, decl,
-                                     ValueRange{id}).getResult(0);
-    }
-    return gtidVal;
-  };
-
-  auto resolveArg = [&](Attribute a) -> Value {
-    if (auto ia = llvm::dyn_cast<IntegerAttr>(a))
-      return arith::ConstantOp::create(builder, loc, i32t,
-        IntegerAttr::get(i32t, ia.getInt()));
-    if (auto sa = llvm::dyn_cast<StringAttr>(a)) {
-      llvm::StringRef s = sa.getValue();
-      uint32_t flags;
-      if (parseIdentRef(s, flags))
-        return getOrCreateIdent(module, builder, loc, ctx, flags);
-      if (s == "%gtid")
-        return getGtid();
-    }
-    return LLVM::UndefOp::create(builder, loc, ptr);
-  };
-
-  auto lowerBlock = [&](ArrayAttr block) {
-    if (!block) return;
-    for (Attribute actionAttr : block) {
-      auto ca = llvm::dyn_cast<PlanCallAttr>(actionAttr);
-      if (!ca) continue;
-      SmallVector<Value> args;
-      SmallVector<Type>  types;
-      for (Attribute argAttr : ca.getArgs()) {
-        Value v = resolveArg(argAttr);
-        args.push_back(v); types.push_back(v.getType());
-      }
-      auto decl = getOrInsertDecl(module, ca.getCallee().getValue(), types,
-                                  builder);
-      func::CallOp::create(builder, loc, decl, args);
-    }
-  };
-
-  lowerBlock(op.getPre());
-  lowerBlock(op.getInvoke());
-  lowerBlock(op.getPost());
-  op.erase();
-}
 
 // ---------------------------------------------------------------------------
 // 1. PARALLEL OUTLINING
@@ -2152,17 +1894,6 @@ struct OmpOutliningPass
     int counter = 0;
     for (auto op : constructs)
       outlineConstruct(op, module, counter, *barrierPlan, taskwaitPlanPtr);
-
-    // Step 1b: lower top-level leaf constructs (barrier / taskwait not nested
-    // in a parallel), which remain as empty-body ConstructOps after Step 1.
-    // Done here — not in PlanLoweringPass — so %ident/%gtid resolve to real
-    // values (a __kmpc_global_thread_num gtid) instead of undef.
-    SmallVector<ConstructOp> leaves;
-    module.walk([&](ConstructOp op) {
-      if (op.getBody().empty()) leaves.push_back(op);
-    });
-    for (auto op : leaves)
-      lowerTopLevelLeaf(op, module);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;

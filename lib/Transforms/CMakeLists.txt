@@ -7,6 +7,7 @@ add_mlir_library(MLIROmpLoweringTransforms
   OmpToOmpLowerPass.cpp
   OmpOutliningPass.cpp
   PlanLoweringPass.cpp
+  PlanEmit.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/OmpLowering/Transforms

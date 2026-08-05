@@ -1,20 +1,22 @@
-// A top-level omp.taskwait (NOT inside a parallel) reaches the outlining pass
-// as an empty-body omp_lower.construct.  It must be lowered with a REAL gtid
-// from __kmpc_global_thread_num — not the undef that PlanLoweringPass would emit
-// (which crashes the iomp runtime).  This is handled by lowerTopLevelLeaf in the
-// outlining pass, so after --omp-outline the construct is already a concrete
-// call sequence.
+// A top-level omp.taskwait (NOT inside a parallel) has no body and no captures,
+// so the outlining pass has nothing to do with it: it survives as an empty-body
+// omp_lower.construct and PlanLoweringPass turns it into calls.  This is the
+// only construct shape that exercises the full three-pass pipeline, since
+// everything with a region is consumed by the outlining pass.
+//
+// It must get a REAL gtid from __kmpc_global_thread_num — an undef there
+// crashes the iomp runtime.  That used to force this lowering into the outlining
+// pass; now PlanLoweringPass resolves ident/%gtid through the same shared
+// vocabulary (see lib/Transforms/PlanEmit.h).
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 func.func @tw() {
   omp.taskwait
   return
 }
 
-// The taskwait is fully lowered here (no leftover omp_lower.construct for
-// PlanLoweringPass), with the gtid coming from __kmpc_global_thread_num:
 // CHECK-LABEL: func.func @tw
 // CHECK:       call @__kmpc_global_thread_num
 // CHECK:       call @__kmpc_omp_taskwait
