@@ -224,13 +224,6 @@ static Value getClauseOperand(ConstructOp op, llvm::StringRef name) {
 
 // Normalise a clause value to i1 for use as an llvm.cond_br condition /
 // arith.select predicate (if-clause values are typically already i1).
-static Value clauseToI1(OpBuilder &builder, Location loc, Value v) {
-  if (v.getType().isInteger(1)) return v;
-  Value zero = LLVM::ConstantOp::create(builder, loc, v.getType(),
-    IntegerAttr::get(v.getType(), 0));
-  return LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne, v, zero);
-}
-
 static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
   auto dict = op.getPropDict();
   if (!dict) return "";

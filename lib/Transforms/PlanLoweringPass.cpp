@@ -21,7 +21,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/StringMap.h"
 
 using namespace mlir;
@@ -86,8 +85,48 @@ struct ConstructEmitter {
     return LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
   }
 
-  // Lower one plan block (pre / invoke / post).
-  void lowerBlock(ArrayAttr block) {
+  void lowerCall(PlanCallAttr callAttr) {
+    ArrayAttr argAttrs = callAttr.getArgs();
+    SmallVector<Value> args;
+    SmallVector<Type>  argTypes;
+    args.reserve(argAttrs.size());
+    argTypes.reserve(argAttrs.size());
+    for (Attribute a : argAttrs) {
+      Value v = resolveArg(a);
+      args.push_back(v);
+      argTypes.push_back(v.getType());
+    }
+    func::FuncOp decl = getOrInsertDecl(
+        module, callAttr.getCallee().getValue(), argTypes, builder);
+    func::CallOp::create(builder, loc, decl, args);
+  }
+
+  // `branch <cond> { true => ... false => ... }`: the one plan action that is
+  // not a straight line.  Splits the current block in two and fills a block per
+  // arm, leaving the builder at the top of the continuation so whatever follows
+  // in the plan lands after the join.
+  void lowerBranch(PlanBranchAttr br) {
+    Value cond = clauseToI1(builder, loc, resolveArg(br.getCond()));
+
+    Block *curBlock = builder.getInsertionBlock();
+    Block *contBlock = curBlock->splitBlock(builder.getInsertionPoint());
+    Block *trueBlock  = builder.createBlock(contBlock);
+    Block *falseBlock = builder.createBlock(contBlock);
+
+    builder.setInsertionPointToEnd(curBlock);
+    LLVM::CondBrOp::create(builder, loc, cond, trueBlock, falseBlock);
+
+    for (auto [blk, arm] : {std::pair{trueBlock,  br.getIfTrue()},
+                            std::pair{falseBlock, br.getIfFalse()}}) {
+      builder.setInsertionPointToEnd(blk);
+      lowerActions(arm);
+      LLVM::BrOp::create(builder, loc, contBlock);
+    }
+
+    builder.setInsertionPointToStart(contBlock);
+  }
+
+  void lowerActions(ArrayAttr block) {
     if (!block) return;
 
     for (Attribute actionAttr : block) {
@@ -97,44 +136,35 @@ struct ConstructEmitter {
           bindings[nm] = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
         continue;
       }
-
       if (auto callAttr = llvm::dyn_cast<PlanCallAttr>(actionAttr)) {
-        ArrayAttr argAttrs = callAttr.getArgs();
-
-        SmallVector<Value> args;
-        SmallVector<Type>  argTypes;
-        args.reserve(argAttrs.size());
-        argTypes.reserve(argAttrs.size());
-        for (Attribute a : argAttrs) {
-          Value v = resolveArg(a);
-          args.push_back(v);
-          argTypes.push_back(v.getType());
-        }
-
-        func::FuncOp decl = getOrInsertDecl(
-            module, callAttr.getCallee().getValue(), argTypes, builder);
-        func::CallOp::create(builder, loc, decl, args);
+        lowerCall(callAttr);
+        continue;
+      }
+      if (auto branchAttr = llvm::dyn_cast<PlanBranchAttr>(actionAttr)) {
+        lowerBranch(branchAttr);
         continue;
       }
     }
   }
+
+  // Lower one plan block (pre / invoke / post).
+  void lowerBlock(ArrayAttr block) { lowerActions(block); }
 };
 
 // ---------------------------------------------------------------------------
-// Rewrite pattern
+// Lowering one construct
 // ---------------------------------------------------------------------------
 
-struct ConstructOpLowering : public OpConversionPattern<ConstructOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(ConstructOp op,
-                                OpAdaptor,
-                                ConversionPatternRewriter &rewriter) const override {
+// A plain walk rather than a dialect conversion: `branch` splits the block it
+// is emitted into, and the conversion framework tracks IR changes in a way that
+// direct block surgery does not fit.  The outlining pass emits its own control
+// flow the same way.
+static LogicalResult lowerConstruct(ConstructOp op) {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     if (!module)
       return op.emitOpError("expected parent ModuleOp");
 
-    OpBuilder builder(rewriter);
+    OpBuilder builder(op);
     builder.setInsertionPoint(op);
 
     ConstructEmitter emitter{module, builder, op.getLoc(), op.getContext()};
@@ -157,10 +187,9 @@ struct ConstructOpLowering : public OpConversionPattern<ConstructOp> {
     emitter.lowerBlock(op.getInvoke());
     emitter.lowerBlock(op.getPost());
 
-    rewriter.eraseOp(op);
+    op.erase();
     return success();
-  }
-};
+}
 
 // ---------------------------------------------------------------------------
 // Pass
@@ -184,19 +213,14 @@ struct PlanLoweringPass
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    MLIRContext *ctx = &getContext();
 
-    ConversionTarget target(*ctx);
-    target.addIllegalDialect<OmpLoweringDialect>();
-    target.addLegalDialect<func::FuncDialect,
-                           LLVM::LLVMDialect,
-                           arith::ArithDialect>();
+    // Collect first: lowering a construct rewrites the block it lives in.
+    SmallVector<ConstructOp> constructs;
+    module.walk([&](ConstructOp op) { constructs.push_back(op); });
 
-    RewritePatternSet patterns(ctx);
-    patterns.add<ConstructOpLowering>(ctx);
-
-    if (failed(applyPartialConversion(module, target, std::move(patterns))))
-      signalPassFailure();
+    for (auto op : constructs)
+      if (failed(lowerConstruct(op)))
+        return signalPassFailure();
   }
 };
 

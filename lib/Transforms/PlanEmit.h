@@ -68,6 +68,10 @@ Value resolveIdentToken(uint32_t flags, ModuleOp module, OpBuilder &builder,
                         Location loc, MLIRContext *ctx,
                         llvm::function_ref<Value()> defaultIdent);
 
+// Normalise a value to i1 for use as a cond_br condition / select predicate
+// (clause values are typically already i1).
+Value clauseToI1(OpBuilder &builder, Location loc, Value v);
+
 // --- Symbolic token resolution ----------------------------------------------
 // Resolve a DSL argument token against one shared vocabulary:
 //   1. a site-specific binding (looked up first, so a construct's own tokens and
