@@ -196,6 +196,12 @@ extractParallelContext(omp::ParallelOp op) {
   // invoke (GOMP_parallel / ext_pi_cl_team_fork).
   ctx["env_ptr"]    = dsl::makeStr("env_ptr");
 
+  // Slots the serialized side of `if` hands to the microtask, whose ABI takes
+  // gtid and btid by pointer.  Tokens here; the outlining pass makes the
+  // allocas and binds them, since only it knows the outlined signature.
+  ctx["gtid_addr"]  = dsl::makeStr("gtid_addr");
+  ctx["btid_addr"]  = dsl::makeStr("btid_addr");
+
   return ctx;
 }
 
