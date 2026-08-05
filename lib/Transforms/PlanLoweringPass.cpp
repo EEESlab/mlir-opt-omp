@@ -174,8 +174,41 @@ struct ConstructEmitter {
   // not a straight line.  Splits the current block in two and fills a block per
   // arm, leaving the builder at the top of the continuation so whatever follows
   // in the plan lands after the join.
+  // Every string token appearing as a call argument, or as a nested branch's
+  // condition, anywhere under this block.
+  static void forEachToken(ArrayAttr block,
+                           llvm::function_ref<void(llvm::StringRef)> fn) {
+    if (!block) return;
+    for (Attribute a : block) {
+      if (auto c = llvm::dyn_cast<PlanCallAttr>(a)) {
+        for (Attribute arg : c.getArgs())
+          if (auto s = llvm::dyn_cast<StringAttr>(arg)) fn(s.getValue());
+      } else if (auto b = llvm::dyn_cast<PlanBranchAttr>(a)) {
+        if (auto s = llvm::dyn_cast<StringAttr>(b.getCond())) fn(s.getValue());
+        forEachToken(b.getIfTrue(), fn);
+        forEachToken(b.getIfFalse(), fn);
+      }
+    }
+  }
+
   void lowerBranch(PlanBranchAttr br) {
     Value cond = clauseToI1(builder, loc, resolveArg(br.getCond()));
+
+    // The default ident and the gtid are materialised on first use and reused.
+    // Left to the arms, whichever referenced one first would define it inside
+    // its own block, where the other arm cannot see it.  Force them out here,
+    // before the split, if either arm asks for them — and only then, so a
+    // branch that needs neither (libgomp's, pmsis's) still emits neither.
+    bool needsIdent = false, needsGtid = false;
+    auto scan = [&](llvm::StringRef s) {
+      uint32_t flags;
+      if (parseIdentRef(s, flags)) needsIdent = true;
+      if (s == "%gtid") needsGtid = true;
+    };
+    forEachToken(br.getIfTrue(), scan);
+    forEachToken(br.getIfFalse(), scan);
+    if (needsGtid) getGtid();        // seeds off the ident itself
+    else if (needsIdent) getIdent();
 
     Block *curBlock = builder.getInsertionBlock();
     Block *contBlock = curBlock->splitBlock(builder.getInsertionPoint());
