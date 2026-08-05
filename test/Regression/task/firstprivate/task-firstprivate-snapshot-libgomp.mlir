@@ -10,7 +10,7 @@
 // is harmless for `parallel` (creation coincides with the fork).
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 omp.private {type = firstprivate} @fp_i32 : i32 copy {
 ^bb0(%src: !llvm.ptr, %dst: !llvm.ptr):

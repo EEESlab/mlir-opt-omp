@@ -2,7 +2,7 @@
 // closure (void(ptr)) and the call site schedules it via GOMP_task, passing
 // the capture struct together with its size/alignment and the if-clause.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

@@ -11,10 +11,6 @@
         // void(ptr gtid, ptr btid, cap0, cap1, ...), built in C++ (see
         // outlineConstruct): each capture is passed as its own trailing arg.
         capture_strategy = by_pointer;
-        // Emitted by PlanLoweringPass.  `captures` reaches it as a list binding
-        // and splices into one argument each, which is also what makes the fork
-        // call variadic.
-        lower_in = plan;
 
         pre {
           // No `emit` for ident or global_tid: both are materialised on demand
@@ -119,8 +115,6 @@ runtime libgomp {
     // ABI selector.  packed entails the closure signature void(ptr data): all
     // captures live in one struct the call site hands over by pointer (env_ptr).
     capture_strategy = packed;
-    // Emitted by PlanLoweringPass — the invoke below says everything it needs.
-    lower_in = plan;
     pre {}
     invoke {
       // GOMP_parallel has no `if` parameter: GCC lowers the clause by running
@@ -187,12 +181,6 @@ runtime pmsis {
     // ABI selector.  packed entails the closure signature void(ptr data): all
     // captures live in one struct the call site hands over by pointer (env_ptr).
     capture_strategy = packed;
-    // Emit the invoke in PlanLoweringPass rather than in the outlining pass.
-    // This one can: the team size is a literal, and `body`/`env_ptr` are handed
-    // over as named operands by the outlining pass.  The other runtimes still
-    // emit in place — iomp needs a variadic capture splice and a branch for the
-    // if clause, libgomp a select on num_threads.
-    lower_in = plan;
     pre {}
     invoke {
       call "ext_pi_cl_team_fork"(8, body, env_ptr);

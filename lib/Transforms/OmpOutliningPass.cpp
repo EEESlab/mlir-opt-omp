@@ -1315,15 +1315,15 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
       // (lazy i64 constants, emitted only when referenced so the parallel path
       // materialises none), if_clause (i1→i8 normalisation) and null (a real
       // null ptr, not the undef fallback) stay special-cased below.
-      // `lower_in = plan` hands the invoke over to PlanLoweringPass instead of
-      // emitting it here: this pass attaches the artifacts only it can produce
-      // — the outlined function pointer and the capture struct — as named
-      // operands, and leaves the construct standing for the plan pass to
-      // consume.  That is the end state for every construct; the ones without
-      // the property still emit below, because their invoke needs something the
-      // flat plan cannot yet say (a variadic capture splice, a call whose
-      // callee is a bound value, a branch on a clause).
-      if (getPropStr(op, "lower_in") == "plan") {
+      // The default: hand the invoke to PlanLoweringPass rather than emit it
+      // here.  This pass attaches the artifacts only it can produce — the
+      // outlined function pointer and the capture struct — as named operands
+      // and leaves the construct standing for the plan pass to consume.
+      //
+      // A construct opts out with `lower_in = outline` when its invoke needs
+      // something the plan pass cannot resolve yet.  Only libgomp's task does:
+      // env_size/env_align, a real null pointer and a boolean.
+      if (getPropStr(op, "lower_in") != "outline") {
         SmallVector<Value> operands(op.getClauseOperands().begin(),
                                     op.getClauseOperands().end());
         SmallVector<Attribute> names;
@@ -1341,6 +1341,12 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
         bind("outlined_parallel", fnPtrCast);
         bind("outlined_task", fnPtrCast);
         bind("env_ptr", structAlloca);
+        // The capture struct's layout: GOMP_task takes them as `long arg_size,
+        // long arg_align`, and only this pass has built the struct.
+        bind("env_size", LLVM::ConstantOp::create(builder, loc, i64t,
+                           IntegerAttr::get(i64t, (int64_t)envSize)));
+        bind("env_align", LLVM::ConstantOp::create(builder, loc, i64t,
+                            IntegerAttr::get(i64t, (int64_t)envAlign)));
         op->setOperands(operands);
         op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
         // Same guard as the emitting paths below, but the plan may well
@@ -1436,7 +1442,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
         capVals.push_back(capVal);
       }
 
-      if (getPropStr(op, "lower_in") == "plan") {
+      if (getPropStr(op, "lower_in") != "outline") {
         SmallVector<Value> operands(op.getClauseOperands().begin(),
                                     op.getClauseOperands().end());
         SmallVector<Attribute> names;

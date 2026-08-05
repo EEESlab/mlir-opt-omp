@@ -76,7 +76,24 @@ struct ConstructEmitter {
     return gtidCache;
   }
 
+  // C `_Bool` is i8, so a boolean literal and the if-clause value both have to
+  // be widened from the i1 the rest of the IR uses.
+  Value toI8(Value v) {
+    auto i8t = IntegerType::get(ctx, 8);
+    if (v.getType() == i8t) return v;
+    unsigned bw = v.getType().getIntOrFloatBitWidth();
+    return bw < 8 ? LLVM::ZExtOp::create(builder, loc, i8t, v).getResult()
+                  : LLVM::TruncOp::create(builder, loc, i8t, v).getResult();
+  }
+
   Value resolveArg(Attribute arg) {
+    // A bool literal is a C `_Bool`, not an i1: GOMP_task's if_clause slot.
+    if (auto boolAttr = llvm::dyn_cast<BoolAttr>(arg)) {
+      auto i8t = IntegerType::get(ctx, 8);
+      return LLVM::ConstantOp::create(builder, loc, i8t,
+          IntegerAttr::get(i8t, boolAttr.getValue() ? 1 : 0));
+    }
+
     if (auto intAttr = llvm::dyn_cast<IntegerAttr>(arg))
       return arith::ConstantOp::create(builder, loc, i32Ty(ctx),
           IntegerAttr::get(i32Ty(ctx), intAttr.getInt()));
@@ -85,6 +102,9 @@ struct ConstructEmitter {
       // `argc(<list>)` arrives as "%argc:<name>": the length of a list binding,
       // known only now.
       llvm::StringRef s = strAttr.getValue();
+      // A real null pointer, not the undef the unknown-token fallback gives.
+      if (s == "null")
+        return LLVM::ZeroOp::create(builder, loc, ptrTy(ctx));
       if (s.consume_front("%argc:")) {
         auto it = listBindings.find(("%" + s).str());
         int64_t n = it == listBindings.end() ? 0 : (int64_t)it->second.size();
@@ -129,6 +149,11 @@ struct ConstructEmitter {
         }
       }
       Value v = resolveArg(a);
+      // As a call argument the if clause is a C `_Bool`; as a branch condition
+      // it stays the i1 it came in as, which is why this widening lives here
+      // and not in resolveArg.
+      if (auto s = llvm::dyn_cast<StringAttr>(a))
+        if (s.getValue() == "if_clause") v = toI8(v);
       args.push_back(v);
       argTypes.push_back(v.getType());
     }
