@@ -121,7 +121,15 @@ Expected<Value> evalBuiltin(const std::string &name, std::vector<Value> args) {
       return make_error<StringError>(name + "() expects 1 arg", inconvertibleErrorCode());
     if (auto *l = std::get_if<ListVal>(&args[0]))
       return makeInt((int)l->items.size());
-    return make_error<StringError>(name + "() expects a list", inconvertibleErrorCode());
+    // A symbolic list — one whose contents only exist later, like `captures`,
+    // which the outlining pass collects long after the rules are evaluated.
+    // Counting it now is impossible, so the count stays a token too and the
+    // emitting pass resolves it against the same binding as the list itself.
+    if (auto *s = std::get_if<StrVal>(&args[0]))
+      if (!s->value.empty() && s->value.front() == '%')
+        return makeStr("%argc:" + s->value.substr(1));
+    return make_error<StringError>(
+      name + "() expects a list or a symbolic list token", inconvertibleErrorCode());
   }
   if (name == "first") {
     if (args.size() != 1)

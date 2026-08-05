@@ -48,6 +48,12 @@ struct ConstructEmitter {
   MLIRContext *ctx;
   // `emit`-declared symbols, bound as they are encountered.
   llvm::StringMap<Value> bindings;
+  // Tokens that stand for a whole list of values rather than one — `captures`
+  // being the case that matters.  A list token used as a call argument splices
+  // into that many arguments, and `argc(<list>)` becomes its length.  Neither
+  // can be settled while the rules are evaluated, because the outlining pass
+  // has not collected the captures yet.
+  llvm::StringMap<SmallVector<Value>> listBindings;
   Value identCache;
   Value gtidCache;
 
@@ -72,14 +78,24 @@ struct ConstructEmitter {
       return arith::ConstantOp::create(builder, loc, i32Ty(ctx),
           IntegerAttr::get(i32Ty(ctx), intAttr.getInt()));
 
-    if (auto strAttr = llvm::dyn_cast<StringAttr>(arg))
+    if (auto strAttr = llvm::dyn_cast<StringAttr>(arg)) {
+      // `argc(<list>)` arrives as "%argc:<name>": the length of a list binding,
+      // known only now.
+      llvm::StringRef s = strAttr.getValue();
+      if (s.consume_front("%argc:")) {
+        auto it = listBindings.find(("%" + s).str());
+        int64_t n = it == listBindings.end() ? 0 : (int64_t)it->second.size();
+        return arith::ConstantOp::create(builder, loc, i32Ty(ctx),
+            IntegerAttr::get(i32Ty(ctx), n));
+      }
       return resolveSymbolToken(
-          strAttr.getValue(), builder, loc, bindings,
+          s, builder, loc, bindings,
           [&](uint32_t flags) {
             return resolveIdentToken(flags, module, builder, loc, ctx,
                                      [&] { return getIdent(); });
           },
           [&] { return getGtid(); });
+    }
 
     // Nested ArrayAttr (e.g. a captures list) – opaque pointer placeholder.
     return LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
@@ -92,6 +108,17 @@ struct ConstructEmitter {
     args.reserve(argAttrs.size());
     argTypes.reserve(argAttrs.size());
     for (Attribute a : argAttrs) {
+      // A list token contributes as many arguments as it is bound to, not one.
+      if (auto s = llvm::dyn_cast<StringAttr>(a)) {
+        auto it = listBindings.find(s.getValue());
+        if (it != listBindings.end()) {
+          for (Value v : it->second) {
+            args.push_back(v);
+            argTypes.push_back(v.getType());
+          }
+          continue;
+        }
+      }
       Value v = resolveArg(a);
       args.push_back(v);
       argTypes.push_back(v.getType());

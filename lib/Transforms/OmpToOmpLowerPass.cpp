@@ -145,7 +145,10 @@ extractParallelContext(omp::ParallelOp op) {
   llvm::StringMap<dsl::Value> ctx;
 
   ctx["body"]     = dsl::makeStr("outlined_parallel");
-  ctx["captures"] = dsl::makeList({});
+  // Symbolic, not a list: the captures are not known until the outlining
+  // pass has collected them, so `captures` and `argc(captures)` stay tokens
+  // and are resolved against the bindings when the call is emitted.
+  ctx["captures"] = dsl::makeStr("%captures");
 
   // if_clause is a sentinel like on task: non-null selects `when
   // has(if_clause)` branches; the SSA value rides as a ConstructOp clause
@@ -224,7 +227,10 @@ extractTaskContext(omp::TaskOp op) {
 
   // Resolved to the outlined function pointer in OmpOutliningPass.
   ctx["body"]     = dsl::makeStr("body");
-  ctx["captures"] = dsl::makeList({});
+  // Symbolic, not a list: the captures are not known until the outlining
+  // pass has collected them, so `captures` and `argc(captures)` stay tokens
+  // and are resolved against the bindings when the call is emitted.
+  ctx["captures"] = dsl::makeStr("%captures");
 
   // if_clause is a sentinel: its presence (non-null) selects the
   // `when has(if_clause)` invoke branch; the actual SSA value is carried as
