@@ -98,15 +98,22 @@ using Statement =
 struct ActionStmt    { Action action; };
 struct WhenStmt      { Predicate predicate; Action action; };
 struct OtherwiseStmt { Action action; };
-// `branch <expr> { true => <arm> false => <arm> }`, where an arm is one action
-// or a braced sequence.  Unlike `when`, whose predicate is decided while
-// evaluating the rules, this condition is a value known only at run time, so it
-// survives evaluation and becomes a real branch in the emitted IR.  Either arm
-// may be empty.
+// `branch <expr> { true => <arm> false => <arm> }`, where an arm is one
+// statement or a braced sequence of them.  Unlike `when`, whose predicate is
+// decided while evaluating the rules, this condition is a value known only at
+// run time, so it survives evaluation and becomes a real branch in the emitted
+// IR.  Either arm may be empty.
+//
+// Arms hold statements, not just actions, so the two kinds of choice can nest:
+// a `when has(num_threads)` inside an arm is still settled during evaluation
+// and collapses, while the branch around it does not.
+//
+// A condition that evaluates to null means the clause is absent, and there is
+// nothing to branch on: the true arm is emitted inline and no branch survives.
 struct BranchStmt {
   Expr condition;
-  std::vector<Action> ifTrue;
-  std::vector<Action> ifFalse;
+  std::vector<Statement> ifTrue;
+  std::vector<Statement> ifFalse;
 };
 struct LetStmt       { LetDecl decl; };
 // `let <name> = call "<callee>"(<args>);` — binds <name> to the call's SSA

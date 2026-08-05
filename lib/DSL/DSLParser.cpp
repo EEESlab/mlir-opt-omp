@@ -391,27 +391,26 @@ class Parser {
 
   // ---- Statement ----------------------------------------------------------
 
-  // One arm of a `branch`: either a single action or a braced sequence.
+  // One arm of a `branch`: a single statement, or a braced sequence of them.
   //   true  => call "f"();
   //   false => { call "g"(); call "h"(); }
-  Expected<std::vector<Action>> parseBranchArm() {
-    std::vector<Action> actions;
+  //   true  => { when has(x) => call "f"(x); otherwise => call "f"(0); }
+  Expected<std::vector<Statement>> parseBranchArm() {
+    std::vector<Statement> stmts;
     if (at(TK::LBRACE)) {
       advance();
       while (!at(TK::RBRACE) && !at(TK::END)) {
-        auto act = parseAction();
-        if (!act) return act.takeError();
-        if (auto e = expect(TK::SEMI); !e) return e.takeError();
-        actions.push_back(std::move(*act));
+        auto st = parseStatement();
+        if (!st) return st.takeError();
+        stmts.push_back(std::move(*st));
       }
       if (auto e = expect(TK::RBRACE); !e) return e.takeError();
-      return actions;
+      return stmts;
     }
-    auto act = parseAction();
-    if (!act) return act.takeError();
-    if (auto e = expect(TK::SEMI); !e) return e.takeError();
-    actions.push_back(std::move(*act));
-    return actions;
+    auto st = parseStatement();
+    if (!st) return st.takeError();
+    stmts.push_back(std::move(*st));
+    return stmts;
   }
 
   Expected<Statement> parseStatement() {

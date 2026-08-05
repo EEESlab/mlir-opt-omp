@@ -3,7 +3,7 @@
 // GOMP_task call *inside* the parallel's outlined function, with its own body
 // outlined into a second closure.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

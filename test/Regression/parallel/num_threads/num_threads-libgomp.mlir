@@ -3,7 +3,7 @@
 // DSL invoke.  Without the clause the slot is the literal 0, which libgomp reads
 // as "runtime default team size".
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
-// RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
 llvm.func @use(!llvm.ptr)
 

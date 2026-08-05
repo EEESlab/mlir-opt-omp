@@ -797,26 +797,35 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
 //
 // The binding travels as a regular operand plus its name in clause_names, the
 // same channel the clause values use.
-// Does any action in this plan block name %gtid?  Recurses into branch arms.
-static bool blockNamesGtid(ArrayAttr block) {
+// Does any action in this plan block name the given token?  Recurses into
+// branch arms, and looks at a branch's condition as well as call arguments.
+static bool blockNamesToken(ArrayAttr block, llvm::StringRef token) {
   if (!block) return false;
-  auto isGtid = [](Attribute a) {
+  auto is = [&](Attribute a) {
     auto s = llvm::dyn_cast<StringAttr>(a);
-    return s && s.getValue() == "%gtid";
+    return s && s.getValue() == token;
   };
   for (Attribute a : block) {
     if (auto call = llvm::dyn_cast<PlanCallAttr>(a)) {
       for (Attribute arg : call.getArgs())
-        if (isGtid(arg)) return true;
+        if (is(arg)) return true;
       continue;
     }
     if (auto br = llvm::dyn_cast<PlanBranchAttr>(a)) {
-      if (isGtid(br.getCond())) return true;
-      if (blockNamesGtid(br.getIfTrue()) || blockNamesGtid(br.getIfFalse()))
+      if (is(br.getCond())) return true;
+      if (blockNamesToken(br.getIfTrue(), token) ||
+          blockNamesToken(br.getIfFalse(), token))
         return true;
     }
   }
   return false;
+}
+
+// Does the construct's plan name the token anywhere (pre, invoke or post)?
+static bool planNamesToken(ConstructOp op, llvm::StringRef token) {
+  return blockNamesToken(op.getPre(), token) ||
+         blockNamesToken(op.getInvoke(), token) ||
+         blockNamesToken(op.getPost(), token);
 }
 
 static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
@@ -828,9 +837,7 @@ static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
   // function — GOMP_barrier and friends take no arguments.
   SmallVector<ConstructOp> leaves;
   outlinedFn.walk([&](ConstructOp c) {
-    if (c.getBody().empty() &&
-        (blockNamesGtid(c.getPre()) || blockNamesGtid(c.getInvoke()) ||
-         blockNamesGtid(c.getPost())))
+    if (c.getBody().empty() && planNamesToken(c, "%gtid"))
       leaves.push_back(c);
   });
   if (leaves.empty()) return;
@@ -1294,6 +1301,44 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
       // (lazy i64 constants, emitted only when referenced so the parallel path
       // materialises none), if_clause (i1→i8 normalisation) and null (a real
       // null ptr, not the undef fallback) stay special-cased below.
+      // `lower_in = plan` hands the invoke over to PlanLoweringPass instead of
+      // emitting it here: this pass attaches the artifacts only it can produce
+      // — the outlined function pointer and the capture struct — as named
+      // operands, and leaves the construct standing for the plan pass to
+      // consume.  That is the end state for every construct; the ones without
+      // the property still emit below, because their invoke needs something the
+      // flat plan cannot yet say (a variadic capture splice, a call whose
+      // callee is a bound value, a branch on a clause).
+      if (getPropStr(op, "lower_in") == "plan") {
+        SmallVector<Value> operands(op.getClauseOperands().begin(),
+                                    op.getClauseOperands().end());
+        SmallVector<Attribute> names;
+        if (auto existing = op.getClauseNames())
+          names.assign(existing->begin(), existing->end());
+        auto bind = [&](llvm::StringRef n, Value v) {
+          operands.push_back(v);
+          names.push_back(StringAttr::get(ctx, n));
+        };
+        // Bind every spelling the plan may use for the outlined function: the
+        // context seeds `body` with the string "outlined_parallel"/"outlined_task",
+        // so that — not "body" — is what reaches the plan as the argument.
+        // Missing one resolves to an undef pointer and forks into nothing.
+        bind("body", fnPtrCast);
+        bind("outlined_parallel", fnPtrCast);
+        bind("outlined_task", fnPtrCast);
+        bind("env_ptr", structAlloca);
+        op->setOperands(operands);
+        op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+        // Same guard as the emitting paths below, but the plan may well
+        // consume the clause itself now (libgomp branches on it), so only warn
+        // when nothing in the plan names it.
+        if (getClauseOperand(op, "if_clause") &&
+            !planNamesToken(op, "if_clause"))
+          op.emitWarning("omp-outline: `if` clause is not supported by this "
+                         "runtime/construct lowering and was ignored");
+        return;   // deliberately not erased: the plan pass consumes it
+      }
+
       llvm::StringMap<Value> invokeBindings;
       invokeBindings["body"]              = fnPtrCast;
       invokeBindings["outlined_parallel"] = fnPtrCast;
@@ -1385,24 +1430,10 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
       }
     }
 
-    // parallel if(cond) on libgomp: GOMP_parallel has no if parameter — GCC
-    // lowers the clause by forcing num_threads to 1 when the condition is
-    // false (a one-thread team is the undeferred/serial execution).  The
-    // num_threads slot is arg 2 of GOMP_parallel(fn, data, num_threads,
-    // flags); 0 there means "runtime default".
-    if (runtimeCallee == "GOMP_parallel" && callArgs.size() >= 3 &&
-        llvm::isa<IntegerType>(callArgs[2].getType())) {
-      if (Value ifv = getClauseOperand(op, "if_clause")) {
-        ifClauseUsed = true;
-        Value cond = clauseToI1(builder, loc, ifv);
-        Type ntTy = callArgs[2].getType();
-        Value oneNt = arith::ConstantOp::create(builder, loc, ntTy,
-          IntegerAttr::get(ntTy, 1));
-        callArgs[2] = arith::SelectOp::create(builder, loc, cond,
-          callArgs[2], oneNt);
-        callTypes[2] = callArgs[2].getType();
-      }
-    }
+    // (The libgomp `parallel if(cond)` handling used to sit here, forcing
+    // num_threads to 1 on the false side with an arith.select.  It is now a
+    // `branch` in rules.dsl and emitted by PlanLoweringPass — the first case
+    // where the DSL expresses a choice on a runtime value instead of C++.)
 
     // __kmpc_fork_call is variadic: (ident, argc, fn, ...captures) -> void.
     // Declare it as llvm.func variadic so multiple parallel regions with

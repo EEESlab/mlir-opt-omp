@@ -351,14 +351,17 @@ Expected<PlanAction> evalAction(const Action &action, ScopeImpl &scope) {
 
 // ---- Block (with when/otherwise chain semantics) --------------------------
 
-Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
-                                            ScopeImpl &parentScope) {
+// Evaluate a statement list.  Shared by a construct's pre/invoke/post blocks
+// and by the arms of a `branch`, so the two kinds of choice nest: a when chain
+// inside an arm is settled here and collapses, the branch around it does not.
+Expected<std::vector<PlanAction>> evalStatements(
+    const std::vector<Statement> &statements, ScopeImpl &parentScope) {
   ScopeImpl scope(&parentScope);
   std::vector<PlanAction> out;
-  size_t i = 0, n = block.statements.size();
+  size_t i = 0, n = statements.size();
 
   while (i < n) {
-    const auto &stmt = block.statements[i];
+    const auto &stmt = statements[i];
 
     if (auto *ls = std::get_if<LetStmt>(&stmt)) {
       auto v = evalExpr(ls->decl.expr, scope);
@@ -398,15 +401,26 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       auto cond = evalExpr(bs->condition, scope);
       if (!cond) return cond.takeError();
 
-      auto evalArm = [&](const std::vector<Action> &arm)
+      // A null condition means the clause is simply absent — there is no
+      // runtime value to test, so there is nothing to branch on.  Emit the true
+      // arm inline, which is what "the guard does not apply" means for every
+      // clause modelled this way (an omitted `if` runs the region unconditionally).
+      if (std::holds_alternative<NullVal>(*cond)) {
+        auto inlined = evalStatements(bs->ifTrue, scope);
+        if (!inlined) return inlined.takeError();
+        for (auto &a : *inlined) out.push_back(std::move(a));
+        i++;
+        continue;
+      }
+
+      auto evalArm = [&](const std::vector<Statement> &arm)
           -> Expected<std::vector<std::shared_ptr<PlanActionBox>>> {
+        auto actions = evalStatements(arm, scope);
+        if (!actions) return actions.takeError();
         std::vector<std::shared_ptr<PlanActionBox>> boxed;
-        for (const auto &act : arm) {
-          auto a = evalAction(act, scope);
-          if (!a) return a.takeError();
+        for (auto &a : *actions)
           boxed.push_back(std::make_shared<PlanActionBox>(
-              PlanActionBox{std::move(*a)}));
-        }
+              PlanActionBox{std::move(a)}));
         return boxed;
       };
 
@@ -425,7 +439,7 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       // Collect the when/otherwise chain
       bool taken = false;
       while (i < n) {
-        const auto &cur = block.statements[i];
+        const auto &cur = statements[i];
         if (auto *ws = std::get_if<WhenStmt>(&cur)) {
           if (!taken) {
             auto cond = evalPredicate(ws->predicate, scope);
@@ -462,6 +476,11 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
     i++;
   }
   return out;
+}
+
+Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
+                                            ScopeImpl &parentScope) {
+  return evalStatements(block.statements, parentScope);
 }
 
 // ---- Construct selection --------------------------------------------------

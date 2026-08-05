@@ -105,10 +105,24 @@ runtime libgomp {
     // ABI selector.  packed entails the closure signature void(ptr data): all
     // captures live in one struct the call site hands over by pointer (env_ptr).
     capture_strategy = packed;
+    // Emitted by PlanLoweringPass — the invoke below says everything it needs.
+    lower_in = plan;
     pre {}
     invoke {
-      when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, 0);
-      otherwise             => call "GOMP_parallel"(body, env_ptr, 0, 0);
+      // GOMP_parallel has no `if` parameter: GCC lowers the clause by running
+      // the region with a one-thread team, which is the serial execution.  That
+      // is a choice on a *runtime* value, so it is a branch and not a `when`.
+      // The team size for the true side is still a compile-time choice, hence
+      // the nested when/otherwise; 0 there means "runtime default".
+      // With no if clause the condition is null, the branch collapses, and only
+      // the true arm is emitted.
+      branch if_clause {
+        true => {
+          when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, 0);
+          otherwise             => call "GOMP_parallel"(body, env_ptr, 0, 0);
+        }
+        false => call "GOMP_parallel"(body, env_ptr, 1, 0);
+      }
     }
   }
   construct wsloop when schedule == static {
@@ -159,6 +173,12 @@ runtime pmsis {
     // ABI selector.  packed entails the closure signature void(ptr data): all
     // captures live in one struct the call site hands over by pointer (env_ptr).
     capture_strategy = packed;
+    // Emit the invoke in PlanLoweringPass rather than in the outlining pass.
+    // This one can: the team size is a literal, and `body`/`env_ptr` are handed
+    // over as named operands by the outlining pass.  The other runtimes still
+    // emit in place — iomp needs a variadic capture splice and a branch for the
+    // if clause, libgomp a select on num_threads.
+    lower_in = plan;
     pre {}
     invoke {
       call "ext_pi_cl_team_fork"(8, body, env_ptr);
