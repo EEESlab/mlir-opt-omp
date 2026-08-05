@@ -87,15 +87,27 @@ struct WhenStmt;
 struct OtherwiseStmt;
 struct LetStmt;
 struct LetCallStmt;
+struct BranchStmt;
 
 struct LetDecl { std::string name; Expr expr; };
 
 using Statement =
-  std::variant<ActionStmt, WhenStmt, OtherwiseStmt, LetStmt, LetCallStmt>;
+  std::variant<ActionStmt, WhenStmt, OtherwiseStmt, LetStmt, LetCallStmt,
+               BranchStmt>;
 
 struct ActionStmt    { Action action; };
 struct WhenStmt      { Predicate predicate; Action action; };
 struct OtherwiseStmt { Action action; };
+// `branch <expr> { true => <arm> false => <arm> }`, where an arm is one action
+// or a braced sequence.  Unlike `when`, whose predicate is decided while
+// evaluating the rules, this condition is a value known only at run time, so it
+// survives evaluation and becomes a real branch in the emitted IR.  Either arm
+// may be empty.
+struct BranchStmt {
+  Expr condition;
+  std::vector<Action> ifTrue;
+  std::vector<Action> ifFalse;
+};
 struct LetStmt       { LetDecl decl; };
 // `let <name> = call "<callee>"(<args>);` — binds <name> to the call's SSA
 // result so later statements can reference it (see docs/dsl-result-binding-proposal.md).

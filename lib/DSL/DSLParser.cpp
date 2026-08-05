@@ -25,7 +25,7 @@ using llvm::inconvertibleErrorCode;
 enum class TK {
   // Keywords
   RUNTIME, CONSTRUCT, WHEN, OTHERWISE, PRE, INVOKE, POST,
-  LET, CALL, EMIT, HAS, AND, OR, NOT, TRUE, FALSE,
+  LET, CALL, EMIT, HAS, AND, OR, NOT, TRUE, FALSE, BRANCH,
   // Punctuation
   LBRACE, RBRACE, LPAREN, RPAREN, LBRACKET, RBRACKET,
   SEMI, COMMA, EQUALS, ARROW, EQEQ, NEQ,
@@ -125,6 +125,7 @@ class Lexer {
       {"has",       TK::HAS},       {"and",       TK::AND},
       {"or",        TK::OR},        {"not",       TK::NOT},
       {"true",      TK::TRUE},      {"false",     TK::FALSE},
+      {"branch",    TK::BRANCH},
     };
     auto it = kw.find(s);
     TK k = (it != kw.end()) ? it->second : TK::IDENT;
@@ -390,7 +391,69 @@ class Parser {
 
   // ---- Statement ----------------------------------------------------------
 
+  // One arm of a `branch`: either a single action or a braced sequence.
+  //   true  => call "f"();
+  //   false => { call "g"(); call "h"(); }
+  Expected<std::vector<Action>> parseBranchArm() {
+    std::vector<Action> actions;
+    if (at(TK::LBRACE)) {
+      advance();
+      while (!at(TK::RBRACE) && !at(TK::END)) {
+        auto act = parseAction();
+        if (!act) return act.takeError();
+        if (auto e = expect(TK::SEMI); !e) return e.takeError();
+        actions.push_back(std::move(*act));
+      }
+      if (auto e = expect(TK::RBRACE); !e) return e.takeError();
+      return actions;
+    }
+    auto act = parseAction();
+    if (!act) return act.takeError();
+    if (auto e = expect(TK::SEMI); !e) return e.takeError();
+    actions.push_back(std::move(*act));
+    return actions;
+  }
+
   Expected<Statement> parseStatement() {
+    if (at(TK::BRANCH)) {
+      advance();
+      auto cond = parseExpr();
+      if (!cond) return cond.takeError();
+      if (auto e = expect(TK::LBRACE); !e) return e.takeError();
+
+      BranchStmt br{std::move(*cond), {}, {}};
+      bool sawTrue = false, sawFalse = false;
+      while (at(TK::TRUE) || at(TK::FALSE)) {
+        bool isTrue = at(TK::TRUE);
+        int line = cur().line;
+        advance();
+        if (auto e = expect(TK::ARROW); !e) return e.takeError();
+        auto arm = parseBranchArm();
+        if (!arm) return arm.takeError();
+        if (isTrue) {
+          if (sawTrue)
+            return make_error<StringError>(
+              "duplicate 'true' arm in branch at line " + std::to_string(line),
+              inconvertibleErrorCode());
+          sawTrue = true;
+          br.ifTrue = std::move(*arm);
+        } else {
+          if (sawFalse)
+            return make_error<StringError>(
+              "duplicate 'false' arm in branch at line " + std::to_string(line),
+              inconvertibleErrorCode());
+          sawFalse = true;
+          br.ifFalse = std::move(*arm);
+        }
+      }
+      if (auto e = expect(TK::RBRACE); !e) return e.takeError();
+      if (!sawTrue && !sawFalse)
+        return make_error<StringError>(
+          "branch needs at least a 'true' or a 'false' arm at line " +
+            std::to_string(cur().line),
+          inconvertibleErrorCode());
+      return Statement{std::move(br)};
+    }
     if (at(TK::WHEN)) {
       advance();
       auto pred = parsePredicate();

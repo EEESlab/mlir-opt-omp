@@ -14,6 +14,7 @@
 #include "llvm/Support/Error.h"
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -79,7 +80,24 @@ struct PlanCall {
   std::string resultName;  // non-empty if the call's SSA result is bound (let = call)
 };
 
-using PlanAction = std::variant<PlanEmit, PlanCall>;
+// A branch on a value only known at run time — `branch <cond> { true => ...
+// false => ... }` in the DSL.  This is what `when`/`otherwise` cannot express:
+// those are decided here, while evaluating, and collapse to a flat sequence.
+// A PlanBranch survives into the plan and becomes real control flow.
+//
+// Actions are boxed for the same reason ListVal boxes its items: PlanAction is
+// a variant that includes PlanBranch, so the recursion needs indirection.
+struct PlanActionBox;
+
+struct PlanBranch {
+  Value cond;   // resolves to the SSA value to branch on
+  std::vector<std::shared_ptr<PlanActionBox>> ifTrue;
+  std::vector<std::shared_ptr<PlanActionBox>> ifFalse;
+};
+
+using PlanAction = std::variant<PlanEmit, PlanCall, PlanBranch>;
+
+struct PlanActionBox { PlanAction action; };
 
 struct LoweringPlan {
   std::string runtime;

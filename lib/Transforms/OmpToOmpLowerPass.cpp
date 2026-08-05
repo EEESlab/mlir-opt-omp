@@ -68,6 +68,19 @@ Attribute planActionToAttr(const dsl::PlanAction &action, MLIRContext *ctx) {
         StringAttr::get(ctx, c.callee),
         ArrayAttr::get(ctx, argAttrs),
         c.resultName.empty() ? StringAttr() : StringAttr::get(ctx, c.resultName));
+    },
+    [&](const dsl::PlanBranch &b) -> Attribute {
+      auto arm = [&](const std::vector<std::shared_ptr<dsl::PlanActionBox>> &as) {
+        SmallVector<Attribute> attrs;
+        for (auto &a : as)
+          attrs.push_back(planActionToAttr(a->action, ctx));
+        return ArrayAttr::get(ctx, attrs);
+      };
+      return PlanBranchAttr::get(
+        ctx,
+        dslValueToAttr(b.cond, ctx),
+        arm(b.ifTrue),
+        arm(b.ifFalse));
     }
   ), action);
 }

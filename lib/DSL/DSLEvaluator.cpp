@@ -382,6 +382,37 @@ Expected<std::vector<PlanAction>> evalBlock(const BlockDecl &block,
       continue;
     }
 
+    if (auto *bs = std::get_if<BranchStmt>(&stmt)) {
+      // The condition is NOT decided here: it is evaluated only far enough to
+      // yield the token naming the runtime value, and both arms are kept.  That
+      // is the whole difference from when/otherwise, which pick an arm now and
+      // leave a flat sequence behind.
+      auto cond = evalExpr(bs->condition, scope);
+      if (!cond) return cond.takeError();
+
+      auto evalArm = [&](const std::vector<Action> &arm)
+          -> Expected<std::vector<std::shared_ptr<PlanActionBox>>> {
+        std::vector<std::shared_ptr<PlanActionBox>> boxed;
+        for (const auto &act : arm) {
+          auto a = evalAction(act, scope);
+          if (!a) return a.takeError();
+          boxed.push_back(std::make_shared<PlanActionBox>(
+              PlanActionBox{std::move(*a)}));
+        }
+        return boxed;
+      };
+
+      auto t = evalArm(bs->ifTrue);
+      if (!t) return t.takeError();
+      auto f = evalArm(bs->ifFalse);
+      if (!f) return f.takeError();
+
+      out.push_back(PlanAction{
+          PlanBranch{std::move(*cond), std::move(*t), std::move(*f)}});
+      i++;
+      continue;
+    }
+
     if (std::holds_alternative<WhenStmt>(stmt)) {
       // Collect the when/otherwise chain
       bool taken = false;

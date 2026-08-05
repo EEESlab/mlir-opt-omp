@@ -56,6 +56,27 @@ def PlanCallAttr : OmpLowering_Attr<"PlanCall", "call"> {
 }
 
 // ---------------------------------------------------------------------------
+// PlanBranchAttr  –  #omp_lower.branch<"%cond", [...], [...]>
+// ---------------------------------------------------------------------------
+
+def PlanBranchAttr : OmpLowering_Attr<"PlanBranch", "branch"> {
+  let summary = "A planned branch on a run-time value";
+  let description = [{
+    The `when`/`otherwise` chains in the rule file are decided while the rules
+    are evaluated and collapse into a flat sequence.  This one does not: its
+    condition names a value known only at run time, so both arms reach the
+    emitting pass and become real control flow.  Either arm may be empty.
+  }];
+  let parameters = (ins
+    // Names the SSA value to branch on, resolved like any other plan argument.
+    "::mlir::Attribute":$cond,
+    "::mlir::ArrayAttr":$ifTrue,
+    "::mlir::ArrayAttr":$ifFalse
+  );
+  let assemblyFormat = "`<` $cond `,` `[` $ifTrue `]` `,` `[` $ifFalse `]` `>`";
+}
+
+// ---------------------------------------------------------------------------
 // PlanEmitAttr  –  #omp_lower.emit<"name", value>
 // ---------------------------------------------------------------------------
 

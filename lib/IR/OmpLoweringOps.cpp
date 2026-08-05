@@ -66,7 +66,8 @@ LogicalResult ConstructOp::verify() {
       -> LogicalResult {
     if (!block) return success();
     for (auto attr : block) {
-      if (!llvm::isa<PlanCallAttr>(attr) && !llvm::isa<PlanEmitAttr>(attr))
+      if (!llvm::isa<PlanCallAttr>(attr) && !llvm::isa<PlanEmitAttr>(attr) &&
+          !llvm::isa<PlanBranchAttr>(attr))
         return (*this)->emitOpError("block '") << blockName
                << "' contains unexpected attribute: " << attr;
     }
