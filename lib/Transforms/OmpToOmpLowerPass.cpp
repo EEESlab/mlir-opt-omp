@@ -129,7 +129,9 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
     toArrayAttr(plan.pre),
     toArrayAttr(plan.invoke),
     toArrayAttr(plan.post),
-    clauseNames.empty() ? ArrayAttr() : builder.getArrayAttr(clauseNames));
+    clauseNames.empty() ? ArrayAttr() : builder.getArrayAttr(clauseNames),
+    // list_names: the outlining pass sets it when it binds a list (captures).
+    ArrayAttr());
 
   // Move the source region (e.g. omp.parallel body) into the construct op.
   if (srcRegion && !srcRegion->empty())

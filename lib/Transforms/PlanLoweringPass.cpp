@@ -141,7 +141,12 @@ struct ConstructEmitter {
     if (auto bound = bindings.find(callee); bound != bindings.end()) {
       auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(ctx),
                                               argTypes, /*isVarArg=*/false);
-      LLVM::CallOp::create(builder, loc, fnTy, bound->second, args);
+      // The indirect form takes the callee pointer as the first operand rather
+      // than as a separate parameter.
+      SmallVector<Value> operands;
+      operands.push_back(bound->second);
+      operands.append(args.begin(), args.end());
+      LLVM::CallOp::create(builder, loc, fnTy, operands);
       return;
     }
 
