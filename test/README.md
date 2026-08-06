@@ -28,14 +28,17 @@ Regression/
   taskwait/
 ```
 
-lit recurses, so a test is picked up wherever it lands. **Clause directories are
-kept even when empty** — they are the checklist of what is supported but not yet
-covered, so an empty one is a gap to fill rather than a directory to delete.
-Git does not track empty directories, hence the `.gitkeep` in each.
+lit recurses, so a test is picked up wherever it lands. **Every clause in the
+matrix below has a directory with at least one test per runtime.** A new clause
+gets its directory as soon as the lowering accepts it — if there is nothing to
+assert yet beyond "this is dropped on the floor", that is itself the test to
+write (see *Encoding a gap*). An empty clause directory is a gap to fill, not a
+directory to delete; git does not track empty ones, so it needs a `.gitkeep`.
 
 ### Coverage
 
-Clauses supported by the lowering, and whether a regression test covers them:
+Clauses supported by the lowering, and whether a regression test covers them.
+Every cell now has a test; the symbol says what that test asserts.
 
 | Construct | Clause | iomp | libgomp | pmsis |
 |---|---|:--:|:--:|:--:|
@@ -43,11 +46,11 @@ Clauses supported by the lowering, and whether a regression test covers them:
 | | `if` | ✓ | ✓ | ! |
 | | `num_threads` | ✓ | ✓ | ✗ |
 | | `proc_bind` | ✗ | ✗ | ✗ |
-| | `private` | — | — | — |
-| | `firstprivate` | — | — | — |
+| | `private` | ✗ | ✗ | ✗ |
+| | `firstprivate` | ✓ | ✓ | ✓ |
 | `wsloop` | — | ✓ | ✓ | ✓ |
-| | `schedule(static)` | ✓ | — | — |
-| | `schedule(dynamic)` | ! | ✗ | ✗ |
+| | `schedule(static)` | ✓ | ✓ | ✓ |
+| | `schedule(dynamic)` | ! | ! | ✗ |
 | | `nowait` | ✓ | ✓ | ✓ |
 | `barrier` | — | ✓ | ✓ | ✓ |
 | `task` | — | ✓ | ✓ | n/a |
@@ -55,17 +58,28 @@ Clauses supported by the lowering, and whether a regression test covers them:
 | | `firstprivate` | ✓ | ✓ | n/a |
 | `taskwait` | — | ✓ | ✓ | n/a |
 
-`✓` a test exists, `—` supported but untested, `n/a` the runtime has no such
-construct (`rules.dsl` declares no `task`/`taskwait` for pmsis), `!` the clause
-is *not* supported and a test asserts the diagnostic rather than a lowering,
+`✓` a passing test covers the lowering, `n/a` the runtime has no such construct
+(`rules.dsl` declares no `task`/`taskwait` for pmsis), `!` the clause is *not*
+supported and a passing test asserts the diagnostic rather than a lowering,
 `✗` not supported **and not diagnosed** — the clause is accepted and silently
-dropped or mislowered. Every `✗` is a latent wrong-code path:
+dropped or mislowered, with an `XFAIL`ed test stating what it should do. Every
+`✗` is a latent wrong-code path:
 
 - **`proc_bind`** is declared only in the iomp DSL, and even there it is broken:
   the clause reaches the plan as the *string* `"close"`/`"spread"`, and the
   outlining pass resolves unknown string tokens to `llvm.mlir.undef : !llvm.ptr`
   — so `__kmpc_push_proc_bind` is handed an undef pointer where it expects an
-  i32 enum. libgomp and pmsis never mention the clause at all.
+  i32 enum. libgomp and pmsis never mention the clause at all, so there it
+  vanishes without a call or a warning.
+- **`private`** (pure, no copy region) is broken on all three, in two different
+  ways. `injectFirstprivateUses` injects a use only for privatizers that have a
+  copy region, so a private produces no capture — but the copy-in loops treat
+  *every* privatizer block arg as a firstprivate and pair it positionally with a
+  capture. On the packed ABI (libgomp, pmsis) the loop is skipped for want of
+  captures, the block arg survives, and the pass errors out. On iomp the index
+  lands back on the privatizer arg itself, so the prolog loads from an argument
+  the call site never fills and seeds the private slot with garbage — silently.
+  `firstprivate`, which is what that machinery was written for, works.
 - **`num_threads` on pmsis** is ignored: `ext_pi_cl_team_fork` is called with a
   team size hardcoded to 8 in `rules.dsl`.
 - **`schedule(dynamic)` on pmsis** matches the *unguarded* `construct wsloop`
