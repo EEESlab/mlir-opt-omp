@@ -3,15 +3,24 @@
 // Converts every omp_lower.construct op into concrete func.call operations
 // targeting the selected OpenMP runtime (iomp, libgomp or pmsis).
 //
-// This is where a plan becomes calls — every plan, for every construct.
-// OmpOutliningPass runs first and produces what only it can: the outlined
-// function, the capture struct, the resolved capture values, the ABI sizes.
-// It attaches those to the construct as named operands and leaves it standing;
-// nothing about the call sequence is decided there.
+// This is where a plan becomes calls, for every construct that carries one:
+// parallel, task, barrier, taskwait.  OmpOutliningPass runs first and produces
+// what only it can — the outlined function, the capture struct, the resolved
+// capture values, the ABI sizes — attaches those to the construct as named
+// operands, and leaves it standing.  Nothing about the call sequence is
+// decided there.
 //
 // Consequently a runtime is retargeted by editing rules.dsl alone.  `branch`
 // covers the cases that used to force a construct back into C++ — a choice on a
 // runtime value, such as `if` on parallel and task.
+//
+// The exception is wsloop, which never becomes an omp_lower.construct at all:
+// its DSL rules are evaluated inside OmpOutliningPass, which emits its pre/post
+// calls itself.  Its callees still come from the plan, so the DSL owns them the
+// same way; only the emitting pass differs.  The reason is structural — the
+// plan's pre and post straddle a loop skeleton that the outlining pass builds,
+// and the loop's bounds depend on which shape `pre` took (a runtime init call
+// vs `emit thread_bounds`).
 
 #include "OmpLowering/Transforms/PlanLoweringPass.h"
 #include "OmpLowering/IR/OmpLoweringOps.h"
@@ -165,27 +174,21 @@ struct ConstructEmitter {
     }
 
     llvm::StringRef callee = callAttr.getCallee().getValue();
-
-    // `let <name> = call ...`: the call yields a handle the rest of the plan
-    // refers to as "%<name>" — the kmp_task_t the alloc returns, which every
-    // later task call takes.  Runtime entry points that hand back a handle
-    // return a pointer; the ones whose result the plan drops are declared void
-    // below (a C symbol is not type-checked at link time, and no caller reads
-    // the discarded value).
-    if (auto resultName = callAttr.getResult()) {
-      func::FuncOp decl = getOrInsertDeclWithReturn(module, callee, argTypes,
-                                                    ptrTy(ctx), builder);
-      Value res = func::CallOp::create(builder, loc, decl, args).getResult(0);
-      bindings["%" + resultName.getValue().str()] = res;
-      return;
-    }
+    StringAttr resultName = callAttr.getResult();
 
     // A callee that names a binding is a function *value*, not a symbol: the
     // outlined function's real name is only known to the outlining pass, which
     // hands its address over as `body`.  Call through the pointer, typed void:
     // an entry that does return something (the task entry returns i32) is called
     // for its effect only, and dropping the result is what the plan asked for.
+    // Checked before the `let` case below, so a bound callee stays indirect
+    // rather than being emitted as a call to a symbol literally named "body".
     if (auto bound = bindings.find(callee); bound != bindings.end()) {
+      if (resultName)
+        emitError(loc, "omp-lower-plan: `let ... = call " + callee +
+                       "(...)` binds the result of an indirect call, which is "
+                       "not supported (the callee's return type is unknown "
+                       "here)");
       auto fnTy = LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(ctx),
                                               argTypes, /*isVarArg=*/false);
       // The indirect form takes the callee pointer as the first operand rather
@@ -194,6 +197,20 @@ struct ConstructEmitter {
       operands.push_back(bound->second);
       operands.append(args.begin(), args.end());
       LLVM::CallOp::create(builder, loc, fnTy, operands);
+      return;
+    }
+
+    // `let <name> = call ...`: the call yields a handle the rest of the plan
+    // refers to as "%<name>" — the kmp_task_t the alloc returns, which every
+    // later task call takes.  Runtime entry points that hand back a handle
+    // return a pointer; the ones whose result the plan drops are declared void
+    // below (a C symbol is not type-checked at link time, and no caller reads
+    // the discarded value).
+    if (resultName) {
+      func::FuncOp decl = getOrInsertDeclWithReturn(module, callee, argTypes,
+                                                    ptrTy(ctx), builder);
+      Value res = func::CallOp::create(builder, loc, decl, args).getResult(0);
+      bindings["%" + resultName.getValue().str()] = res;
       return;
     }
 
@@ -227,9 +244,23 @@ struct ConstructEmitter {
   // mechanical: the shareds struct is one field per bound value, in order, so
   // its type follows from their types, exactly as the entry prolog rebuilds it.
   void lowerPopulateShareds(PlanEmitAttr emitAttr) {
+    // Both of these mean the construct was not prepared for this verb, and
+    // skipping the write would leave the task reading uninitialised shareds —
+    // a miscompile with no other symptom.  Say so instead.
+    if (!kmpTaskTy) {
+      emitError(loc, "omp-lower-plan: `emit populate_shareds` needs the "
+                     "construct's `kmp_task_t = struct(...)` layout, which this "
+                     "runtime does not declare");
+      return;
+    }
     auto it = listBindings.find("%captures");
-    if (it == listBindings.end() || it->second.empty()) return;
-    if (!kmpTaskTy) return;
+    if (it == listBindings.end()) {
+      emitError(loc, "omp-lower-plan: `emit populate_shareds` found no "
+                     "`%captures` list; the outlining pass did not bind one");
+      return;
+    }
+    // No captures at all is not an error: there is simply nothing to write.
+    if (it->second.empty()) return;
     ArrayRef<Value> capVals = it->second;
 
     Value base = resolveArg(emitAttr.getValue());
@@ -317,8 +348,11 @@ struct ConstructEmitter {
           lowerPopulateShareds(emitAttr);
           continue;
         }
-        if (!bindings.count(nm))
-          bindings[nm] = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+        // `emit` names a C++-backed verb.  The wsloop ones (loop_body,
+        // thread_bounds) are consumed by the outlining pass and never arrive
+        // here, so anything else is a verb this pass does not implement —
+        // silently binding it to undef would hide a DSL typo.
+        emitError(loc, "omp-lower-plan: unknown `emit " + nm + "`");
         continue;
       }
       if (auto callAttr = llvm::dyn_cast<PlanCallAttr>(actionAttr)) {
@@ -331,9 +365,6 @@ struct ConstructEmitter {
       }
     }
   }
-
-  // Lower one plan block (pre / invoke / post).
-  void lowerBlock(ArrayAttr block) { lowerActions(block); }
 };
 
 // ---------------------------------------------------------------------------
@@ -401,9 +432,9 @@ static LogicalResult lowerConstruct(ConstructOp op) {
       }
     }
 
-    emitter.lowerBlock(op.getPre());
-    emitter.lowerBlock(op.getInvoke());
-    emitter.lowerBlock(op.getPost());
+    emitter.lowerActions(op.getPre());
+    emitter.lowerActions(op.getInvoke());
+    emitter.lowerActions(op.getPost());
 
     op.erase();
     return success();
