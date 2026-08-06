@@ -96,10 +96,10 @@ recorded one of two ways depending on what the tool does today:
   real property: the tool refuses the input instead of mislowering it. Grep for
   `-unsupported-` to list these.
 - **Silently wrong** — write the test against the behaviour the tool *should*
-  have and mark it `// XFAIL: *`. It fails, lit counts it under
-  `Expected Failures`, and the gap stays visible in every run. When the fix
-  lands the test XPASSes, which lit reports as a failure — that is the prompt to
-  drop the `XFAIL` line.
+  have and mark it `// XFAIL: *`. It fails, and `check-omp` runs lit with
+  `--show-xfail`, so every run prints the gap under `Expectedly Failed Tests`
+  **by name**. When the fix lands the test XPASSes, which lit reports as a
+  failure — that is the prompt to drop the `XFAIL` line.
 
 Never delete a failing test for an unimplemented feature: an `XFAIL` is the
 record that the gap is known, a missing test is not.

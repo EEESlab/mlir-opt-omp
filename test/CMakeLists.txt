@@ -41,8 +41,13 @@ foreach(tool FileCheck count not)
   endif()
 endforeach()
 
+# --show-xfail makes lit list the expectedly-failed tests by name instead of
+# just counting them.  Each XFAIL here marks a clause the lowering accepts and
+# gets wrong (see the coverage matrix in README.md), so the names are the point:
+# a bare "Expectedly Failed: 8" says a gap exists, not which one.
 add_lit_testsuite(check-omp "Running the omp-lower regression tests"
   ${CMAKE_CURRENT_BINARY_DIR}
+  ARGS --show-xfail
   DEPENDS ${OMP_LOWER_TEST_DEPENDS}
 )
 set_target_properties(check-omp PROPERTIES FOLDER "Tests")
