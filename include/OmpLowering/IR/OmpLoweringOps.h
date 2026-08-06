@@ -17,8 +17,8 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-// BytecodeOpInterface is referenced by the generated .inc even when
-// usePropertiesForAttributes = 0, because MemoryEffectOpInterface pulls it in.
+// BytecodeOpInterface is referenced by the generated .inc: the op attributes
+// are stored as properties, which are read and written through it.
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 
 // Step 1: dialect class declaration.

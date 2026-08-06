@@ -21,13 +21,6 @@ def OmpLowering_Dialect : Dialect {
   let summary      = "Dialect for OpenMP runtime lowering plans";
   let cppNamespace = "::mlir::omp_lower";
   let useDefaultAttributePrinterParser = 1;
-  // Disable the LLVM-17+ "Properties" storage model.
-  // With usePropertiesForAttributes = 1 (the new default) TableGen generates
-  // code that depends on BytecodeOpInterface, InferredProperties, and a new
-  // getProperties() ABI that requires additional boilerplate we don't need.
-  // Setting this to 0 keeps all op attributes in the classic attribute-dict,
-  // which is simpler and fully sufficient for a plan-carrier operation.
-  let usePropertiesForAttributes = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,11 +97,10 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     // symbolic name in the plan would otherwise lose the SSA reference.
     //
     // A single variadic list (rather than several Optional operands) avoids
-    // AttrSizedOperandSegments, whose generated verifier is broken when the
-    // dialect disables usePropertiesForAttributes.  The 1:1 clause_names
-    // array below says which clause each operand carries ("num_threads",
-    // "if_clause", ...), so a construct can carry several at once (e.g.
-    // `parallel num_threads(n) if(c)`).
+    // AttrSizedOperandSegments and the segment-size attribute it brings along.
+    // The 1:1 clause_names array below says which clause each operand carries
+    // ("num_threads", "if_clause", ...), so a construct can carry several at
+    // once (e.g. `parallel num_threads(n) if(c)`).
     Variadic<AnyType>:$clause_operands,
 
     StrAttr:$runtime,

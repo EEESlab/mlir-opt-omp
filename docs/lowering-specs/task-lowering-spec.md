@@ -225,9 +225,9 @@ the shape mirrors libgomp (`closure` + `packed`) with a different callee.
   (`clause_operands`)** rather than several `Optional` operands. At most one is
   present today — `num_threads` (parallel) or `if_clause` (task) — and the
   construct kind plus the plan's symbolic arg name disambiguate which it is.
-  (Two `Optional` operands would need `AttrSizedOperandSegments`, whose
-  generated verifier is broken when the dialect disables
-  `usePropertiesForAttributes`, so a single variadic is used instead.)
+  (Two `Optional` operands would need `AttrSizedOperandSegments` and the
+  segment-size attribute it brings along, so a single variadic is used
+  instead.)
   `emitConstructOp` / the `process` lambda thread the value through.
 - **Shared `injectFirstprivateUses` helper** (used by both `parallel` and
   `task`) injects `unrealized_conversion_cast` uses of firstprivate source vars
