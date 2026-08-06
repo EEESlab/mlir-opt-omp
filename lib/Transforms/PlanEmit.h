@@ -33,10 +33,6 @@ Type ptrTy(MLIRContext *ctx);
 Type i32Ty(MLIRContext *ctx);
 
 // --- DSL-owned ABI layouts --------------------------------------------------
-// Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
-// type.  Kept small on purpose: extend as new layouts need more field types.
-Type parseAbiType(MLIRContext *ctx, llvm::StringRef t);
-
 // Expand a DSL struct-layout property of the form "%struct:t0,t1,..." into an
 // LLVM literal struct type.  An absent or malformed property falls back to the
 // caller's default so older DSL files keep working.  Shared because both passes

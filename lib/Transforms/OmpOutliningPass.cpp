@@ -732,25 +732,6 @@ static bool planNamesToken(ConstructOp op, llvm::StringRef token) {
          blockNamesToken(op.getPost(), token);
 }
 
-// The callee of the first call in a plan block, looking inside branch arms.
-//
-// This drives which emission path runs below, so it has to see through a
-// branch: libgomp's parallel invoke is one, and stopping at the top level
-// would report "no call at all" and skip the whole call-site emission.
-static std::string firstPlanCallee(ArrayAttr block) {
-  if (!block) return "";
-  for (Attribute a : block) {
-    if (auto call = llvm::dyn_cast<PlanCallAttr>(a))
-      return call.getCallee().getValue().str();
-    if (auto br = llvm::dyn_cast<PlanBranchAttr>(a)) {
-      std::string c = firstPlanCallee(br.getIfTrue());
-      if (c.empty()) c = firstPlanCallee(br.getIfFalse());
-      if (!c.empty()) return c;
-    }
-  }
-  return "";
-}
-
 static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
                              llvm::function_ref<Value(OpBuilder &, Location)>
                                  makeGtid) {
@@ -1088,431 +1069,145 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
     return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
   });
 
-  // ---- Emit the runtime call at the call site ----
-  std::string runtimeCallee = firstPlanCallee(op.getInvoke());
+  // ---- Hand the construct to PlanLoweringPass ----
+  // This pass emits no runtime call.  It attaches what only it can produce —
+  // the outlined function's address, the capture struct or the individual
+  // capture values, the ABI sizes — as named operands and leaves the construct
+  // standing.  Everything the DSL states in pre/invoke/post is emitted there.
+  builder.setInsertionPoint(op);
 
-  // Set by whichever emission path consumes the if clause; checked after
-  // emission so an unconsumed if is flagged instead of silently dropped.
-  bool ifClauseUsed = false;
+  SmallVector<Value> operands(op.getClauseOperands().begin(),
+                              op.getClauseOperands().end());
+  SmallVector<Attribute> names;
+  if (auto existing = op.getClauseNames())
+    names.assign(existing->begin(), existing->end());
+  auto bind = [&](llvm::StringRef n, Value v) {
+    operands.push_back(v);
+    names.push_back(StringAttr::get(ctx, n));
+  };
 
-  if (!runtimeCallee.empty()) {
-    builder.setInsertionPoint(op);
+  // The outlined function's address, under every spelling a plan may use for
+  // it: the evaluation context seeds `body` with "outlined_parallel" for
+  // parallel and with "body" for task, and a plan can also name it as a callee
+  // (the direct microtask call on the serialized side of `if`).  Missing one
+  // resolves to an undef pointer and forks into nothing.
+  Value fnPtr = func::ConstantOp::create(builder, loc,
+    outlinedFn.getFunctionType(), FlatSymbolRefAttr::get(ctx, fnName));
+  Value fnPtrCast = UnrealizedConversionCastOp::create(
+    builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
+  bind("body", fnPtrCast);
+  bind("outlined_parallel", fnPtrCast);
+  bind("outlined_task", fnPtrCast);
 
-    SmallVector<Value> callArgs;
-    SmallVector<Type>  callTypes;
+  auto i64t = IntegerType::get(ctx, 64);
+  auto one64 = [&] {
+    return LLVM::ConstantOp::create(builder, loc, i64t,
+                                    IntegerAttr::get(i64t, 1));
+  };
 
-    // Call-site ident and master global_tid are materialised on demand — once,
-    // the first time a pre/invoke call actually references them — with no `emit`
-    // declaration in the DSL (same on-demand model as barrier/wsloop/task).
-    //   - ident: needed by the iomp fork and as the gtid seed; the packed path
-    //     (libgomp/pmsis) references neither, so it is never emitted there.
-    //   - global_tid: needed only when an optional push_num_threads /
-    //     push_proc_bind pre-call is present.  Its function name comes from the
-    //     `global_tid_function` DSL property; it seeds off the default ident.
-    Value identCache;
-    auto getIdent = [&]() -> Value {
-      if (!identCache)
-        identCache = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
-      return identCache;
-    };
-    Value gtidCache;
-    auto getGtid = [&]() -> Value {
-      if (!gtidCache) {
-        std::string gtidFnName = getPropStr(op, "global_tid_function");
-        if (gtidFnName.empty()) {
-          // A %gtid token under a runtime with no global_tid_function DSL
-          // property (libgomp/pmsis) has no gtid source; declaring a nameless
-          // function would fail the verifier.
-          op.emitWarning("'%gtid' referenced but the runtime defines no "
-                         "global_tid_function; using undef");
-          gtidCache = LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
-        } else {
-          auto gtidDecl = getOrInsertDeclWithReturn(module,
-            gtidFnName, {ptrTy(ctx)}, i32Ty(ctx), builder);
-          gtidCache = func::CallOp::create(builder, loc, gtidDecl,
-            ValueRange{getIdent()}).getResult(0);
-        }
-      }
-      return gtidCache;
-    };
-    // Shared ident seam for the pre/invoke resolvers below (see
-    // resolveIdentToken): the default ident reuses the cached fork ident.
-    auto resolveIdent = [&](uint32_t flags) -> Value {
-      return resolveIdentToken(flags, module, builder, loc, ctx, getIdent);
-    };
+  if (abi == CaptureAbi::Packed) {
+    // -------------------------------------------------------------------------
+    // PACKED / CLOSURE: one capture struct on the stack, handed over by pointer
+    // -------------------------------------------------------------------------
+    // Scalar/ptr-alloca captures are packed by value (see buildCaptureStruct /
+    // storeCapturesToBase); the struct type also gives env_size / env_align.
+    SmallVector<Type> fieldTypes;
+    auto structTy =
+        buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
 
-    // Bindings for the pre-block resolver: num_threads when the clause is set.
-    llvm::StringMap<Value> preBindings;
-    if (Value ct = getClauseOperand(op, "num_threads"))
-      preBindings["num_threads"] = ct;
-
-    // Emit pre-block calls (push_num_threads, push_proc_bind, etc.)
-    for (auto attr : op.getPre()) {
-      auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
-      if (!ca) continue;
-      SmallVector<Value> preArgs;
-      SmallVector<Type>  preTypes;
-      for (auto argAttr : ca.getArgs()) {
-        Value v;
-        if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-          v = resolveSymbolToken(sa.getValue(), builder, loc, preBindings,
-                                 resolveIdent, getGtid);
-        } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
-          v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
-            IntegerAttr::get(i32Ty(ctx), ia.getInt()));
-        } else {
-          v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-        }
-        preArgs.push_back(v); preTypes.push_back(v.getType());
-      }
-      auto preDecl = getOrInsertDecl(module, ca.getCallee().getValue(),
-                                      preTypes, builder);
-      func::CallOp::create(builder, loc, preDecl, preArgs);
-    }
-
-    if (abi == CaptureAbi::Packed) {
-      // -----------------------------------------------------------------------
-      // PACKED / CLOSURE: build capture struct on the stack, pass ptr to it
-      // -----------------------------------------------------------------------
-      // Scalar/ptr-alloca captures are packed by value (see buildCaptureStruct
-      // / storeCapturesToBase); the struct type is also needed below for
-      // env_size / env_align (task).
-      SmallVector<Type> fieldTypes;
-      auto structTy =
-          buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
-
-      // Build the capture struct (same for all packed runtimes).
-      Value structAlloca;
-      if (!captures.empty()) {
-        Value one64 = LLVM::ConstantOp::create(builder, loc,
-          IntegerType::get(ctx, 64),
-          IntegerAttr::get(IntegerType::get(ctx, 64), 1));
-        structAlloca = LLVM::AllocaOp::create(builder, loc,
-          ptrTy(ctx), structTy, one64);
-        storeCapturesToBase(builder, loc, structAlloca, structTy, captures,
-          fieldTypes, privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
-      } else {
-        structAlloca = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-      }
-
-      // outlined fn pointer
-      Value fnPtr = func::ConstantOp::create(builder, loc,
-        outlinedFn.getFunctionType(),
-        FlatSymbolRefAttr::get(ctx, fnName));
-      Value fnPtrCast = UnrealizedConversionCastOp::create(
-        builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
-
-      // Capture-struct size/alignment for GOMP_task's `long arg_size,
-      // long arg_align` (libgomp memcpys arg_size bytes into task-private
-      // memory when cpyfn is NULL).  Computed via the module DataLayout;
-      // alignment falls back to 16 (a valid power-of-2 ≥ any field's align).
-      auto i64t = IntegerType::get(ctx, 64);
-      auto i8t  = IntegerType::get(ctx, 8);
-      DataLayout dataLayout(module);
-      uint64_t envSize  = captures.empty()
-        ? 0u : dataLayout.getTypeSize(structTy).getFixedValue();
-      uint64_t envAlign = captures.empty()
-        ? 1u : dataLayout.getTypeABIAlignment(structTy);
-      if (envAlign == 0) envAlign = 16;
-
-      // Plain-lookup tokens shared with resolveSymbolToken.  env_size/env_align
-      // (lazy i64 constants, emitted only when referenced so the parallel path
-      // materialises none), if_clause (i1→i8 normalisation) and null (a real
-      // null ptr, not the undef fallback) stay special-cased below.
-      // The default: hand the invoke to PlanLoweringPass rather than emit it
-      // here.  This pass attaches the artifacts only it can produce — the
-      // outlined function pointer and the capture struct — as named operands
-      // and leaves the construct standing for the plan pass to consume.
-      //
-      // A construct opts out with `lower_in = outline` when its invoke needs
-      // something the plan pass cannot resolve yet.  Only libgomp's task does:
-      // env_size/env_align, a real null pointer and a boolean.
-      if (getPropStr(op, "lower_in") != "outline") {
-        SmallVector<Value> operands(op.getClauseOperands().begin(),
-                                    op.getClauseOperands().end());
-        SmallVector<Attribute> names;
-        if (auto existing = op.getClauseNames())
-          names.assign(existing->begin(), existing->end());
-        auto bind = [&](llvm::StringRef n, Value v) {
-          operands.push_back(v);
-          names.push_back(StringAttr::get(ctx, n));
-        };
-        // Bind every spelling the plan may use for the outlined function: the
-        // context seeds `body` with the string "outlined_parallel"/"outlined_task",
-        // so that — not "body" — is what reaches the plan as the argument.
-        // Missing one resolves to an undef pointer and forks into nothing.
-        bind("body", fnPtrCast);
-        bind("outlined_parallel", fnPtrCast);
-        bind("outlined_task", fnPtrCast);
-        bind("env_ptr", structAlloca);
-        // The capture struct's layout: GOMP_task takes them as `long arg_size,
-        // long arg_align`, and only this pass has built the struct.
-        bind("env_size", LLVM::ConstantOp::create(builder, loc, i64t,
-                           IntegerAttr::get(i64t, (int64_t)envSize)));
-        bind("env_align", LLVM::ConstantOp::create(builder, loc, i64t,
-                            IntegerAttr::get(i64t, (int64_t)envAlign)));
-        op->setOperands(operands);
-        op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
-        // Same guard as the emitting paths below, but the plan may well
-        // consume the clause itself now (libgomp branches on it), so only warn
-        // when nothing in the plan names it.
-        if (getClauseOperand(op, "if_clause") &&
-            !planNamesToken(op, "if_clause"))
-          op.emitWarning("omp-outline: `if` clause is not supported by this "
-                         "runtime/construct lowering and was ignored");
-        return;   // deliberately not erased: the plan pass consumes it
-      }
-
-      llvm::StringMap<Value> invokeBindings;
-      invokeBindings["body"]              = fnPtrCast;
-      invokeBindings["outlined_parallel"] = fnPtrCast;
-      invokeBindings["outlined_task"]     = fnPtrCast;
-      invokeBindings["env_ptr"]           = structAlloca;
-      if (Value ct = getClauseOperand(op, "num_threads"))
-        invokeBindings["num_threads"] = ct;
-
-      // Build call args from DSL invoke args, resolving symbolic names.
-      for (auto attr : op.getInvoke()) {
-        auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
-        if (!ca) continue;
-        for (auto argAttr : ca.getArgs()) {
-          Value v;
-          if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-            llvm::StringRef s = sa.getValue();
-            if (s == "env_size")
-              v = LLVM::ConstantOp::create(builder, loc, i64t,
-                    IntegerAttr::get(i64t, (int64_t)envSize));
-            else if (s == "env_align")
-              v = LLVM::ConstantOp::create(builder, loc, i64t,
-                    IntegerAttr::get(i64t, (int64_t)envAlign));
-            else if (s == "if_clause" && getClauseOperand(op, "if_clause")) {
-              // Normalise the if-clause SSA value (typically i1) to i8 to
-              // match the C `_Bool` parameter of GOMP_task.
-              ifClauseUsed = true;
-              Value ifv = getClauseOperand(op, "if_clause");
-              if (ifv.getType() != i8t) {
-                unsigned bw = ifv.getType().getIntOrFloatBitWidth();
-                ifv = bw < 8
-                  ? LLVM::ZExtOp::create(builder, loc, i8t, ifv).getResult()
-                  : LLVM::TruncOp::create(builder, loc, i8t, ifv).getResult();
-              }
-              v = ifv;
-            } else if (s == "null")
-              v = LLVM::ZeroOp::create(builder, loc, ptrTy(ctx));
-            else
-              v = resolveSymbolToken(s, builder, loc, invokeBindings,
-                                     resolveIdent, getGtid);
-          } else if (auto ba = llvm::dyn_cast<BoolAttr>(argAttr)) {
-            v = LLVM::ConstantOp::create(builder, loc, i8t,
-                  IntegerAttr::get(i8t, ba.getValue() ? 1 : 0));
-          } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
-            v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
-              IntegerAttr::get(i32Ty(ctx), ia.getInt()));
-          } else if (auto aa = llvm::dyn_cast<ArrayAttr>(argAttr)) {
-            // Nested array — skip (handles argc(captures) style args)
-            v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-          } else {
-            v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-          }
-          callArgs.push_back(v);
-          callTypes.push_back(v.getType());
-        }
-        break; // only first invoke call
-      }
+    Value structAlloca;
+    if (!captures.empty()) {
+      structAlloca = LLVM::AllocaOp::create(builder, loc,
+        ptrTy(ctx), structTy, one64());
+      storeCapturesToBase(builder, loc, structAlloca, structTy, captures,
+        fieldTypes, privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
     } else {
-      // -----------------------------------------------------------------------
-      // BY_POINTER (iomp): ident, argc, fn_ptr, captures...
-      // -----------------------------------------------------------------------
-      Value fnPtr = func::ConstantOp::create(builder, loc,
-        outlinedFn.getFunctionType(),
-        FlatSymbolRefAttr::get(ctx, fnName));
-      Value fnPtrCast = UnrealizedConversionCastOp::create(
-        builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
+      structAlloca = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+    }
+    bind("env_ptr", structAlloca);
 
-      // The values actually passed: a private capture (a loop IV) gets a fresh
-      // local alloca so each thread has its own copy rather than sharing the
-      // caller's.
-      SmallVector<Value> capVals;
-      for (auto cap : captures) {
-        Value capVal = cap;
-        if (privateCaptures.contains(cap)) {
-          auto srcAlloca = cap.getDefiningOp<LLVM::AllocaOp>();
-          Value cnt = LLVM::ConstantOp::create(builder, loc,
-            IntegerType::get(ctx, 64),
-            IntegerAttr::get(IntegerType::get(ctx, 64), 1));
-          capVal = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
-            srcAlloca.getElemType(), cnt);
-        }
-        capVals.push_back(capVal);
+    // The struct's layout: GOMP_task takes it as `long arg_size, long
+    // arg_align` (libgomp memcpys arg_size bytes into task-private memory when
+    // cpyfn is NULL).  Computed via the module DataLayout; alignment falls back
+    // to 16, a valid power-of-2 >= any field's own alignment.
+    DataLayout dataLayout(module);
+    uint64_t envSize  = captures.empty()
+      ? 0u : dataLayout.getTypeSize(structTy).getFixedValue();
+    uint64_t envAlign = captures.empty()
+      ? 1u : dataLayout.getTypeABIAlignment(structTy);
+    if (envAlign == 0) envAlign = 16;
+    bind("env_size",  LLVM::ConstantOp::create(builder, loc, i64t,
+                        IntegerAttr::get(i64t, (int64_t)envSize)));
+    bind("env_align", LLVM::ConstantOp::create(builder, loc, i64t,
+                        IntegerAttr::get(i64t, (int64_t)envAlign)));
+  } else {
+    // -------------------------------------------------------------------------
+    // BY_POINTER (iomp microtask): each capture is its own trailing argument
+    // -------------------------------------------------------------------------
+    // A private capture (a loop IV) gets a fresh local alloca so each thread has
+    // its own copy rather than sharing the caller's.
+    SmallVector<Value> capVals;
+    for (auto cap : captures) {
+      Value capVal = cap;
+      if (privateCaptures.contains(cap)) {
+        auto srcAlloca = cap.getDefiningOp<LLVM::AllocaOp>();
+        capVal = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+          srcAlloca.getElemType(), one64());
       }
-
-      if (getPropStr(op, "lower_in") != "outline") {
-        SmallVector<Value> operands(op.getClauseOperands().begin(),
-                                    op.getClauseOperands().end());
-        SmallVector<Attribute> names;
-        if (auto existing = op.getClauseNames())
-          names.assign(existing->begin(), existing->end());
-        auto bind = [&](llvm::StringRef n, Value v) {
-          operands.push_back(v);
-          names.push_back(StringAttr::get(ctx, n));
-        };
-        bind("body", fnPtrCast);
-        bind("outlined_parallel", fnPtrCast);
-
-        // The serialized side of `if` calls the microtask directly, and the
-        // microtask ABI takes gtid and btid *by pointer* — two slots only this
-        // pass can make.  Emitted just for that path, so a parallel with no if
-        // clause gets neither.
-        if (getClauseOperand(op, "if_clause")) {
-          auto i64t = IntegerType::get(ctx, 64);
-          Value one64 = LLVM::ConstantOp::create(builder, loc, i64t,
-            IntegerAttr::get(i64t, 1));
-          Value zero32 = LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
-            IntegerAttr::get(i32Ty(ctx), 0));
-          Value gtidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
-            i32Ty(ctx), one64);
-          Value btidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
-            i32Ty(ctx), one64);
-          LLVM::StoreOp::create(builder, loc, getGtid(), gtidAddr);
-          LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
-          bind("gtid_addr", gtidAddr);
-          bind("btid_addr", btidAddr);
-          // Hand the thread id over too: the serialized calls need it, and the
-          // store above already had to materialise it.  Without this the plan
-          // pass would emit a second __kmpc_global_thread_num of its own.
-          bind("%gtid", getGtid());
-        }
-
-        // captures is a list: every operand under this name belongs to it, and
-        // list_names keeps it a list even when there are none.
-        for (Value v : capVals) bind("%captures", v);
-        op->setOperands(operands);
-        op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
-        op.setListNamesAttr(ArrayAttr::get(ctx,
-            {StringAttr::get(ctx, "%captures")}));
-        if (getClauseOperand(op, "if_clause") &&
-            !planNamesToken(op, "if_clause"))
-          op.emitWarning("omp-outline: `if` clause is not supported by this "
-                         "runtime/construct lowering and was ignored");
-        return;   // deliberately not erased: the plan pass consumes it
-      }
-
-      callArgs.push_back(getIdent()); callTypes.push_back(ptrTy(ctx));
-
-      Value argcVal = arith::ConstantOp::create(builder, loc,
-        builder.getI32Type(),
-        builder.getI32IntegerAttr((int32_t)captures.size()));
-      callArgs.push_back(argcVal); callTypes.push_back(i32Ty(ctx));
-
-      callArgs.push_back(fnPtrCast); callTypes.push_back(ptrTy(ctx));
-
-      for (Value capVal : capVals) {
-        callArgs.push_back(capVal); callTypes.push_back(capVal.getType());
-      }
+      capVals.push_back(capVal);
     }
 
-    // (The libgomp `parallel if(cond)` handling used to sit here, forcing
-    // num_threads to 1 on the false side with an arith.select.  It is now a
-    // `branch` in rules.dsl and emitted by PlanLoweringPass — the first case
-    // where the DSL expresses a choice on a runtime value instead of C++.)
-
-    // __kmpc_fork_call is variadic: (ident, argc, fn, ...captures) -> void.
-    // Declare it as llvm.func variadic so multiple parallel regions with
-    // different capture counts can share the same declaration.
-    if (runtimeCallee == "__kmpc_fork_call") {
-      MLIRContext *mctx = module.getContext();
-      // Fixed prefix: ident(ptr), argc(i32), fn(ptr)
-      SmallVector<Type> fixedTypes;
-      size_t fixedCount = std::min((size_t)3, callTypes.size());
-      for (size_t fi = 0; fi < fixedCount; fi++)
-        fixedTypes.push_back(callTypes[fi]);
-      LLVM::LLVMFuncOp llvmDecl;
-      if (auto existing = module.lookupSymbol<LLVM::LLVMFuncOp>(runtimeCallee)) {
-        llvmDecl = existing;
+    // The serialized side of `if` calls the microtask directly, and the
+    // microtask ABI takes gtid and btid *by pointer* — two slots only this pass
+    // can make.  Emitted just for that path, so a parallel with no if clause
+    // gets neither, nor the thread id they need.
+    if (getClauseOperand(op, "if_clause")) {
+      std::string gtidFnName = getPropStr(op, "global_tid_function");
+      Value gtid;
+      if (gtidFnName.empty()) {
+        // No gtid source under this runtime; declaring a nameless function
+        // would fail the verifier.
+        op.emitWarning("'%gtid' referenced but the runtime defines no "
+                       "global_tid_function; using undef");
+        gtid = LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
       } else {
-        auto varFnType = LLVM::LLVMFunctionType::get(
-          LLVM::LLVMVoidType::get(mctx), fixedTypes, /*isVarArg=*/true);
-        OpBuilder::InsertionGuard g(builder);
-        builder.setInsertionPointToStart(module.getBody());
-        llvmDecl = LLVM::LLVMFuncOp::create(builder,
-          UnknownLoc::get(mctx), runtimeCallee, varFnType,
-          LLVM::Linkage::External);
+        Value ident = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
+        auto gtidDecl = getOrInsertDeclWithReturn(module, gtidFnName,
+          {ptrTy(ctx)}, i32Ty(ctx), builder);
+        gtid = func::CallOp::create(builder, loc, gtidDecl,
+          ValueRange{ident}).getResult(0);
       }
-
-      Value ifCond = abi == CaptureAbi::Packed
-                         ? Value()
-                         : getClauseOperand(op, "if_clause");
-      if (!ifCond) {
-        LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
-      } else {
-        // parallel if(cond): branch on the runtime value, clang-style.
-        //   cond true  → __kmpc_fork_call as usual
-        //   cond false → serialized parallel: __kmpc_serialized_parallel,
-        //                direct microtask call on this thread (gtid/btid
-        //                passed by pointer, btid = 0),
-        //                __kmpc_end_serialized_parallel.
-        // __kmpc_fork_call_if is deliberately NOT used: it takes a single
-        // packed `void *args` (argc <= 1), incompatible with the by_pointer
-        // capture convention that passes each capture as its own vararg.
-        ifClauseUsed = true;
-        Value gtidVal = getGtid();
-        auto i64t = IntegerType::get(ctx, 64);
-        Value one64 = LLVM::ConstantOp::create(builder, loc, i64t,
-          IntegerAttr::get(i64t, 1));
-        Value zero32 = LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
-          IntegerAttr::get(i32Ty(ctx), 0));
-        Value gtidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
-          i32Ty(ctx), one64);
-        Value btidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
-          i32Ty(ctx), one64);
-        LLVM::StoreOp::create(builder, loc, gtidVal, gtidAddr);
-        LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
-        Value cond = clauseToI1(builder, loc, ifCond);
-
-        Block *curBlock = builder.getInsertionBlock();
-        // op and everything after it continue in contBlock.
-        Block *contBlock = curBlock->splitBlock(op);
-        Block *forkBlock = builder.createBlock(contBlock);
-        Block *serBlock  = builder.createBlock(contBlock);
-
-        builder.setInsertionPointToEnd(curBlock);
-        LLVM::CondBrOp::create(builder, loc, cond, forkBlock, serBlock);
-
-        builder.setInsertionPointToEnd(forkBlock);
-        LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
-        LLVM::BrOp::create(builder, loc, contBlock);
-
-        builder.setInsertionPointToEnd(serBlock);
-        auto serDecl = getOrInsertDecl(module, "__kmpc_serialized_parallel",
-          {ptrTy(ctx), i32Ty(ctx)}, builder);
-        func::CallOp::create(builder, loc, serDecl,
-          ValueRange{getIdent(), gtidVal});
-        // callArgs[3..] are exactly the capture args of the microtask.
-        SmallVector<Value> directArgs{gtidAddr, btidAddr};
-        for (size_t ai = 3; ai < callArgs.size(); ++ai)
-          directArgs.push_back(callArgs[ai]);
-        func::CallOp::create(builder, loc, outlinedFn, directArgs);
-        auto endSerDecl = getOrInsertDecl(module,
-          "__kmpc_end_serialized_parallel", {ptrTy(ctx), i32Ty(ctx)}, builder);
-        func::CallOp::create(builder, loc, endSerDecl,
-          ValueRange{getIdent(), gtidVal});
-        LLVM::BrOp::create(builder, loc, contBlock);
-
-        builder.setInsertionPoint(op);
-      }
-    } else {
-      auto decl = getOrInsertDecl(module, runtimeCallee, callTypes, builder);
-      func::CallOp::create(builder, loc, decl, callArgs);
+      Value zero32 = LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
+        IntegerAttr::get(i32Ty(ctx), 0));
+      Value gtidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+        i32Ty(ctx), one64());
+      Value btidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+        i32Ty(ctx), one64());
+      LLVM::StoreOp::create(builder, loc, gtid, gtidAddr);
+      LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
+      bind("gtid_addr", gtidAddr);
+      bind("btid_addr", btidAddr);
+      // Hand the thread id over too: the serialized calls need it, and the
+      // store above already had to materialise it.  Without this the plan pass
+      // would emit a second __kmpc_global_thread_num of its own.
+      bind("%gtid", gtid);
     }
+
+    // captures is a list: every operand under this name belongs to it, and
+    // list_names keeps it a list even when there are none.
+    for (Value v : capVals) bind("%captures", v);
+    op.setListNamesAttr(ArrayAttr::get(ctx,
+        {StringAttr::get(ctx, "%captures")}));
   }
 
-  // An if clause that no emission path consumed would silently change
-  // semantics (if(false) must run the region undeferred/serialized): flag it.
-  if (getClauseOperand(op, "if_clause") && !ifClauseUsed)
+  op->setOperands(operands);
+  op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+
+  // An if clause that no plan action names would silently change semantics
+  // (if(false) must run the region serialized): flag it.
+  if (getClauseOperand(op, "if_clause") && !planNamesToken(op, "if_clause"))
     op.emitWarning("omp-outline: `if` clause is not supported by this "
                    "runtime/construct lowering and was ignored");
-
-  op.erase();
 }
 
 // ---------------------------------------------------------------------------

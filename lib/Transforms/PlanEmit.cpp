@@ -30,7 +30,9 @@ Type mlir::omp_lower::i32Ty(MLIRContext *ctx) {
 // DSL-owned ABI layouts
 // ---------------------------------------------------------------------------
 
-Type mlir::omp_lower::parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
+// Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
+// type.  Kept small on purpose: extend as new layouts need more field types.
+static Type parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
   if (t == "ptr") return ptrTy(ctx);
   if (t == "i32") return i32Ty(ctx);
   if (t == "i64") return IntegerType::get(ctx, 64);

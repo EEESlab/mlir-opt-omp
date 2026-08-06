@@ -25,10 +25,14 @@ func.func @parallel_plain(%arg0: !llvm.ptr) {
 }
 
 // With the clause: push before the fork, and the gtid it needs is materialised.
-// CHECK-LABEL: func.func @parallel_nt
-// CHECK:         call @__kmpc_global_thread_num
-// CHECK:         call @__kmpc_push_num_threads
-// CHECK:         llvm.call @__kmpc_fork_call
+// Both exactly once — the pre block is emitted by PlanLoweringPass alone, and a
+// plain CHECK would not notice a second copy from another pass.
+// CHECK-LABEL:      func.func @parallel_nt
+// CHECK-COUNT-1:      call @__kmpc_global_thread_num
+// CHECK-NOT:          call @__kmpc_global_thread_num
+// CHECK-COUNT-1:      call @__kmpc_push_num_threads
+// CHECK-NOT:          call @__kmpc_push_num_threads
+// CHECK:              llvm.call @__kmpc_fork_call
 
 // Without it: no push, and no gtid call — nothing else in this path needs one.
 // CHECK-LABEL: func.func @parallel_plain
