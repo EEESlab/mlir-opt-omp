@@ -120,7 +120,13 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     // separately because a list can legitimately be empty — a parallel with no
     // captures has no operand at all, and only this attribute distinguishes
     // "empty list" from "not a list".
-    OptionalAttr<StrArrayAttr>:$list_names
+    OptionalAttr<StrArrayAttr>:$list_names,
+    // proc_bind is a compile-time enum, not a run-time value, so unlike
+    // num_threads and if_clause it cannot ride in clause_operands: there is no
+    // SSA value to carry.  The kind's spelling ("close", "spread", ...) travels
+    // here, and the outlining pass turns it into the constant the runtime's ABI
+    // wants — which is a different numbering from the MLIR enum's own ordinals.
+    OptionalAttr<StrAttr>:$proc_bind
   );
 
   let results = (outs);

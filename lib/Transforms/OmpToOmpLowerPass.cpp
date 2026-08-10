@@ -90,7 +90,8 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
                      Location loc,
                      Region *srcRegion = nullptr,
                      Value numThreads = nullptr,
-                     Value ifClause = nullptr) {
+                     Value ifClause = nullptr,
+                     StringAttr procBind = nullptr) {
   MLIRContext *ctx = builder.getContext();
 
   SmallVector<NamedAttribute> propPairs;
@@ -131,7 +132,10 @@ void emitConstructOp(const dsl::LoweringPlan &plan,
     toArrayAttr(plan.post),
     clauseNames.empty() ? ArrayAttr() : builder.getArrayAttr(clauseNames),
     // list_names: the outlining pass sets it when it binds a list (captures).
-    ArrayAttr());
+    ArrayAttr(),
+    // proc_bind: a compile-time enum, so it travels as an attribute rather
+    // than as one of the clause operands above.
+    procBind);
 
   // Move the source region (e.g. omp.parallel body) into the construct op.
   if (srcRegion && !srcRegion->empty())
@@ -169,12 +173,23 @@ extractParallelContext(omp::ParallelOp op) {
   else
     ctx["num_threads"] = dsl::makeNull();
 
-  // proc_bind
-  ctx["proc_bind"] = dsl::makeNull();
-  if (op.getProcBindKind()) {
-    auto pb = omp::stringifyClauseProcBindKind(*op.getProcBindKind());
-    ctx["proc_bind"] = dsl::makeStr(pb.str());
-  }
+  // proc_bind is a sentinel like num_threads: non-null selects the
+  // `when has(proc_bind)` push call, and the identifier in the DSL stands for
+  // the affinity constant, which the outlining pass materialises from the kind
+  // carried on the ConstructOp.  Seeding the kind's own spelling here instead
+  // would put "close" in the plan as a call argument, and an unknown string
+  // token resolves to an undef pointer where the ABI wants an i32 enum.
+  if (op.getProcBindKind())
+    ctx["proc_bind"] = dsl::makeStr("proc_bind");
+  else
+    ctx["proc_bind"] = dsl::makeNull();
+
+  // The same affinity constant seen the way GOMP takes it: a flags word that is
+  // always passed, 0 meaning "no policy asked for" — the value GCC itself emits
+  // there.  It needs its own token because `proc_bind` above is the *clause*,
+  // null when absent so `has(proc_bind)` can gate iomp's push call, and a null
+  // resolves to a null pointer where this slot wants an i32.
+  ctx["proc_bind_flags"] = dsl::makeStr("proc_bind_flags");
 
   // iomp runtime identifiers
   ctx["ident"]      = dsl::makeStr("%ident");
@@ -355,7 +370,8 @@ struct OmpToOmpLowerPass
                        llvm::StringMap<dsl::Value> ctx,
                        Region *region = nullptr,
                        Value numThreads = nullptr,
-                       Value ifClause = nullptr) -> bool {
+                       Value ifClause = nullptr,
+                       StringAttr procBind = nullptr) -> bool {
       auto plan = evaluator.buildPlan(runtimeName, construct, ctx);
       if (!plan) {
         op.emitError("DSL evaluation failed: ")
@@ -364,7 +380,8 @@ struct OmpToOmpLowerPass
         return false;
       }
       OpBuilder builder(op);
-      emitConstructOp(*plan, builder, op.getLoc(), region, numThreads, ifClause);
+      emitConstructOp(*plan, builder, op.getLoc(), region, numThreads, ifClause,
+                      procBind);
       op.erase();
       return true;
     };
@@ -402,8 +419,15 @@ struct OmpToOmpLowerPass
       Value numThreads;
       if (op.getNumThreadsDimsCount() > 0)
         numThreads = op.getNumThreads(0);
+      // The kind's spelling, not its ordinal: the MLIR enum numbers its cases
+      // differently from every runtime's, so the name is what survives.
+      StringAttr procBind;
+      if (auto kind = op.getProcBindKind())
+        procBind = StringAttr::get(&getContext(),
+                                   omp::stringifyClauseProcBindKind(*kind));
       if (!process(op, "parallel", extractParallelContext(op),
-                   &op.getRegion(), numThreads, op.getIfExpr())) return;
+                   &op.getRegion(), numThreads, op.getIfExpr(), procBind))
+        return;
     }
 
     // Tasks behave like parallel for outlining (closure/packed body), but

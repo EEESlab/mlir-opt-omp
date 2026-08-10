@@ -477,6 +477,7 @@ static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
                              llvm::function_ref<Value(OpBuilder &, Location)>
                                  makeGtid);
 static bool planNamesToken(ConstructOp op, llvm::StringRef token);
+static void warnIgnoredClauses(ConstructOp op);
 
 static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   Region &body = op.getBody();
@@ -677,9 +678,7 @@ static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
   op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
   op.setListNamesAttr(ArrayAttr::get(ctx,
       {StringAttr::get(ctx, "%captures")}));
-  if (getClauseOperand(op, "if_clause") && !planNamesToken(op, "if_clause"))
-    op.emitWarning("omp-outline: `if` clause is not supported by this "
-                   "runtime/construct lowering and was ignored");
+  warnIgnoredClauses(op);
   return;   // deliberately not erased: the plan pass consumes it
 }
 
@@ -730,6 +729,37 @@ static bool planNamesToken(ConstructOp op, llvm::StringRef token) {
   return blockNamesToken(op.getPre(), token) ||
          blockNamesToken(op.getInvoke(), token) ||
          blockNamesToken(op.getPost(), token);
+}
+
+// A clause the construct carries that no plan action names is a clause this
+// runtime's rules have no lowering for.  Emitting the construct anyway would
+// change semantics without saying so — if(false) must run the region
+// serialized, num_threads must size the team, proc_bind asks for an affinity
+// policy — so each one gets a warning.  The check is per construct, not per
+// runtime: the same clause can be lowered by one construct and dropped by
+// another, and only the plan knows which.
+static void warnIgnoredClauses(ConstructOp op) {
+  // The tokens a plan can name the clause by, and how OpenMP spells it.  Most
+  // have one; proc_bind has two — the push argument (iomp) and the flags word
+  // GOMP always takes — and naming either one is a lowering.
+  struct Clause { llvm::StringRef token, altToken, spelling; };
+  static const Clause kClauses[] = {
+    {"if_clause",   "",                "if"},
+    {"num_threads", "",                "num_threads"},
+    {"proc_bind",   "proc_bind_flags", "proc_bind"},
+  };
+  for (auto [token, altToken, spelling] : kClauses) {
+    // proc_bind is the one clause with no SSA value: it rides as an attribute.
+    bool present = token == "proc_bind" ? op.getProcBind().has_value()
+                                        : (bool)getClauseOperand(op, token);
+    bool named = planNamesToken(op, token) ||
+                 (!altToken.empty() && planNamesToken(op, altToken));
+    if (present && !named)
+      op.emitWarning("omp-outline: `")
+          << spelling
+          << "` clause is not supported by this runtime/construct lowering "
+             "and was ignored";
+  }
 }
 
 static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
@@ -1099,6 +1129,30 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
   bind("outlined_parallel", fnPtrCast);
   bind("outlined_task", fnPtrCast);
 
+  // proc_bind names a compile-time affinity policy, so unlike num_threads it
+  // arrives as an attribute and the constant for it has to be made here rather
+  // than resolved from an operand.  Two tokens carry the one value: `proc_bind`
+  // is the clause, bound only when one was given, and `proc_bind_flags` is the
+  // flags word GOMP always takes, 0 when no policy was asked for.  Each is
+  // bound only if the plan names it — elsewhere it would be a constant nothing
+  // reads, and that case is what the ignored-clause warning covers instead.
+  uint32_t affinity = 0;  // kmp_proc_bind_false / omp_proc_bind_false
+  if (auto procBind = op.getProcBind()) {
+    if (auto value = procBindEnumValue(*procBind))
+      affinity = *value;
+    else
+      op.emitError("omp-outline: unknown proc_bind kind '")
+          << *procBind << "'; no affinity constant to emit";
+  }
+  auto affinityConst = [&] {
+    return LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
+             IntegerAttr::get(i32Ty(ctx), (int64_t)affinity));
+  };
+  if (op.getProcBind() && planNamesToken(op, "proc_bind"))
+    bind("proc_bind", affinityConst());
+  if (planNamesToken(op, "proc_bind_flags"))
+    bind("proc_bind_flags", affinityConst());
+
   auto i64t = IntegerType::get(ctx, 64);
   auto one64 = [&] {
     return LLVM::ConstantOp::create(builder, loc, i64t,
@@ -1203,11 +1257,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
   op->setOperands(operands);
   op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
 
-  // An if clause that no plan action names would silently change semantics
-  // (if(false) must run the region serialized): flag it.
-  if (getClauseOperand(op, "if_clause") && !planNamesToken(op, "if_clause"))
-    op.emitWarning("omp-outline: `if` clause is not supported by this "
-                   "runtime/construct lowering and was ignored");
+  warnIgnoredClauses(op);
 }
 
 // ---------------------------------------------------------------------------

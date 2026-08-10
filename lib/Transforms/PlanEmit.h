@@ -25,6 +25,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
+
 namespace mlir {
 namespace omp_lower {
 
@@ -81,6 +83,11 @@ Value resolveIdentToken(uint32_t flags, ModuleOp module, OpBuilder &builder,
 // Normalise a value to i1 for use as a cond_br condition / select predicate
 // (clause values are typically already i1).
 Value clauseToI1(OpBuilder &builder, Location loc, Value v);
+
+// --- proc_bind --------------------------------------------------------------
+// Map an OpenMP proc_bind kind, by name, to the value the runtimes give it.
+// std::nullopt for a kind this table does not know.
+std::optional<uint32_t> procBindEnumValue(llvm::StringRef kind);
 
 // --- Symbolic token resolution ----------------------------------------------
 // Resolve a DSL argument token against one shared vocabulary:

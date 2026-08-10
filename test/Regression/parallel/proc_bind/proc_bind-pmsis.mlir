@@ -4,9 +4,9 @@
 // On pmsis the answer is almost certainly "this target has no affinity policy
 // to set" — the fork goes to a fixed cluster of cores — but a clause that
 // changes nothing must still be reported rather than absorbed, on the same
-// grounds as the `if` clause here (parallel-if-pmsis.mlir).  Fails today.
+// grounds as any other clause the plan never names — the outlining pass warns
+// instead of dropping it (warnIgnoredClauses in OmpOutliningPass.cpp).
 //
-// XFAIL: *
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower --omp-outline --verify-diagnostics
 

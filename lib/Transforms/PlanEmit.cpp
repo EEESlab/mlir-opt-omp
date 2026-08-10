@@ -188,6 +188,29 @@ Value mlir::omp_lower::resolveIdentToken(uint32_t flags, ModuleOp module,
              : getOrCreateIdent(module, builder, loc, ctx, flags);
 }
 
+// ---------------------------------------------------------------------------
+// proc_bind
+// ---------------------------------------------------------------------------
+
+// The runtimes agree on the numbering: iomp's kmp_proc_bind_t and libgomp's
+// omp_proc_bind_t are the same enum (false=0, true=1, master=2, close=3,
+// spread=4), and GCC passes those very values in GOMP_parallel's flags word.
+// One table therefore serves every runtime that names the clause.
+//
+// The MLIR enum is *not* that numbering — its ordinals are primary=0, master=1,
+// close=2, spread=3 — so the mapping goes through the kind's spelling.  Passing
+// the ordinal through would turn close into master, silently.  Kept here beside
+// identFlagBits, which is the same kind of table: a runtime ABI constant the
+// rules never spell out.
+//
+// primary and master are the 5.1 rename of one concept and share a value.
+std::optional<uint32_t> mlir::omp_lower::procBindEnumValue(llvm::StringRef kind) {
+  if (kind == "primary" || kind == "master") return 2u;
+  if (kind == "close")                       return 3u;
+  if (kind == "spread")                      return 4u;
+  return std::nullopt;
+}
+
 Value mlir::omp_lower::clauseToI1(OpBuilder &builder, Location loc, Value v) {
   if (v.getType().isInteger(1)) return v;
   Value zero = LLVM::ConstantOp::create(builder, loc, v.getType(),
