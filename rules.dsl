@@ -136,12 +136,17 @@ runtime libgomp {
       // the nested when/otherwise; 0 there means "runtime default".
       // With no if clause the condition is null, the branch collapses, and only
       // the true arm is emitted.
+      //
+      // The last argument is GOMP_parallel's flags word, which carries the
+      // proc_bind policy in its low bits — same numbering as iomp's
+      // kmp_proc_bind_t, and 0 when no policy was asked for.  There is no push
+      // call to gate here, so the token used is the always-valued one.
       branch if_clause {
         true => {
-          when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, 0);
-          otherwise             => call "GOMP_parallel"(body, env_ptr, 0, 0);
+          when has(num_threads) => call "GOMP_parallel"(body, env_ptr, num_threads, proc_bind_flags);
+          otherwise             => call "GOMP_parallel"(body, env_ptr, 0, proc_bind_flags);
         }
-        false => call "GOMP_parallel"(body, env_ptr, 1, 0);
+        false => call "GOMP_parallel"(body, env_ptr, 1, proc_bind_flags);
       }
     }
   }
@@ -193,9 +198,26 @@ runtime pmsis {
     // ABI selector.  packed entails the closure signature void(ptr data): all
     // captures live in one struct the call site hands over by pointer (env_ptr).
     capture_strategy = packed;
+    // Team size used when no num_threads clause asks for one.  The cluster has
+    // 8 cores; the value lives here rather than in the pass for the same reason
+    // default_chunk and task_flags do — it is a property of the runtime.
+    let default_team_size = 8;
     pre {}
     invoke {
-      call "ext_pi_cl_team_fork"(8, body, env_ptr);
+      // ext_pi_cl_team_fork has no `if` parameter, so the clause lowers the way
+      // libgomp's does: a one-core team, which is the serial execution.  Forking
+      // a team of 1 rather than calling the closure directly keeps the region
+      // inside a team, so an ext_pi_cl_team_barrier in the body still meets the
+      // number of cores it waits for.  That is a choice on a *runtime* value,
+      // hence a branch and not a `when`; with no if clause the condition is
+      // null, the branch collapses, and only the true arm is emitted.
+      branch if_clause {
+        true => {
+          when has(num_threads) => call "ext_pi_cl_team_fork"(num_threads, body, env_ptr);
+          otherwise             => call "ext_pi_cl_team_fork"(default_team_size, body, env_ptr);
+        }
+        false => call "ext_pi_cl_team_fork"(1, body, env_ptr);
+      }
     }
   }
   construct barrier {

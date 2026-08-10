@@ -1,15 +1,7 @@
-// num_threads on pmsis is NOT honoured: rules.dsl calls
-// `ext_pi_cl_team_fork(8, body, env_ptr)` with the team size written as a
-// literal, so the clause value never reaches the fork and the region always
-// runs on 8 cores.  Nothing diagnoses it — the clause is accepted and dropped.
-//
-// The check below states the behaviour the lowering should have: the fork takes
-// the value the user asked for.  It fails today, hence the XFAIL; when the DSL
-// starts threading num_threads through (a `when has(num_threads)` select like
-// the libgomp parallel does with GOMP_parallel), this XPASSes and the XFAIL
-// line goes away.
-//
-// XFAIL: *
+// pmsis has no push call: num_threads is the team-size argument of
+// ext_pi_cl_team_fork, so the clause selects between the `when has(num_threads)`
+// and `otherwise` arms of the DSL invoke, exactly as it does for GOMP_parallel.
+// Without the clause the slot is `default_team_size`, the 8-core cluster.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 
@@ -23,9 +15,21 @@ func.func @parallel_nt(%arg0: !llvm.ptr, %nt: i32) {
   return
 }
 
-// Capture the clause operand off the signature, then require the fork to be
-// handed that same value.  Today the first argument is a constant 8, so the
-// substitution does not match.
+func.func @parallel_plain(%arg0: !llvm.ptr) {
+  omp.parallel {
+    llvm.call @use(%arg0) : (!llvm.ptr) -> ()
+    omp.terminator
+  }
+  return
+}
+
+// With the clause: capture the operand off the signature and require the fork
+// to be handed that same value, rather than a team size of its own choosing.
 // CHECK-LABEL: func.func @parallel_nt
 // CHECK-SAME:    %{{[^:]+}}: !llvm.ptr, %[[NT:[^:]+]]: i32
 // CHECK:         call @ext_pi_cl_team_fork(%[[NT]],
+
+// Without it: the default team size goes in instead.
+// CHECK-LABEL: func.func @parallel_plain
+// CHECK-DAG:     %[[EIGHT:.*]] = arith.constant 8 : i32
+// CHECK:         call @ext_pi_cl_team_fork(%[[EIGHT]],

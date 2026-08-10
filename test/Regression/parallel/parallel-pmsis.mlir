@@ -1,7 +1,8 @@
 // The same input under the pmsis runtime forks the cluster team via
 // ext_pi_cl_team_fork (a shim over the PMSIS API, see
 // quick-compile/pulp/interface-adapter.c) instead of a __kmpc_/GOMP_ call.
-// The team size is fixed at 8 in rules.dsl, not taken from a clause.
+// With no num_threads clause the team size is `default_team_size` from
+// rules.dsl (see num_threads-pmsis.mlir for the clause taking its place).
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower | FileCheck %s
 
