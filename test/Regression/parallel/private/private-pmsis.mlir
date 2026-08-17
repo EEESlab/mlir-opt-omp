@@ -1,14 +1,13 @@
 // A pure `private` clause on pmsis.  pmsis shares the packed capture strategy
-// with libgomp, so it hits the same gap described in private-libgomp.mlir: no
-// capture is produced for a private, the copy-in loop is skipped, and the
-// surviving privatizer block arg is reported as an unsupported clause shape.
+// with libgomp, so the closure keeps its single data pointer and the slot is
+// allocated in the outlined body — see private-libgomp.mlir for the same
+// property spelled out.
 //
 // It gets its own test rather than being folded into the libgomp one because
 // the two runtimes reach the packed path through different DSL constructs
 // (ext_pi_cl_team_fork vs GOMP_parallel), and a fix that threads the private
 // through one call site says nothing about the other.
 //
-// XFAIL: *
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 

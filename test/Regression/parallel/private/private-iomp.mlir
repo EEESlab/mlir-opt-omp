@@ -3,20 +3,20 @@
 // copy in, so the outlined microtask needs no capture for it at all — it should
 // allocate the slot itself and take only the ABI-mandated (gtid, btid).
 //
-// That is what the CHECKs below state.  It is not what happens today.
-// OmpToOmpLowerPass::injectFirstprivateUses deliberately injects a use only for
-// privatizers with a copy region, so a pure private reaches OmpOutliningPass
-// with a privatizer block arg and no matching capture.  The iomp copy-in loop
-// then pairs privatizerArgs[i] with entry argument `privCapStart + i`, and with
-// no captures present that index lands back on the privatizer arg itself: the
-// prolog emits a load from an argument the call site never fills, and stores
-// the result into the private slot.  The private variable is initialised from
-// garbage instead of being left alone, and no diagnostic is produced.
+// The slot is allocated by OmpToOmpLowerPass (wirePrivatizers), inside the
+// region that is about to become the outlined body, and the privatizer block
+// arg is dropped there.  That is what keeps it out of the signature: by the
+// time OmpOutliningPass builds the microtask there is nothing left to pair
+// with a capture.
 //
-// See private-libgomp.mlir for how the same input fails on the packed ABI —
-// differently, which is why each runtime gets its own test.
+// This test used to XFAIL.  A pure private reached the outlining pass with a
+// block arg and no matching capture, and the iomp copy-in loop paired
+// privatizerArgs[i] with entry argument `privCapStart + i` — with no captures
+// that index landed back on the privatizer arg itself, so the prolog loaded
+// from an argument the call site never fills and stored the result into the
+// private slot, seeding it with garbage and saying nothing.  The CHECK-NOT
+// below is what rules that out.
 //
-// XFAIL: *
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
 

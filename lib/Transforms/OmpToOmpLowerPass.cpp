@@ -9,6 +9,7 @@
 #include "OmpLowering/DSL/DSLParser.h"
 #include "OmpLowering/DSL/DSLEvaluator.h"
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -312,7 +313,7 @@ struct OmpToOmpLowerPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<omp_lower::OmpLoweringDialect>();
+    registry.insert<omp_lower::OmpLoweringDialect, LLVM::LLVMDialect>();
   }
 
   void runOnOperation() override {
@@ -386,36 +387,123 @@ struct OmpToOmpLowerPass
       return true;
     };
 
-    // Inject firstprivate source vars as explicit uses inside a construct
-    // region so collectCaptures finds them (shared with parallel handling).
-    auto injectFirstprivateUses = [&](auto op) {
+    // Wire the privatizer block args a construct arrived with.  The two kinds
+    // need opposite things, and telling them apart is the whole job here.
+    //
+    // A firstprivate reads the original value, so that value has to reach the
+    // outlined function: inject an explicit use of it inside the region for
+    // collectCaptures to find, and leave the block arg alone for
+    // OmpOutliningPass to pair with that capture in the prolog.
+    //
+    // A pure private reads nothing — every thread just needs its own slot — so
+    // the slot is allocated right here, in the region that is about to become
+    // the outlined body, and the block arg goes away along with the clause
+    // operand that fed it.  That leaves only firstprivate args on the
+    // ConstructOp, which is what makes the outlining pass's positional pairing
+    // (privatizer arg i <-> injected capture i) correct.
+    auto wirePrivatizers = [&](auto op) {
       Region &region = op.getRegion();
-      if (region.empty()) return;
+      if (region.empty() || op.getPrivateVars().empty()) return true;
       Block &entryBlock = region.front();
       OpBuilder injector(&entryBlock, entryBlock.begin());
       auto privateSyms = op.getPrivateSyms();
+      auto blockArgs =
+          llvm::cast<omp::BlockArgOpenMPOpInterface>(op.getOperation())
+              .getPrivateBlockArgs();
+
+      auto fail = [&](const char *msg) {
+        op.emitError("omp-to-omp-lower: ") << msg;
+        signalPassFailure();
+      };
+
+      Value one;   // the alloca count, materialised on first use
+      // For each pure private: its index in private_vars, and the number of the
+      // block arg it feeds.  Both are needed to drop it, and both are read
+      // before any erase invalidates them.
+      SmallVector<std::pair<unsigned, unsigned>> dropped;
+      bool ok = true;
       for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
-        bool isFirstprivate = false;
-        if (privateSyms) {
-          auto symRef = llvm::cast<SymbolRefAttr>((*privateSyms)[idx]);
-          if (auto recipe = SymbolTable::lookupNearestSymbolFrom<
-                  omp::PrivateClauseOp>(op, symRef))
-            isFirstprivate = !recipe.getCopyRegion().empty();
+        omp::PrivateClauseOp recipe;
+        if (privateSyms)
+          recipe = SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
+              op, llvm::cast<SymbolRefAttr>((*privateSyms)[idx]));
+        if (!recipe) {
+          fail("privatizer recipe not found, so `private` cannot be told from "
+               "`firstprivate`");
+          ok = false;
+          continue;
         }
-        if (!isFirstprivate) continue;
-        UnrealizedConversionCastOp::create(injector, op.getLoc(),
-          TypeRange{privateVar.getType()}, ValueRange{privateVar});
+        // Declared firstprivate, or carrying the copy region that performs the
+        // copy-in: either way the source value is read and must be captured.
+        if (recipe.getDataSharingType() ==
+                omp::DataSharingClauseType::FirstPrivate ||
+            !recipe.getCopyRegion().empty()) {
+          UnrealizedConversionCastOp::create(injector, op.getLoc(),
+            TypeRange{privateVar.getType()}, ValueRange{privateVar});
+          continue;
+        }
+
+        // An init or dealloc region means the slot takes more than storage — a
+        // Fortran descriptor to set up, a destructor to run — and a bare alloca
+        // would be the wrong lowering rather than an incomplete one.
+        if (!recipe.getInitRegion().empty() ||
+            !recipe.getDeallocRegion().empty()) {
+          fail("`private` clause whose recipe has an init or dealloc region is "
+               "not supported");
+          ok = false;
+          continue;
+        }
+        BlockArgument arg = blockArgs[idx];
+        Type slotTy = recipe.getType();
+        if (!llvm::isa<LLVM::LLVMPointerType>(arg.getType()) ||
+            !LLVM::isCompatibleType(slotTy)) {
+          fail("`private` clause of an unsupported type: the region argument "
+               "must be a pointer to LLVM-compatible storage");
+          ok = false;
+          continue;
+        }
+        if (!one) {
+          auto i64Ty = injector.getI64Type();
+          one = LLVM::ConstantOp::create(injector, op.getLoc(), i64Ty,
+                                         injector.getI64IntegerAttr(1));
+        }
+        // One slot per execution of the outlined body, which is one per thread.
+        Value slot = LLVM::AllocaOp::create(injector, op.getLoc(),
+                                            arg.getType(), slotTy, one);
+        arg.replaceAllUsesWith(slot);
+        dropped.push_back({(unsigned)idx, arg.getArgNumber()});
       }
+
+      // Drop the pure privates from the op: block arg, clause operand and the
+      // matching private_syms entry, back to front so the earlier indices stay
+      // valid.  The op is about to be erased anyway, but it stays verifiable
+      // until then — the arg count and private_vars must agree.
+      if (!dropped.empty()) {
+        llvm::SmallDenseSet<unsigned> droppedVars;
+        for (auto [varIdx, argNo] : dropped) droppedVars.insert(varIdx);
+        for (auto [varIdx, argNo] : llvm::reverse(dropped)) {
+          entryBlock.eraseArgument(argNo);
+          op.getPrivateVarsMutable().erase(varIdx);
+        }
+        if (privateSyms) {
+          SmallVector<Attribute> kept;
+          for (auto [i, sym] : llvm::enumerate(*privateSyms))
+            if (!droppedVars.contains((unsigned)i)) kept.push_back(sym);
+          if (kept.empty())
+            op.removePrivateSymsAttr();
+          else
+            op.setPrivateSymsAttr(ArrayAttr::get(op.getContext(), kept));
+        }
+      }
+      return ok;
     };
 
     // Process parallels first, passing their region for later outlining.
     // Wsloops and barriers nested inside a parallel are erased with it.
     for (auto op : parallels) {
-      // Before moving the region, inject the privatizer source vars as
-      // explicit uses inside the region so collectCaptures finds them.
-      // Only inject for firstprivate vars (which need the source value
-      // copied); purely private vars just need a fresh alloca per thread.
-      injectFirstprivateUses(op);
+      // Before moving the region: capture the firstprivate sources and give
+      // each pure private its own slot inside the region (see wirePrivatizers).
+      if (!wirePrivatizers(op)) return;
       Value numThreads;
       if (op.getNumThreadsDimsCount() > 0)
         numThreads = op.getNumThreads(0);
@@ -437,7 +525,7 @@ struct OmpToOmpLowerPass
     for (auto op : tasks) {
       if (!op->getBlock()) continue;
       // Clauses with no lowering yet: warn instead of silently dropping them
-      // (if/firstprivate are wired; pure private is diagnosed downstream).
+      // (if, private and firstprivate are wired).
       if (op.getFinal())
         op.emitWarning("omp task `final` clause is not supported; ignored");
       if (op.getUntied())
@@ -450,12 +538,9 @@ struct OmpToOmpLowerPass
       if (!op.getDependVars().empty())
         op.emitWarning("omp task `depend` clause is not supported; the "
                        "dependency is ignored");
-      if (!op.getInReductionVars().empty())
-        op.emitWarning("omp task `in_reduction` clause is not supported; "
-                       "ignored");
       if (op.getEventHandle())
         op.emitWarning("omp task `detach` clause is not supported; ignored");
-      injectFirstprivateUses(op);
+      if (!wirePrivatizers(op)) return;
       Value ifClause = op.getIfExpr();
       if (!process(op, "task", extractTaskContext(op),
                    &op.getRegion(), /*numThreads=*/nullptr, ifClause)) return;

@@ -46,7 +46,7 @@ Every cell now has a test; the symbol says what that test asserts.
 | | `if` | ✓ | ✓ | ✓ |
 | | `num_threads` | ✓ | ✓ | ✓ |
 | | `proc_bind` | ✓ | ✓ | ! |
-| | `private` | ✗ | ✗ | ✗ |
+| | `private` | ✓ | ✓ | ✓ |
 | | `firstprivate` | ✓ | ✓ | ✓ |
 | `wsloop` | — | ✓ | ✓ | ✓ |
 | | `schedule(static)` | ✓ | ✓ | ✓ |
@@ -65,15 +65,6 @@ supported and a passing test asserts the diagnostic rather than a lowering,
 dropped or mislowered, with an `XFAIL`ed test stating what it should do. Every
 `✗` is a latent wrong-code path:
 
-- **`private`** (pure, no copy region) is broken on all three, in two different
-  ways. `injectFirstprivateUses` injects a use only for privatizers that have a
-  copy region, so a private produces no capture — but the copy-in loops treat
-  *every* privatizer block arg as a firstprivate and pair it positionally with a
-  capture. On the packed ABI (libgomp, pmsis) the loop is skipped for want of
-  captures, the block arg survives, and the pass errors out. On iomp the index
-  lands back on the privatizer arg itself, so the prolog loads from an argument
-  the call site never fills and seeds the private slot with garbage — silently.
-  `firstprivate`, which is what that machinery was written for, works.
 - **`schedule(dynamic)` on pmsis** matches the *unguarded* `construct wsloop`
   and is lowered as a static block distribution. iomp and libgomp guard theirs
   with `when schedule == static`, so there it fails loudly instead (`!`).
