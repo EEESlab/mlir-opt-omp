@@ -16,6 +16,7 @@
 //     -o out.mlir in.mlir
 
 #include "OmpLowering/IR/OmpLoweringOps.h"
+#include "OmpLowering/Transforms/OmpBarrierElimPass.h"
 #include "OmpLowering/Transforms/OmpOutliningPass.h"
 #include "OmpLowering/Transforms/OmpToOmpLowerPass.h"
 #include "OmpLowering/Transforms/PlanLoweringPass.h"
@@ -102,6 +103,8 @@ int main(int argc, char **argv) {
     return mlir::createOmpOutliningPass(dslFile, runtime);
   });
   mlir::registerPlanLoweringPass();
+  // No DSL file: it optimises the omp dialect
+  mlir::registerOmpBarrierElimPass();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "omp-lower-opt", registry));

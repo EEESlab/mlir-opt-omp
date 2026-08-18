@@ -9,6 +9,8 @@ kernels and the same `run.env`:
   produce **bit-identical** array dumps.
 - **`run_performance.sh`** — times our tool against the native compiler and
   reports speedups (see [Performance](#performance) below).
+- **`run_barrier_stats.sh`** — counts the team barriers `--omp-barrier-elim`
+  removes from each kernel (see [Barrier elimination](#barrier-elimination)).
 
 A third, lighter driver covers the task construct (it lives in
 [`tasks/`](tasks/) together with its test cases):
@@ -219,6 +221,40 @@ results/
     <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
 
+## Barrier elimination
+
+`--omp-barrier-elim` drops team barriers the surrounding OpenMP structure
+already guarantees — chiefly the implicit barrier of a work-sharing loop that
+ends a parallel region, which the team join makes redundant. It runs on the
+`omp` dialect before any runtime is chosen, so the same removals apply to all
+three; what differs is only what a barrier costs.
+
+Two things to measure, and they answer different questions.
+
+`run_barrier_stats.sh` counts what disappears, without running anything:
+
+```sh
+SUITE=full ./run_barrier_stats.sh        # -> results/results_barrier_stats.csv
+```
+
+The count is **static** — barriers removed from the program text, not barrier
+executions saved. A loop whose barrier sits inside a sequential outer loop
+counts once here and fires once per iteration at run time, so the dynamic
+saving is the larger number. `floyd-warshall` is the clearest case: one static
+barrier, executed once per `k`.
+
+`BARRIER_ELIM=1` puts the pass in the real pipeline, so the other two drivers
+measure its effect. Run each configuration twice, changing only this variable:
+
+```sh
+BARRIER_ELIM=0 SUITE=full ./run_performance.sh    # baseline
+BARRIER_ELIM=1 SUITE=full ./run_performance.sh    # with the optimisation
+BARRIER_ELIM=1 SUITE=full ./run_correctness.sh    # still bit-identical?
+```
+
+Both drivers write into the same `results/<runtime>/` tree, so move or rename
+the baseline CSV before the second run or it will be overwritten.
+
 ## PULP / gvsoc (`RUNTIME=pmsis`)
 
 The same two drivers also target PULP/GAP8 through the **gvsoc** simulator.
@@ -321,6 +357,7 @@ a warning and fall back to `PATH`.
 | `KERNELS` | *empty* | explicit space-separated kernel list; overrides `SUITE`, paths resolved against `$POLYBENCH` |
 | `DATASET` | `MINI_DATASET` for correctness, `LARGE_DATASET` for performance, always `MINI_DATASET` on `pmsis` unless set | PolyBench dataset size macro |
 | `THREADS` | `16`    | thread count for the parallel runs; ignored on `pmsis` |
+| `BARRIER_ELIM` | `0` | `1` adds `--omp-barrier-elim` to the pipeline. Off by default so a plain run is the baseline to compare against |
 
 ### Performance only (`run_performance.sh`)
 

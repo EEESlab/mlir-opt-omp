@@ -18,6 +18,8 @@ out-of-tree MLIR test setup.
 One directory per construct, one subdirectory per clause. Tests that exercise a
 construct as a whole rather than one clause sit directly in the construct
 directory; `dialects.mlir` covers no construct and stays at the root.
+`barrier-elim/` is the exception: it covers a pass rather than a construct, so
+it is named after the pass.
 
 ```
 Regression/
@@ -26,7 +28,13 @@ Regression/
   barrier/
   task/       if/  firstprivate/
   taskwait/
+  barrier-elim/
 ```
+
+Most `barrier-elim/` tests select no runtime at all — `--omp-barrier-elim`
+reads no DSL — so one RUN line covers all three. The `no-barrier-call-*.mlir`
+trio is the exception, and carries the result through to the emitted runtime
+call.
 
 lit recurses, so a test is picked up wherever it lands. **Every clause in the
 matrix below has a directory with at least one test per runtime.** A new clause

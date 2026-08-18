@@ -54,6 +54,20 @@ OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
 # DATASET_DEFAULT lets a driver pick its own default (e.g. LARGE for perf)
 # while still letting the user/run.env override via DATASET.
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp | pmsis (pulp/gvsoc)
+# Redundant team-barrier elimination (--omp-barrier-elim). Off by default so a
+# plain run is the baseline to compare against.
+BARRIER_ELIM="${BARRIER_ELIM:-0}"    # 0 | 1
+case "$BARRIER_ELIM" in
+    0|1) ;;
+    *)
+        echo "ERROR: BARRIER_ELIM='$BARRIER_ELIM' is not 0 or 1." >&2
+        exit 1
+        ;;
+esac
+# Spliced into the mlir-opt-omp command line by native.sh and pulp.sh; empty
+# when off, so the baseline command line is unchanged.
+BARRIER_ELIM_FLAG=""
+[ "$BARRIER_ELIM" = "1" ] && BARRIER_ELIM_FLAG="--omp-barrier-elim"
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
 SUITE="${SUITE:-bundled}"            # bundled | full

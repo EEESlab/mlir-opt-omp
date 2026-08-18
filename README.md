@@ -195,6 +195,7 @@ omp.*  ──[--omp-to-omp-lower]──▶  omp_lower.construct  ──[--omp-ou
 
 | Pass | Does |
 |---|---|
+| `--omp-barrier-elim` | optional, runs first: drops redundant team barriers. It doesn't read DSL |
 | `--omp-to-omp-lower` | reads the DSL and turns each `omp.*` op into an `omp_lower.construct` carrying its `pre`/`invoke`/`post` plan |
 | `--omp-outline` | outlines construct body regions into `func.func` with the runtime's entry signature, and lowers `omp.wsloop` |
 | `--omp-lower-plan` | replaces each `omp_lower.construct` with the concrete runtime calls |

@@ -138,6 +138,7 @@ compile_pulp_kernel_obj() {
         --allow-unregistered-dialect \
         --omp-lower-dsl="$RULES" \
         --omp-lower-runtime="$RUNTIME" \
+        ${BARRIER_ELIM_FLAG:+$BARRIER_ELIM_FLAG} \
         --omp-to-omp-lower --omp-outline --omp-lower-plan \
         "$tmpdir/$name-s1.mlir" > "$tmpdir/$name-s2.mlir" \
         || { rm -rf "$tmpdir"; return 1; }
