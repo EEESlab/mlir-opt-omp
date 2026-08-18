@@ -1,17 +1,14 @@
 // A `private` and a `firstprivate` on the same parallel, with the private
 // listed *first*.  The order is the point: only firstprivate sources become
 // captures, and OmpOutliningPass pairs privatizer block arg i with capture i
-// positionally, so a private that reached the outlining pass still holding a
-// block arg would shift that pairing and make the firstprivate copy in from
-// the wrong slot.  It cannot, because OmpToOmpLowerPass (wirePrivatizers)
-// allocates the private in the region and drops its block arg before the
-// construct is built — leaving the two lists aligned by construction.
+// positionally, so a private still holding a block arg would shift that
+// pairing and make the firstprivate copy in from the wrong slot.  It cannot,
+// because wirePrivatizers allocates the private and drops its block arg before
+// the construct is built, leaving the two lists aligned by construction.
 //
-// The companion is private-with-firstprivate-libgomp.mlir, which pins the same
-// property on the packed ABI.  There is no pmsis variant: pmsis shares the
-// packed path, and what differs between it and libgomp is the call site, which
-// private-pmsis.mlir already covers — the pairing under test here is the same
-// code.
+// private-with-firstprivate-libgomp.mlir pins the same on the packed ABI.  No
+// pmsis variant: it shares that path, and what differs is the call site, which
+// private-pmsis.mlir already covers.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s

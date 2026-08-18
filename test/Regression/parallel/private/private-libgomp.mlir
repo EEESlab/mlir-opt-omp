@@ -2,17 +2,15 @@
 // Expected: the closure takes only its data pointer and allocates the private
 // slot itself, with no copy-in.
 //
-// The slot comes from OmpToOmpLowerPass (wirePrivatizers), which allocates it
-// inside the region and drops the privatizer block arg, so the packed path
-// never sees an arg it would have to find a capture for.
+// wirePrivatizers allocates the slot inside the region and drops the
+// privatizer block arg, so the packed path never sees an arg it would have to
+// find a capture for.
 //
-// This test used to XFAIL, and differently from private-iomp.mlir: the packed
-// copy-in loop sits inside `if (!captures.empty())`, a pure private produced no
+// This used to XFAIL, differently from private-iomp.mlir: the packed copy-in
+// loop sits inside `if (!captures.empty())`, a pure private produced no
 // capture, so the loop never ran, the block arg kept its uses, and the pass
-// reported "unsupported private/firstprivate clause; outlined ABI would break".
-// A hard error here, a silent read of an unfilled argument there — one fix for
-// both, telling `private` from `firstprivate` instead of treating every
-// privatizer arg as a copy-in.
+// reported "unsupported private/firstprivate clause".  A hard error here, a
+// silent read of an unfilled argument there — one fix for both.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s

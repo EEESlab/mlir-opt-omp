@@ -26,6 +26,56 @@ using namespace mlir::omp_lower;
 namespace {
 
 // ===========================================================================
+// Privatizer recipe shapes
+// ===========================================================================
+//
+// An omp.private recipe says how to build one thread's own copy of a variable.
+// The storage is allocated by whoever lowers the clause, here
+// wirePrivatizers, and the recipe's three optional regions then act on it:
+// `init` prepares the fresh slot, `copy` fills it from the original (which is
+// what makes a firstprivate), `dealloc` tears it down afterwards.
+//
+// This lowering only allocates.  The two predicates below ask whether a recipe
+// is content with that — whether it wants anything beyond the bare storage.
+
+// True when the init region hands the slot straight back without touching it.
+// Two spellings mean that: no init region at all, which is how a recipe is
+// written by hand, and a region whose whole body is `omp.yield(%alloc)`, which
+// is what ClangIR emits for a scalar `private(j)`.
+//
+// A region that does anything else — zeroing the slot, sizing it from the
+// original — is asking for work this lowering does not perform.
+bool hasTrivialInit(omp::PrivateClauseOp recipe) {
+  Region &init = recipe.getInitRegion();
+  if (init.empty()) return true;          // not written at all
+  if (!init.hasOneBlock()) return false;  // branches mean it computes something
+  Block &body = init.front();
+  // The verifier gives this region two arguments: the original variable (the
+  // "mold", there to be read for things like an array's length) and the fresh
+  // slot.
+  if (body.getNumArguments() != 2) return false;
+  auto yield = llvm::dyn_cast<omp::YieldOp>(body.getTerminator());
+  if (!yield) return false;
+  // Nothing but the terminator, or the extra ops are work done to the slot.
+  if (&body.front() != yield.getOperation()) return false;
+  // And what it yields is that same slot, not something it built instead.
+  return yield.getResults().size() == 1 &&
+         yield.getResults()[0] == body.getArgument(1);
+}
+
+// The same for dealloc: no region, or one that ends without having done
+// anything, means the slot needs no tearing down.
+bool hasTrivialDealloc(omp::PrivateClauseOp recipe) {
+  Region &dealloc = recipe.getDeallocRegion();
+  if (dealloc.empty()) return true;
+  if (!dealloc.hasOneBlock()) return false;
+  Block &body = dealloc.front();
+  auto yield = llvm::dyn_cast<omp::YieldOp>(body.getTerminator());
+  if (!yield) return false;
+  return &body.front() == yield.getOperation() && yield.getResults().empty();
+}
+
+// ===========================================================================
 // dsl::Value -> MLIR Attribute conversion
 // ===========================================================================
 
@@ -390,17 +440,16 @@ struct OmpToOmpLowerPass
     // Wire the privatizer block args a construct arrived with.  The two kinds
     // need opposite things, and telling them apart is the whole job here.
     //
-    // A firstprivate reads the original value, so that value has to reach the
-    // outlined function: inject an explicit use of it inside the region for
-    // collectCaptures to find, and leave the block arg alone for
-    // OmpOutliningPass to pair with that capture in the prolog.
+    // A firstprivate reads the original value, so it has to reach the outlined
+    // function: inject a use of it inside the region for collectCaptures to
+    // find, and leave the block arg for OmpOutliningPass to pair with that
+    // capture.
     //
-    // A pure private reads nothing — every thread just needs its own slot — so
-    // the slot is allocated right here, in the region that is about to become
-    // the outlined body, and the block arg goes away along with the clause
-    // operand that fed it.  That leaves only firstprivate args on the
-    // ConstructOp, which is what makes the outlining pass's positional pairing
-    // (privatizer arg i <-> injected capture i) correct.
+    // A pure private reads nothing — each thread just needs its own slot — so
+    // the slot is allocated here, in the region about to become the outlined
+    // body, and the block arg goes with the clause operand that fed it.  Only
+    // firstprivate args then reach the ConstructOp, which is what makes the
+    // outlining pass's positional pairing (arg i <-> capture i) correct.
     auto wirePrivatizers = [&](auto op) {
       Region &region = op.getRegion();
       if (region.empty() || op.getPrivateVars().empty()) return true;
@@ -417,9 +466,8 @@ struct OmpToOmpLowerPass
       };
 
       Value one;   // the alloca count, materialised on first use
-      // For each pure private: its index in private_vars, and the number of the
-      // block arg it feeds.  Both are needed to drop it, and both are read
-      // before any erase invalidates them.
+      // Per pure private: index in private_vars, and the block arg it feeds.
+      // Both are read before any erase invalidates them.
       SmallVector<std::pair<unsigned, unsigned>> dropped;
       bool ok = true;
       for (auto [idx, privateVar] : llvm::enumerate(op.getPrivateVars())) {
@@ -433,8 +481,8 @@ struct OmpToOmpLowerPass
           ok = false;
           continue;
         }
-        // Declared firstprivate, or carrying the copy region that performs the
-        // copy-in: either way the source value is read and must be captured.
+        // Declared firstprivate, or carrying the copy region that does the
+        // copy-in: either way the source is read and must be captured.
         if (recipe.getDataSharingType() ==
                 omp::DataSharingClauseType::FirstPrivate ||
             !recipe.getCopyRegion().empty()) {
@@ -443,13 +491,12 @@ struct OmpToOmpLowerPass
           continue;
         }
 
-        // An init or dealloc region means the slot takes more than storage — a
-        // Fortran descriptor to set up, a destructor to run — and a bare alloca
-        // would be the wrong lowering rather than an incomplete one.
-        if (!recipe.getInitRegion().empty() ||
-            !recipe.getDeallocRegion().empty()) {
-          fail("`private` clause whose recipe has an init or dealloc region is "
-               "not supported");
+        // An init or dealloc region that *does* something means the slot takes
+        // more than storage — a descriptor to set up, a destructor to run — so
+        // a bare alloca would be the wrong lowering, not an incomplete one.
+        if (!hasTrivialInit(recipe) || !hasTrivialDealloc(recipe)) {
+          fail("`private` clause whose recipe has a non-trivial init or "
+               "dealloc region is not supported");
           ok = false;
           continue;
         }
@@ -474,10 +521,10 @@ struct OmpToOmpLowerPass
         dropped.push_back({(unsigned)idx, arg.getArgNumber()});
       }
 
-      // Drop the pure privates from the op: block arg, clause operand and the
-      // matching private_syms entry, back to front so the earlier indices stay
-      // valid.  The op is about to be erased anyway, but it stays verifiable
-      // until then — the arg count and private_vars must agree.
+      // Drop the pure privates: block arg, clause operand and private_syms
+      // entry, back to front so earlier indices stay valid.  The op is erased
+      // right after, but stays verifiable until then — arg count and
+      // private_vars have to agree.
       if (!dropped.empty()) {
         llvm::SmallDenseSet<unsigned> droppedVars;
         for (auto [varIdx, argNo] : dropped) droppedVars.insert(varIdx);

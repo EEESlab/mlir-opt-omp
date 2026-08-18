@@ -1,13 +1,15 @@
-// A `private` whose recipe carries an `init` region.  Lowering a private means
-// allocating a slot, and that is all wirePrivatizers emits — an `init` (or
-// `dealloc`) region says the slot needs more than storage: a Fortran descriptor
-// to set up, a destructor to run.  Emitting the bare alloca would not be an
-// incomplete lowering but a wrong one, silently skipping code the recipe says
-// must run, so the pass refuses the input instead.
+// A `private` whose `init` region does something — here, zeroing the slot.
+// Lowering a private means allocating storage, and that is all wirePrivatizers
+// emits, so an init region with a body asks for more than it provides.  The
+// bare alloca would not be an incomplete lowering but a wrong one, silently
+// skipping code the recipe says must run, so the pass refuses the input.
 //
-// Only one runtime is exercised: the check sits in OmpToOmpLowerPass, ahead of
-// any runtime-specific work, so the other two would re-test the same code path
-// through the same pass.
+// The contrast is private-trivial-init-iomp.mlir, where the region hands the
+// slot straight back and asks for nothing.  What separates them is whether the
+// region has a body, not whether it exists.
+//
+// One runtime only: the check sits in OmpToOmpLowerPass, ahead of any
+// runtime-specific work.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline --verify-diagnostics
@@ -22,7 +24,7 @@ omp.private {type = private} @priv_init : i32 init {
 llvm.func @use(i32)
 
 func.func @priv_with_init(%a: !llvm.ptr) {
-  // expected-error @+1 {{`private` clause whose recipe has an init or dealloc region is not supported}}
+  // expected-error @+1 {{`private` clause whose recipe has a non-trivial init or dealloc region is not supported}}
   omp.parallel private(@priv_init %a -> %p : !llvm.ptr) {
     %v = llvm.load %p : !llvm.ptr -> i32
     llvm.call @use(%v) : (i32) -> ()

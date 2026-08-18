@@ -1,9 +1,8 @@
-// The mixed `private` + `firstprivate` case of
-// private-with-firstprivate-iomp.mlir, on the packed ABI.  The capture struct
-// is what makes the property visible here: it must hold exactly one field, the
-// firstprivate source.  A private that still carried a block arg into the
-// outlining pass would either add a field or make the copy-in read the wrong
-// one, since the packed loop pairs privatizer arg i with loaded capture i.
+// The mixed case of private-with-firstprivate-iomp.mlir on the packed ABI.
+// The capture struct is what makes it visible: it must hold exactly one field,
+// the firstprivate source.  A private still carrying a block arg would either
+// add a field or make the copy-in read the wrong one, since the packed loop
+// pairs privatizer arg i with loaded capture i.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
