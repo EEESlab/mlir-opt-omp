@@ -4,10 +4,10 @@
 // keep the fini.
 //
 // Both regions call @sink after the loop on purpose: a trailing team barrier is
-// elided anyway as redundant with the fork's implicit join (see
-// barrier-elision-iomp.mlir), which would make the nowait case pass for the
-// wrong reason.  With @sink in the way, the barrier below is present only if
-// `not nowait` really gated it.
+// removable by --omp-barrier-elim as redundant with the fork's implicit join
+// (see barrier-elim/wsloop-trailing.mlir), which would make the nowait case
+// pass for the wrong reason the day that pass joins this RUN line.  With @sink
+// in the way, the barrier below is present only if `not nowait` really gated it.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

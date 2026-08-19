@@ -10,8 +10,9 @@
 // pass compute each thread's slice inline from omp_get_thread_num /
 // omp_get_num_threads, and the post block closes with GOMP_barrier.
 //
-// @sink after the loop keeps that barrier from being elided as redundant with
-// the fork's implicit join (see barrier-elision-iomp.mlir).
+// @sink after the loop keeps that barrier from being the region's trailing op,
+// so --omp-barrier-elim could not drop it as redundant with the fork's implicit
+// join (see barrier-elim/wsloop-trailing.mlir).
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

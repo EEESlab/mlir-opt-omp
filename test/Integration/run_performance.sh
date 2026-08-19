@@ -16,10 +16,10 @@
 #                                              (>1 => our tool is faster)
 #   opt_vs_native_seq   = ref_seq / opt_seq    same, sequential
 #
-# Timing uses PolyBench's cycle-accurate TSC timer. Each cell is run 5 times;
-# the min and max are dropped and the mean of the 3 middle runs is reported,
-# together with its standard deviation. A cell whose relative std-dev exceeds
-# VARIANCE_ACCEPTED% is flagged (noisy machine / background load).
+# Timing uses PolyBench's cycle-accurate TSC timer. Each cell is run REPS times
+# (10 by default); the min and max are dropped and the mean of the rest is
+# reported, together with its standard deviation. A cell whose relative std-dev
+# exceeds VARIANCE_ACCEPTED% is flagged (noisy machine / background load).
 #
 # RUNTIME=pmsis (PULP/gvsoc) builds the same 2x2 matrix but through the
 # PolyBench-PULP harness Makefile (PULP_APP_DIR): ref = the PULP-SDK gcc
@@ -39,10 +39,12 @@
 #   ./run_performance.sh path/to/kernel-omp.c         # a single kernel
 #   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
 #   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
+#   BARRIER_ELIM=1 ./run_performance.sh                # with --omp-barrier-elim
 #
 # Output lands under $OUTDIR/<runtime> (default ./results/<runtime>), one
 # folder per runtime (iomp, libgomp, pmsis) so runs against different runtimes
-# never overwrite each other:
+# never overwrite each other. BARRIER_ELIM=1 adds a -barrier-elim suffix, so an
+# optimised run keeps its own folder beside the baseline it is compared with:
 #   results_performance.csv        one row per kernel + a GEOMEAN row
 #   <kernel>-omp/performance/...   the four binaries and raw timing logs
 #   results_performance_<sel>.png  speedup bar chart (only when PLOT=true;
@@ -66,9 +68,10 @@ DATASET_DEFAULT="LARGE_DATASET"
 THREADS="${THREADS:-16}"             # thread count for the parallel cells
 REPS="${REPS:-10}"                    # timed runs per cell (>=3; min+max dropped)
 VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
-# Results are split per runtime — results/<runtime>/... — so an iomp run only
-# replaces a previous iomp run, never a libgomp/pmsis one.
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
+# Results are split per runtime and by BARRIER_ELIM — results/<runtime>/ and
+# results/<runtime>-barrier-elim/ — so a run only ever replaces one of its own
+# kind, and a baseline survives the optimised run it is compared against.
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_TAG"
 PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
 
 # Performance times the kernel with the cycle-accurate TSC timer. This is

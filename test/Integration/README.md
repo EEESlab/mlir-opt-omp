@@ -10,7 +10,10 @@ kernels and the same `run.env`:
 - **`run_performance.sh`** — times our tool against the native compiler and
   reports speedups (see [Performance](#performance) below).
 - **`run_barrier_stats.sh`** — counts the team barriers `--omp-barrier-elim`
-  removes from each kernel (see [Barrier elimination](#barrier-elimination)).
+  removes from each kernel, and checks that count against the calls left in the
+  emitted code (see [Barrier elimination](#barrier-elimination)).
+- **`run_barrier_vs_native.sh`** — the same count against clang's, both taken
+  from LLVM IR after `-O3`.
 
 A third, lighter driver covers the task construct (it lives in
 [`tasks/`](tasks/) together with its test cases):
@@ -122,7 +125,9 @@ points to a file).
 
 Everything lands under `$OUTDIR/<runtime>` (default `./results/<runtime>/`),
 one folder per runtime — `iomp/`, `libgomp/`, `pmsis/` — so runs against
-different runtimes never overwrite each other:
+different runtimes never overwrite each other. `BARRIER_ELIM=1` appends
+`-barrier-elim` to that folder (`results/iomp-barrier-elim/`), keeping an
+optimised run beside the baseline it is compared with:
 
 ```
 results/
@@ -234,11 +239,48 @@ Two things to measure, and they answer different questions.
 `run_barrier_stats.sh` counts what disappears, without running anything:
 
 ```sh
-SUITE=full ./run_barrier_stats.sh        # -> results/results_barrier_stats.csv
+SUITE=full ./run_barrier_stats.sh   # -> results/<runtime>/results_barrier_stats.csv
 ```
 
-The count is **static** — barriers removed from the program text, not barrier
-executions saved. A loop whose barrier sits inside a sequential outer loop
+It counts the same thing twice, and the two must agree. `explicit_removed` and
+`implicit_removed` are what the pass reports about itself through
+`--mlir-pass-statistics`, on the `omp` dialect. `calls_base` and `calls_elim`
+are the runtime barrier calls left in the **fully lowered IR** — the kernel is
+lowered for `$RUNTIME` twice, once without the pass and once with it, and the
+emitted `__kmpc_barrier` / `GOMP_barrier` / `ext_pi_cl_team_barrier` call sites
+are counted in each. That second count is the one that costs cycles: an
+implicit barrier is dropped by setting `nowait`, and only the runtime's wsloop
+rule (`when not nowait => call ...`) turns that into one call less.
+
+A kernel where the two disagree is flagged `MISMATCH` and the script exits
+non-zero. Both lowerings are kept as
+`results/<runtime>/<kernel>/barrier-stats/{base,elim}.mlir`, so a surprising
+row can be diffed by hand; `VERBOSE=1` lets the tools say why one failed.
+
+The statistics half is runtime-independent, the emitted half is not, so run it
+once per runtime you care about. Either way the count is **static** — barriers
+removed from the program text, not barrier executions saved.
+
+`run_barrier_vs_native.sh` asks the other question — how many barriers are left
+compared with the compiler people actually use:
+
+```sh
+SUITE=full ./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.csv
+```
+
+Both sides are counted in LLVM IR after `-O3`, so neither is measured at a
+kinder stage than the other. On PolyBench/MINI the totals are clang 44, our
+pipeline 59 without the pass and 25 with it: **19 fewer than clang, 43%**. The
+`pragma_form` column explains the whole delta. clang elides a work-sharing
+loop's trailing barrier only for the *combined* `#pragma omp parallel for`; on
+the split `parallel { ... for ... }` it emits it, and there our baseline
+matches clang kernel for kernel while the pass removes one per region. The pass
+reasons about structure on the `omp` dialect rather than about which directive
+was written, so it covers both spellings.
+
+iomp only. gcc is not comparable this way: at `-O3` it emits `GOMP_barrier`
+counts that exceed the number of work-sharing loops in the source, so the
+number reflects code duplication as much as synchronisation. A loop whose barrier sits inside a sequential outer loop
 counts once here and fires once per iteration at run time, so the dynamic
 saving is the larger number. `floyd-warshall` is the clearest case: one static
 barrier, executed once per `k`.
@@ -252,8 +294,16 @@ BARRIER_ELIM=1 SUITE=full ./run_performance.sh    # with the optimisation
 BARRIER_ELIM=1 SUITE=full ./run_correctness.sh    # still bit-identical?
 ```
 
-Both drivers write into the same `results/<runtime>/` tree, so move or rename
-the baseline CSV before the second run or it will be overwritten.
+The two configurations write into separate trees — `results/<runtime>/` for the
+baseline and `results/<runtime>-barrier-elim/` for the optimised run — so you
+can run them in either order and keep both CSVs. Compare the `opt_par_cyc`
+column of the two `results_performance.csv`.
+
+Give the timing enough runs to see the difference: removing a handful of
+barriers is usually worth a few percent, which `REPS=1` cannot resolve. Keep
+`REPS` at its default of 10 (or at least 5) for a comparison you can trust, and
+check the `[noisy]` warnings — a cell flagged there is measuring the machine,
+not the pass.
 
 ## PULP / gvsoc (`RUNTIME=pmsis`)
 
@@ -346,7 +396,7 @@ a warning and fall back to `PATH`.
 | `POLYBENCH`      | `kernels/` (vendored) | PolyBench-OpenMP checkout root, required for `SUITE=full` |
 | `POLYBENCH_UTIL` | `$POLYBENCH/utilities` | PolyBench support headers           |
 | `RULES`          | the repo's `rules.dsl` | DSL file passed to `mlir-opt-omp`   |
-| `OUTDIR`         | `$PWD/results` | binaries, dumps and CSVs land in `$OUTDIR/<runtime>` |
+| `OUTDIR`         | `$PWD/results` | binaries, dumps and CSVs land in `$OUTDIR/<runtime>`, plus a `-barrier-elim` suffix when `BARRIER_ELIM=1` |
 
 ### Run parameters
 
@@ -357,7 +407,7 @@ a warning and fall back to `PATH`.
 | `KERNELS` | *empty* | explicit space-separated kernel list; overrides `SUITE`, paths resolved against `$POLYBENCH` |
 | `DATASET` | `MINI_DATASET` for correctness, `LARGE_DATASET` for performance, always `MINI_DATASET` on `pmsis` unless set | PolyBench dataset size macro |
 | `THREADS` | `16`    | thread count for the parallel runs; ignored on `pmsis` |
-| `BARRIER_ELIM` | `0` | `1` adds `--omp-barrier-elim` to the pipeline. Off by default so a plain run is the baseline to compare against |
+| `BARRIER_ELIM` | `0` | `1` adds `--omp-barrier-elim` to the pipeline and writes to `results/<runtime>-barrier-elim/`. Off by default so a plain run is the baseline to compare against |
 
 ### Performance only (`run_performance.sh`)
 

@@ -1654,62 +1654,10 @@ struct OmpOutliningPass
       lowerWsloop(wsOp, module, *plan);
     }
 
-    // Step 3: drop the redundant trailing team barrier of each outlined
-    // parallel region.  A team barrier that is the last operation before the
-    // microtask returns is already covered by the implicit join barrier of
-    // __kmpc_fork_call (the master waits for the whole team before fork_call
-    // returns).  This is the combined `parallel for` case — clang elides the
-    // work-sharing barrier the same way.  Removing it saves one global barrier
-    // per parallel region, which is significant for kernels that fork many
-    // short regions (e.g. stencils looping over thousands of time steps).
-    //
-    // A trailing barrier comes in two shapes at this point.  An explicit
-    // omp.barrier is still an unlowered ConstructOp — PlanLoweringPass turns it
-    // into calls later — and is recognised by its construct name.  A wsloop's
-    // implicit barrier was emitted here by lowerWsloop as a real call, so it is
-    // recognised by callee; that name is runtime-specific (iomp __kmpc_barrier,
-    // libgomp GOMP_barrier, ...) and comes from the barrier plan.  A runtime
-    // without a `construct barrier` simply has nothing to match.
-    //
-    // Only the *last* barrier before the return is dropped, so a barrier that
-    // separates two work-sharing loops inside the same region is preserved.
-    // Tasks are not fork/joined this way, so only outlined_parallel_* qualify.
-    std::string barrierCallee;
-    {
-      llvm::StringMap<dsl::Value> barrierCtx;
-      barrierCtx["ident"]      = dsl::makeStr("%ident");
-      barrierCtx["global_tid"] = dsl::makeStr("%gtid");
-      auto p = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
-      if (p) {
-        for (auto &action : p->invoke)
-          if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-            barrierCallee = ca->callee;
-            break;
-          }
-      } else {
-        llvm::consumeError(p.takeError());
-      }
-    }
-    module.walk([&](func::FuncOp fn) {
-      if (!fn.getName().starts_with("outlined_parallel_"))
-        return;
-      for (Block &blk : fn.getBody()) {
-        auto ret = llvm::dyn_cast_or_null<func::ReturnOp>(blk.getTerminator());
-        if (!ret)
-          continue;
-        Operation *prev = ret->getPrevNode();
-        if (!prev)
-          continue;
-        if (auto c = llvm::dyn_cast<ConstructOp>(prev)) {
-          if (c.getConstructName() == "barrier")
-            c.erase();
-          continue;
-        }
-        auto call = llvm::dyn_cast<func::CallOp>(prev);
-        if (call && !barrierCallee.empty() && call.getCallee() == barrierCallee)
-          call.erase();
-      }
-    });
+    // The trailing team barrier of a parallel region, redundant with the join
+    // of the fork call, is not dropped here: that rule lives in
+    // OmpBarrierElimPass (--omp-barrier-elim), which states it on the omp
+    // dialect, before a runtime is chosen, so one rule serves all three.
   }
 };
 

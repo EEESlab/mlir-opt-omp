@@ -28,6 +28,7 @@
 #   RUNTIME=pmsis ./run_correctness.sh   # PULP/gvsoc (needs GAP SDK + PULP_APP_DIR)
 #   ./run_correctness.sh path/to/kernel-omp.c   # a single kernel
 #   DATASET=SMALL_DATASET THREADS=8 ./run_correctness.sh
+#   BARRIER_ELIM=1 ./run_correctness.sh  # with --omp-barrier-elim in the pipeline
 # =============================================================================
 
 set -uo pipefail
@@ -39,9 +40,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Correctness-specific config -------------------------------------------
 THREADS="${THREADS:-16}"
 export OMP_NUM_THREADS="$THREADS"
-# Results are split per runtime — results/<runtime>/... — so an iomp run only
-# replaces a previous iomp run, never a libgomp/pmsis one.
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
+# Results are split per runtime and by BARRIER_ELIM — results/<runtime>/ and
+# results/<runtime>-barrier-elim/ — so a run only ever replaces one of its own
+# kind, and a baseline survives the optimised run it is compared against.
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_TAG"
 
 # Correctness dumps the arrays and diffs them.
 POLYBENCH_CFLAGS="-DPOLYBENCH_DUMP_ARRAYS $POLYBENCH_ROOT_CFLAGS"

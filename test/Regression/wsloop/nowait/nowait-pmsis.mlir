@@ -2,9 +2,9 @@
 // fully inline (`emit thread_bounds`), so `ext_pi_cl_team_barrier` in the post
 // block is the only thing `nowait` gates.
 //
-// @sink after the loop keeps a trailing barrier from being elided as redundant
-// with the fork's implicit join, which would make the nowait case pass for the
-// wrong reason.
+// @sink after the loop keeps the barrier from being the region's trailing op,
+// so --omp-barrier-elim could not drop it as redundant with the fork's implicit
+// join, which would make the nowait case pass for the wrong reason.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

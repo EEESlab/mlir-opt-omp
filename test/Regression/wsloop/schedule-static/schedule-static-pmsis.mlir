@@ -8,8 +8,8 @@
 // implying the guard exists.  If the guard is ever added — the right fix for
 // the dynamic gap — this test is what says static must keep matching.
 //
-// @sink after the loop keeps the trailing barrier from being elided as
-// redundant with the fork's implicit join.
+// @sink after the loop keeps the barrier from being the region's trailing op,
+// so --omp-barrier-elim could not drop it as redundant with the fork's join.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

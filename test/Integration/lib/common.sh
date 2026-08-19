@@ -64,10 +64,16 @@ case "$BARRIER_ELIM" in
         exit 1
         ;;
 esac
-# Spliced into the mlir-opt-omp command line by native.sh and pulp.sh; empty
-# when off, so the baseline command line is unchanged.
+# FLAG is spliced into the mlir-opt-omp command line by native.sh and pulp.sh.
+# TAG is appended to the drivers' output directory, so an optimised run lands
+# next to its baseline instead of on top of it. Both empty when off, so the
+# baseline command line and paths stay exactly as they were.
 BARRIER_ELIM_FLAG=""
-[ "$BARRIER_ELIM" = "1" ] && BARRIER_ELIM_FLAG="--omp-barrier-elim"
+BARRIER_ELIM_TAG=""
+if [ "$BARRIER_ELIM" = "1" ]; then
+    BARRIER_ELIM_FLAG="--omp-barrier-elim"
+    BARRIER_ELIM_TAG="-barrier-elim"
+fi
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
 SUITE="${SUITE:-bundled}"            # bundled | full
@@ -155,7 +161,10 @@ unset __DATASET_EXPLICIT
 . "$COMMON_DIR/kernels.sh"
 # shellcheck source=native.sh
 . "$COMMON_DIR/native.sh"
-if [ "$TARGET" = "pulp" ]; then
+# SKIP_PULP_SDK is for a driver that only goes as far as MLIR
+# (run_barrier_stats.sh): RUNTIME=pmsis then needs the lowering rules but
+# neither the GAP SDK nor PULP_APP_DIR, which pulp.sh insists on.
+if [ "$TARGET" = "pulp" ] && [ -z "${SKIP_PULP_SDK:-}" ]; then
     # shellcheck source=pulp.sh
     . "$COMMON_DIR/pulp.sh"
 fi

@@ -25,5 +25,6 @@ func.func @parallel_with_barrier() {
 // CHECK-NOT: @__omp_src_loc_default
 
 // The region really was lowered — the fork is there.  (The barrier is the
-// region's trailing op, so it is elided as redundant with the implicit join.)
+// region's trailing op, so --omp-barrier-elim would drop it as redundant with
+// the implicit join; this run does not enable the pass.)
 // LOWERED: call @ext_pi_cl_team_fork

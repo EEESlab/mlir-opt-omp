@@ -2,9 +2,9 @@
 // computes each thread's slice inline — so `GOMP_barrier` in the post block is
 // the only thing `nowait` gates.
 //
-// @sink after the loop keeps a trailing barrier from being elided as redundant
-// with the fork's implicit join, which would make the nowait case pass for the
-// wrong reason.
+// @sink after the loop keeps the barrier from being the region's trailing op,
+// so --omp-barrier-elim could not drop it as redundant with the fork's implicit
+// join, which would make the nowait case pass for the wrong reason.
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

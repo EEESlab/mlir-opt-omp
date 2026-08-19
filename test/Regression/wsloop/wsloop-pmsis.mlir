@@ -6,8 +6,8 @@
 // is not nowait.
 //
 // The @sink call after the loop keeps that barrier from being the region's
-// trailing op — otherwise it is elided as redundant with the fork's implicit
-// join (see barrier-elision-iomp.mlir, which elides the same way).
+// trailing op — otherwise --omp-barrier-elim would drop it as redundant with
+// the fork's implicit join (see barrier-elim/wsloop-trailing.mlir).
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=pmsis \
 // RUN:   --omp-to-omp-lower --omp-outline | FileCheck %s
 

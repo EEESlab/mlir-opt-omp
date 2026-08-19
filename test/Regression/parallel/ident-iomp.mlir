@@ -13,8 +13,9 @@
 // See docs/lowering-specs/ident-lowering-spec.md.
 //
 // The @sink call after the barrier keeps it from being the region's trailing
-// op, so it is NOT elided (that elision is covered by barrier-elision-iomp.mlir)
-// and its ident is emitted here as intended.
+// op, so --omp-barrier-elim could not drop it either (that removal is covered
+// by barrier-elim/explicit-barriers.mlir) and its ident is emitted here as
+// intended.
 //
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
 // RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s

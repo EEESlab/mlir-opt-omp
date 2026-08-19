@@ -3,7 +3,7 @@
 //
 // Two runs: the first reads the call name out of the plan attribute (what the
 // rules decided), the second takes the pipeline down to emission (what came
-// out).  barrier-elision-iomp.mlir covers a barrier *inside* a parallel, where
+// out).  parallel/ident-iomp.mlir covers a barrier *inside* a parallel, where
 // the gtid comes from the microtask signature; a top-level one has no enclosing
 // outlined function, so ident and gtid must be materialised from scratch —
 // a different path, and an undef gtid here would crash the runtime.
