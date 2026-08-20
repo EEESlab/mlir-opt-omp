@@ -1264,12 +1264,16 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
 // 2. WSLOOP LOWERING — driven by DSL plan
 // ---------------------------------------------------------------------------
 
-static void lowerWsloop(omp::WsloopOp wsOp,
-                        ModuleOp module,
-                        const dsl::LoweringPlan &plan) {
+// Returns failure once a diagnostic has been emitted, so the caller can fail
+// the pass: a wsloop this cannot lower is left standing in the output, and a
+// module still holding an omp.wsloop is not something the rest of the pipeline
+// can make sense of.
+static LogicalResult lowerWsloop(omp::WsloopOp wsOp,
+                                 ModuleOp module,
+                                 const dsl::LoweringPlan &plan) {
   omp::LoopNestOp loopNest;
   wsOp.walk([&](omp::LoopNestOp op) { loopNest = op; });
-  if (!loopNest) return;
+  if (!loopNest) return success();
 
   MLIRContext *ctx = wsOp.getContext();
   Location loc = wsOp.getLoc();
@@ -1278,7 +1282,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   auto lbs   = loopNest.getLoopLowerBounds();
   auto ubs   = loopNest.getLoopUpperBounds();
   auto steps = loopNest.getLoopSteps();
-  if (lbs.empty() || ubs.empty() || steps.empty()) return;
+  if (lbs.empty() || ubs.empty() || steps.empty()) return success();
 
   Value lb = lbs[0], ub = ubs[0], step = steps[0];
   Type iterTy = lb.getType();
@@ -1365,13 +1369,31 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     return "";
   };
 
+  // A property that is present but unreadable is a typo in the rules, and each
+  // of these three fails a different way if it quietly falls back: the wrong
+  // slot width, the wrong truthiness test, or — worst — an inner loop running
+  // one iteration past the end of every chunk.  None of that is worth
+  // discovering at run time, so an unusable value is an error and not a
+  // default.  Absent still means "use the pass's own", which is what keeps the
+  // runtimes that agree with it from declaring anything.
+  bool badProp = false;
+  auto typeProp = [&](llvm::StringRef key, Type fallback) -> Type {
+    std::string spelling = getStrProp(key);
+    if (spelling.empty()) return fallback;
+    if (Type t = parseAbiTypeProp(ctx, spelling, Type())) return t;
+    wsOp.emitError("omp-outline: `") << key << " = " << spelling
+        << "` is not a type this lowering knows (i8, i32, i64, ptr)";
+    badProp = true;
+    return fallback;
+  };
+
   // The index type of this runtime's loop ABI: the width of the bound slots it
   // writes and of the values it takes by value.  It is not always the loop's
   // own: libgomp's GOMP_loop_* family is long-based whatever the induction
   // variable is, while iomp's __kmpc_*_4 matches an i32 one.  Defaulting to the
   // induction variable's type is what keeps every runtime that agrees with it
   // free of conversions — and of any change to the IR it emitted before.
-  Type chunkIdxTy = parseAbiTypeProp(ctx, getStrProp("chunk_index"), iterTy);
+  Type chunkIdxTy = typeProp("chunk_index", iterTy);
 
   // A construct that declares a next_chunk block is one whose iterations the
   // runtime hands out a chunk at a time: the loop below gets an outer loop
@@ -1380,16 +1402,54 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   bool isChunked = !plan.nextChunk.empty();
   // What such a call returns (0 = no work left).  iomp's dispatch_next returns
   // an int, GOMP's a C _Bool.
-  Type chunkResTy = parseAbiTypeProp(ctx, getStrProp("chunk_result"), i32Ty(ctx));
+  Type chunkResTy = typeProp("chunk_result", i32Ty(ctx));
+
+  // Whether the upper bound the runtime writes into the slot is the last valid
+  // iteration or the one past it.  Read here rather than where the predicate is
+  // chosen so a misspelling is caught with the other two.
+  std::string chunkBound = getStrProp("chunk_bound");
+  if (!chunkBound.empty() && chunkBound != "inclusive" &&
+      chunkBound != "exclusive") {
+    wsOp.emitError("omp-outline: `chunk_bound = ")
+        << chunkBound << "` is neither `inclusive` nor `exclusive`";
+    badProp = true;
+  }
+
+  // The chunk size rides in from the clause, so unlike everything else in the
+  // index vocabulary its type is the input's to choose.  Anything but an
+  // integer has no conversion into the ABI's index type, and reaching the
+  // conversion below with one would abort rather than diagnose.
+  Value chunkVal = wsOp.getScheduleChunk();
+  if (chunkVal && !llvm::isa<IntegerType>(chunkVal.getType())) {
+    wsOp.emitError("omp-outline: the schedule chunk must be an integer, got ")
+        << chunkVal.getType();
+    badProp = true;
+  }
+
+  // A construct with a first_chunk block and no next_chunk has no way to ask
+  // for a second chunk, and isChunked is false, so the block would simply not
+  // be emitted: the work-share never registered and every thread running the
+  // whole iteration space.  Wrong code, quietly — so refuse it.
+  if (!plan.firstChunk.empty() && plan.nextChunk.empty()) {
+    wsOp.emitError("omp-outline: this wsloop declares `first_chunk` but no "
+                   "`next_chunk`; there is no call to ask for another chunk");
+    badProp = true;
+  }
+
+  if (badProp) return failure();
 
   // Convert into and out of that ABI.  Loop indices are signed, so the widening
-  // direction is a sign extension.
+  // direction is a sign extension.  Both sides are integers by the checks
+  // above; a non-integer would leave the value alone and be caught by the
+  // verifier rather than crash here.
   auto convertInt = [&](Value v, Type to) -> Value {
     if (v.getType() == to) return v;
-    unsigned from = llvm::cast<IntegerType>(v.getType()).getWidth();
-    unsigned dest = llvm::cast<IntegerType>(to).getWidth();
-    return dest > from ? LLVM::SExtOp::create(builder, loc, to, v).getResult()
-                       : LLVM::TruncOp::create(builder, loc, to, v).getResult();
+    auto fromTy = llvm::dyn_cast<IntegerType>(v.getType());
+    auto destTy = llvm::dyn_cast<IntegerType>(to);
+    if (!fromTy || !destTy) return v;
+    return destTy.getWidth() > fromTy.getWidth()
+               ? LLVM::SExtOp::create(builder, loc, to, v).getResult()
+               : LLVM::TruncOp::create(builder, loc, to, v).getResult();
   };
   auto toIdx   = [&](Value v) { return convertInt(v, chunkIdxTy); };
   auto fromIdx = [&](Value v) { return convertInt(v, iterTy); };
@@ -1434,8 +1494,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   wsBindings["%lb_val"]  = lb;
   wsBindings["%ub_val"]  = ub;           // exclusive, as loop_nest was normalised
   wsBindings["%ub_incl"] = ubInclusive;  // last valid iteration
-  if (Value chunkVal = wsOp.getScheduleChunk())
-    wsBindings["%chunk"] = chunkVal;
+  if (chunkVal) wsBindings["%chunk"] = chunkVal;  // integer, checked above
 
   // Everything naming a loop index crosses into the runtime's index type: the
   // bounds, the step, the chunk size, and integer literals such as a schedule
@@ -1566,8 +1625,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     loopEnd   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
     cmpPred   = LLVM::ICmpPredicate::sle;
   } else {
-    cmpPred = getStrProp("chunk_bound") == "exclusive"
-                ? LLVM::ICmpPredicate::slt : LLVM::ICmpPredicate::sle;
+    cmpPred = chunkBound == "exclusive" ? LLVM::ICmpPredicate::slt
+                                        : LLVM::ICmpPredicate::sle;
   }
 
   // Emit a chunk-acquisition block at the builder's current insertion point and
@@ -1607,7 +1666,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
                     (!plan.firstChunk.empty() && !blockHasCall(plan.firstChunk)))) {
     wsOp.emitError("omp-outline: the chunk block of this wsloop makes no call; "
                    "there is no chunk to loop on");
-    return;
+    return failure();
   }
 
   // -------------------------------------------------------------------------
@@ -1732,6 +1791,7 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   emitPlanCalls(plan.post, builder);
 
   wsOp.erase();
+  return success();
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,7 +1892,11 @@ struct OmpOutliningPass
         return;
       }
 
-      lowerWsloop(wsOp, module, *plan);
+      // Mark the pass failed but carry on to the next loop: a rule file with a
+      // mistake in it usually has the same mistake in every loop that reads it,
+      // and reporting them one run at a time is a poor way to find that out.
+      if (failed(lowerWsloop(wsOp, module, *plan)))
+        signalPassFailure();
     }
 
     // The trailing team barrier of a parallel region, redundant with the join

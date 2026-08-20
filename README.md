@@ -324,7 +324,22 @@ To add a construct or a runtime, start from [`rules.dsl`](rules.dsl): each
 function's signature — and its blocks. A block is any name followed by `{ ... }`
 and says *when* its calls run: `pre`, `invoke` and `post` around the construct,
 and for a work-sharing loop whose iterations the runtime hands out a chunk at a
-time, `first_chunk` and `next_chunk` around each chunk. A
+time, `first_chunk` and `next_chunk` around each chunk. `next_chunk` is what
+makes a loop chunked; `first_chunk` is only for a runtime whose opening call
+differs from the repeat one, as libgomp's does.
+
+Such a loop also has three properties for the shape of its dispatch ABI. Each
+defaults to what iomp's `__kmpc_dispatch_*_4` does, so a runtime that agrees
+declares none of them, and a value none of them understands is an error rather
+than a silent fallback:
+
+| property | default | says |
+|---|---|---|
+| `chunk_index` | the induction variable's type | width of the bound slots and of the values passed by value (`i64` for libgomp, which is `long`-based whatever the loop is) |
+| `chunk_result` | `i32` | what the acquisition call answers with (`i8` for a C `_Bool`) |
+| `chunk_bound` | `inclusive` | whether the upper bound written into the slot is the last valid iteration or the one past it |
+
+A
 change there is picked up at run time — no rebuild needed — which makes it easy
 to iterate with a regression test. Constructs whose lowering needs more than the
 DSL expresses (new `emit` primitives, a different outline shape) also require

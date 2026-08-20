@@ -58,6 +58,7 @@ Every cell now has a test; the symbol says what that test asserts.
 | | `firstprivate` | ✓ | ✓ | ✓ |
 | `wsloop` | — | ✓ | ✓ | ✓ |
 | | `schedule(static)` | ✓ | ✓ | ✓ |
+| | `schedule(static, N)` | ✗ | ✗ | ✗ |
 | | `schedule(dynamic)` | ! | ✓ | ! |
 | | `nowait` | ✓ | ✓ | ✓ |
 | `barrier` | — | ✓ | ✓ | ✓ |
@@ -71,10 +72,29 @@ Every cell now has a test; the symbol says what that test asserts.
 supported and a passing test asserts the diagnostic rather than a lowering,
 `✗` not supported **and not diagnosed** — the clause is accepted and silently
 dropped or mislowered, with an `XFAIL`ed test stating what it should do. Every
-`✗` is a latent wrong-code path, so the column is empty as of now: the last one
-was `schedule(dynamic)` on pmsis, which matched an unguarded `construct wsloop`
-and came out as a static block distribution. Guarding that construct like the
-other two runtimes turned it into the `!` it is today.
+`✗` is a latent wrong-code path:
+
+- **`schedule(static, N)`** matches `construct wsloop when schedule == static`
+  on every runtime and the chunk size is then dropped. libgomp and pmsis run
+  `emit thread_bounds`, one contiguous block per thread, which is not the
+  round-robin distribution of `N` iterations the clause asks for; iomp passes
+  schedule constant 34 with `default_chunk` rather than 33 with the clause's
+  value. No test covers it yet — the `✗` is the record that it is known.
+
+Two gaps are properties of the loop rather than of a clause, so they have no
+row of their own:
+
+- **A descending loop** — a negative step — runs zero iterations under every
+  wsloop lowering. The comparison is fixed at `sle` (iomp) or `slt` (the two
+  inline ones, and libgomp's dynamic chunks), all of which are false on entry
+  when the loop counts down. Which way to fix it is open: a step known to be
+  negative could be rejected outright, the way pmsis rejects `schedule(dynamic)`
+  today, while a step whose sign is only known at run time would need the
+  comparison chosen there.
+- **A non-`i32` induction variable** — `__kmpc_for_static_init_4` and
+  `__kmpc_dispatch_*_4` are the 32-bit entry points, and nothing checks that the
+  loop agrees with them. libgomp is unaffected: its `chunk_index = i64` makes
+  the conversion explicit at the ABI boundary.
 
 ### Encoding a gap
 
