@@ -1,7 +1,8 @@
-// schedule(dynamic) is NOT implemented for pmsis: rules.dsl declares only
-// `construct wsloop when schedule == static`, so no construct matches and the
-// DSL evaluation fails.  Same guard, same outcome, as iomp and libgomp — see
-// schedule-dynamic-unsupported-iomp.mlir.
+// schedule(dynamic) is NOT implemented for pmsis: the only wsloop construct the
+// pmsis rules declare is guarded by `when schedule == static`, so no construct
+// matches and the DSL evaluation fails.  Same guard, same outcome, as iomp —
+// see schedule-dynamic-unsupported-iomp.mlir.  libgomp is the one runtime that
+// has the clause (schedule-dynamic-libgomp.mlir).
 //
 // The guard is what this test really pins.  pmsis used to declare an unguarded
 // `construct wsloop`, so this input matched and was lowered as a static block

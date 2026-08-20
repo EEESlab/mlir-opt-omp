@@ -58,7 +58,7 @@ Every cell now has a test; the symbol says what that test asserts.
 | | `firstprivate` | ✓ | ✓ | ✓ |
 | `wsloop` | — | ✓ | ✓ | ✓ |
 | | `schedule(static)` | ✓ | ✓ | ✓ |
-| | `schedule(dynamic)` | ! | ! | ! |
+| | `schedule(dynamic)` | ! | ✓ | ! |
 | | `nowait` | ✓ | ✓ | ✓ |
 | `barrier` | — | ✓ | ✓ | ✓ |
 | `task` | — | ✓ | ✓ | n/a |

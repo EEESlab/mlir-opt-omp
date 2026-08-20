@@ -106,6 +106,17 @@ struct LoweringPlan {
   std::vector<PlanAction> pre;
   std::vector<PlanAction> invoke;
   std::vector<PlanAction> post;
+  // A work-sharing loop whose iterations the runtime hands out a chunk at a
+  // time asks for them with these.  `nextChunk` runs before each turn of the
+  // outer loop and fills the loop's bound slots; a falsy result ends it.
+  // `firstChunk` is for the runtimes whose opening call differs from the rest
+  // (libgomp's start vs next); where it is empty, `nextChunk` opens the loop
+  // too (iomp, whose init is a separate void call in `pre`).
+  //
+  // The presence of `nextChunk` is what makes a construct a chunked loop — the
+  // passes never look at the schedule kind, that stays a decision of the rules.
+  std::vector<PlanAction> firstChunk;
+  std::vector<PlanAction> nextChunk;
 };
 
 // ===========================================================================

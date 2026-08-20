@@ -1297,8 +1297,30 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   // For iomp microtask: arg0 = ptr gtid, arg1 = ptr btid → load i32 from arg0.
   // For libgomp closure: arg0 = ptr data (capture struct) — no gtid ptr.
   //   Use omp_get_thread_num() to obtain the current thread id.
-  Value gtidVal   = LLVM::UndefOp::create(builder, loc, iterTy);
-  if (auto parentFn = wsOp->getParentOfType<func::FuncOp>()) {
+  //
+  // Only when a call in the plan asks for it.  On the closure runtimes the
+  // thread id costs a call to omp_get_thread_num, and an external call is one
+  // thing LLVM cannot delete for being unused — so a wsloop whose rules never
+  // name %gtid (every libgomp and pmsis one: their loop APIs take no thread id)
+  // would carry it into the binary for nothing.
+  auto actionsName = [](const std::vector<dsl::PlanAction> &actions,
+                        llvm::StringRef token) {
+    for (auto &a : actions)
+      if (auto *ca = std::get_if<dsl::PlanCall>(&a))
+        for (auto &av : ca->args)
+          if (auto *sv = std::get_if<dsl::StrVal>(&av))
+            if (sv->value == token) return true;
+    return false;
+  };
+  bool needsGtid = actionsName(plan.pre, "%gtid") ||
+                   actionsName(plan.invoke, "%gtid") ||
+                   actionsName(plan.post, "%gtid") ||
+                   actionsName(plan.firstChunk, "%gtid") ||
+                   actionsName(plan.nextChunk, "%gtid");
+
+  Value gtidVal;
+  if (needsGtid) gtidVal = LLVM::UndefOp::create(builder, loc, iterTy);
+  if (auto parentFn = wsOp->getParentOfType<func::FuncOp>(); parentFn && needsGtid) {
     auto &entry = parentFn.getBody().front();
     unsigned numArgs = entry.getNumArguments();
     // Microtask convention: at least 2 args (gtid ptr, btid ptr) + captures.
@@ -1335,13 +1357,50 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   Value one32 = LLVM::ConstantOp::create(builder, loc, iterTy,
     IntegerAttr::get(iterTy, 1));
 
+  // Read DSL properties that drive loop lowering strategy.
+  auto getStrProp = [&](llvm::StringRef key) -> std::string {
+    auto it = plan.properties.find(key.str());
+    if (it == plan.properties.end()) return "";
+    if (auto *sv = std::get_if<dsl::StrVal>(&it->second)) return sv->value;
+    return "";
+  };
+
+  // The index type of this runtime's loop ABI: the width of the bound slots it
+  // writes and of the values it takes by value.  It is not always the loop's
+  // own: libgomp's GOMP_loop_* family is long-based whatever the induction
+  // variable is, while iomp's __kmpc_*_4 matches an i32 one.  Defaulting to the
+  // induction variable's type is what keeps every runtime that agrees with it
+  // free of conversions — and of any change to the IR it emitted before.
+  Type chunkIdxTy = parseAbiTypeProp(ctx, getStrProp("chunk_index"), iterTy);
+
+  // A construct that declares a next_chunk block is one whose iterations the
+  // runtime hands out a chunk at a time: the loop below gets an outer loop
+  // around it, asking for a chunk per turn.  The schedule kind is never read
+  // here — which schedules are chunked is a statement rules.dsl makes.
+  bool isChunked = !plan.nextChunk.empty();
+  // What such a call returns (0 = no work left).  iomp's dispatch_next returns
+  // an int, GOMP's a C _Bool.
+  Type chunkResTy = parseAbiTypeProp(ctx, getStrProp("chunk_result"), i32Ty(ctx));
+
+  // Convert into and out of that ABI.  Loop indices are signed, so the widening
+  // direction is a sign extension.
+  auto convertInt = [&](Value v, Type to) -> Value {
+    if (v.getType() == to) return v;
+    unsigned from = llvm::cast<IntegerType>(v.getType()).getWidth();
+    unsigned dest = llvm::cast<IntegerType>(to).getWidth();
+    return dest > from ? LLVM::SExtOp::create(builder, loc, to, v).getResult()
+                       : LLVM::TruncOp::create(builder, loc, to, v).getResult();
+  };
+  auto toIdx   = [&](Value v) { return convertInt(v, chunkIdxTy); };
+  auto fromIdx = [&](Value v) { return convertInt(v, iterTy); };
+
   // Allocate plb, pub, pstride, plast.
   // plb/pub/plast are in/out: initialized here, overwritten by the runtime.
   // pstride is pure output: NOT initialized — runtime writes the stride value.
-  Value plb     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value pub     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value pstride = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value plast   = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
+  Value plb     = LLVM::AllocaOp::create(builder, loc, ptrT, chunkIdxTy, one64);
+  Value pub     = LLVM::AllocaOp::create(builder, loc, ptrT, chunkIdxTy, one64);
+  Value pstride = LLVM::AllocaOp::create(builder, loc, ptrT, chunkIdxTy, one64);
+  Value plast   = LLVM::AllocaOp::create(builder, loc, ptrT, chunkIdxTy, one64);
 
   // Convert exclusive upper bound to inclusive last-iteration index.
   // omp.loop_nest uses exclusive ub: trip = (ub - lb) / step iterations.
@@ -1349,10 +1408,15 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   //   = lb + ((ub-lb)/step - 1)*step  = ub - step
   Value ubInclusive = LLVM::SubOp::create(builder, loc, ub, step);
 
-  LLVM::StoreOp::create(builder, loc, lb,          plb);
-  LLVM::StoreOp::create(builder, loc, ubInclusive, pub);
-  // pstride: no initialization — pure output parameter
-  LLVM::StoreOp::create(builder, loc, zero32,      plast);
+  // For a chunked construct the slots are pure output — the bounds go in by
+  // value through the acquisition call, and every read of a slot happens after
+  // the runtime has written it — so there is nothing to seed.
+  if (!isChunked) {
+    LLVM::StoreOp::create(builder, loc, toIdx(lb),          plb);
+    LLVM::StoreOp::create(builder, loc, toIdx(ubInclusive), pub);
+    // pstride: no initialization — pure output parameter
+    LLVM::StoreOp::create(builder, loc, toIdx(zero32),      plast);
+  }
 
   // Map symbolic DSL names to SSA values.  The loop-specific slots (%lb, %ub,
   // %step, %stride, %last) are the site bindings; ident and %gtid come from the
@@ -1363,26 +1427,41 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   wsBindings["%step"]   = step;     // actual loop step
   wsBindings["%stride"] = pstride;  // output ptr for runtime stride
   wsBindings["%last"]   = plast;    // in/out last-iteration flag
+  // The bounds by value, for the dispatch APIs that take them that way rather
+  // than through the slots above.  Which of the two upper bounds a runtime
+  // wants is its own ABI: iomp's dispatch_init is given the last valid
+  // iteration, libgomp's loop_start the one-past-the-end.
+  wsBindings["%lb_val"]  = lb;
+  wsBindings["%ub_val"]  = ub;           // exclusive, as loop_nest was normalised
+  wsBindings["%ub_incl"] = ubInclusive;  // last valid iteration
+  if (Value chunkVal = wsOp.getScheduleChunk())
+    wsBindings["%chunk"] = chunkVal;
+
+  // Everything naming a loop index crosses into the runtime's index type: the
+  // bounds, the step, the chunk size, and integer literals such as a schedule
+  // constant.  Pointers (ident, the slots) and the thread id are untouched —
+  // they are not indices and their widths are their own.
+  //
+  // Where chunk_index is the induction variable's type, which is every runtime
+  // but libgomp, all of this is the identity.
+  auto isIndexToken = [](llvm::StringRef t) {
+    return t == "%lb_val" || t == "%ub_val" || t == "%ub_incl" ||
+           t == "%step"   || t == "%chunk";
+  };
   auto resolveCallArg = [&](const dsl::Value &v) -> Value {
-    if (auto *sv = std::get_if<dsl::StrVal>(&v))
-      return resolveSymbolToken(
+    if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
+      Value r = resolveSymbolToken(
           sv->value, builder, loc, wsBindings,
           [&](uint32_t flags) {
             return getOrCreateIdent(module, builder, loc, ctx, flags);
           },
           [&] { return gtidVal; });
+      return isIndexToken(sv->value) ? toIdx(r) : r;
+    }
     if (auto *iv = std::get_if<dsl::IntVal>(&v))
-      return LLVM::ConstantOp::create(builder, loc, iterTy,
-        IntegerAttr::get(iterTy, iv->value));
+      return LLVM::ConstantOp::create(builder, loc, chunkIdxTy,
+        IntegerAttr::get(chunkIdxTy, iv->value));
     return LLVM::UndefOp::create(builder, loc, ptrT);
-  };
-
-  // Read DSL properties that drive loop lowering strategy.
-  auto getStrProp = [&](llvm::StringRef key) -> std::string {
-    auto it = plan.properties.find(key.str());
-    if (it == plan.properties.end()) return "";
-    if (auto *sv = std::get_if<dsl::StrVal>(&it->second)) return sv->value;
-    return "";
   };
 
   // Emit each PlanCall in a block (e.g. plan.pre / plan.post) at the
@@ -1473,42 +1552,127 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   // Inline block-chunking produces exclusive ubThread → use slt.
   // Runtime init (e.g. __kmpc_for_static_init_4) writes inclusive ub into pub
   // (we initialised pub with ub - step) → use sle.
+  // A chunked construct has neither yet: its slots are filled once per chunk,
+  // so the two are read in chunkBody below and the predicate comes from the
+  // runtime's own convention for the bound it writes there.
   Value loopStart, loopEnd;
-  LLVM::ICmpPredicate cmpPred;
+  LLVM::ICmpPredicate cmpPred = LLVM::ICmpPredicate::sle;
   if (haveInlineBounds) {
     loopStart = lbThread;
     loopEnd   = ubThread;
     cmpPred   = LLVM::ICmpPredicate::slt;
-  } else {
+  } else if (!isChunked) {
     loopStart = LLVM::LoadOp::create(builder, loc, iterTy, plb);
     loopEnd   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
     cmpPred   = LLVM::ICmpPredicate::sle;
+  } else {
+    cmpPred = getStrProp("chunk_bound") == "exclusive"
+                ? LLVM::ICmpPredicate::slt : LLVM::ICmpPredicate::sle;
+  }
+
+  // Emit a chunk-acquisition block at the builder's current insertion point and
+  // give back the i1 "there was work" test of its last call — the last one
+  // because a `when`/`otherwise` chain collapses to exactly one call, and it is
+  // that call's result the loop turns on.  The caller places the block: once as
+  // the guard ahead of the loop, once as the latch that closes it.
+  auto emitChunkCall = [&](const std::vector<dsl::PlanAction> &actions) -> Value {
+    Value more;
+    for (auto &action : actions) {
+      auto *ca = std::get_if<dsl::PlanCall>(&action);
+      if (!ca) continue;
+      SmallVector<Value> args;
+      SmallVector<Type>  types;
+      for (auto &av : ca->args) {
+        Value v = resolveCallArg(av);
+        args.push_back(v); types.push_back(v.getType());
+      }
+      auto decl =
+          getOrInsertDeclWithReturn(module, ca->callee, types, chunkResTy, builder);
+      more = func::CallOp::create(builder, loc, decl, args).getResult(0);
+    }
+    if (!more) return Value();
+    Value zero = LLVM::ConstantOp::create(builder, loc, chunkResTy,
+      IntegerAttr::get(chunkResTy, 0));
+    return LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne, more, zero);
+  };
+
+  // A chunk block with no call in it leaves the loop with nothing to turn on.
+  // Say so rather than emit a loop that never runs.
+  auto blockHasCall = [](const std::vector<dsl::PlanAction> &b) {
+    for (auto &a : b)
+      if (std::get_if<dsl::PlanCall>(&a)) return true;
+    return false;
+  };
+  if (isChunked && (!blockHasCall(plan.nextChunk) ||
+                    (!plan.firstChunk.empty() && !blockHasCall(plan.firstChunk)))) {
+    wsOp.emitError("omp-outline: the chunk block of this wsloop makes no call; "
+                   "there is no chunk to loop on");
+    return;
   }
 
   // -------------------------------------------------------------------------
-  // Build the sequential loop.
+  // Build the loop.  A chunked construct wraps the sequential loop in an outer
+  // one, rotated so the acquisition call sits in a guard and a latch:
+  //
+  //   pre:  first_chunk?  -> chunkBody : after
+  //   chunkBody:          read the slots the call filled, then the inner loop
+  //   loopHeader/Body/Latch                    (as in the unchunked case)
+  //   chunkLatch:         next_chunk? -> chunkBody : after
+  //
+  // Rotating it is what lets the opening call differ from the repeat one, which
+  // libgomp needs (start hands out the first chunk, next the rest) and iomp does
+  // not — there the same call fills both places.
   // -------------------------------------------------------------------------
   Block *preBlock   = builder.getInsertionBlock();
   Block *afterBlock = preBlock->splitBlock(builder.getInsertionPoint());
+  Block *chunkBody  = isChunked ? new Block() : nullptr;
   Block *loopHeader = new Block();
   Block *loopBody   = new Block();
   Block *loopLatch  = new Block();
+  Block *chunkLatch = isChunked ? new Block() : nullptr;
 
   auto &parentRegion = *preBlock->getParent();
-  parentRegion.getBlocks().insertAfter(preBlock->getIterator(), loopHeader);
-  parentRegion.getBlocks().insertAfter(loopHeader->getIterator(), loopBody);
-  parentRegion.getBlocks().insertAfter(loopBody->getIterator(), loopLatch);
+  auto lastInserted = preBlock->getIterator();
+  auto insertBlock = [&](Block *b) {
+    parentRegion.getBlocks().insertAfter(lastInserted, b);
+    lastInserted = b->getIterator();
+  };
+  if (chunkBody) insertBlock(chunkBody);
+  insertBlock(loopHeader);
+  insertBlock(loopBody);
+  insertBlock(loopLatch);
+  if (chunkLatch) insertBlock(chunkLatch);
 
   builder.setInsertionPointToEnd(preBlock);
   Value pi = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  LLVM::StoreOp::create(builder, loc, loopStart, pi);
-  LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  if (isChunked) {
+    // The opening chunk: first_chunk where the runtime's opening call differs
+    // from the repeat one, next_chunk where it does not.
+    Value more = emitChunkCall(
+        plan.firstChunk.empty() ? plan.nextChunk : plan.firstChunk);
+    LLVM::CondBrOp::create(builder, loc, more,
+      chunkBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+
+    // Each chunk arrives in the slots; the loop runs over it in its own type.
+    builder.setInsertionPointToEnd(chunkBody);
+    loopStart = fromIdx(LLVM::LoadOp::create(builder, loc, chunkIdxTy, plb));
+    loopEnd   = fromIdx(LLVM::LoadOp::create(builder, loc, chunkIdxTy, pub));
+    LLVM::StoreOp::create(builder, loc, loopStart, pi);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  } else {
+    LLVM::StoreOp::create(builder, loc, loopStart, pi);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  }
+
+  // Where the inner loop goes when the chunk is exhausted: back for another one,
+  // or out.
+  Block *loopExit = isChunked ? chunkLatch : afterBlock;
 
   builder.setInsertionPointToEnd(loopHeader);
   Value curI = LLVM::LoadOp::create(builder, loc, iterTy, pi);
   Value cond = LLVM::ICmpOp::create(builder, loc, cmpPred, curI, loopEnd);
   LLVM::CondBrOp::create(builder, loc, cond,
-    loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+    loopBody, mlir::ValueRange{}, loopExit, mlir::ValueRange{});
 
   // Move the loop nest body into loopBody.
   // The nest region may have multiple blocks (from inner loops).
@@ -1554,6 +1718,14 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   Value nextI = LLVM::AddOp::create(builder, loc, curI, step);
   LLVM::StoreOp::create(builder, loc, nextI, pi);
   LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+
+  // The chunk is done: ask for another one, and leave when the answer is no.
+  if (isChunked) {
+    builder.setInsertionPointToEnd(chunkLatch);
+    Value more = emitChunkCall(plan.nextChunk);
+    LLVM::CondBrOp::create(builder, loc, more,
+      chunkBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+  }
 
   // Emit post-loop calls (e.g. fini, optional barrier).
   builder.setInsertionPointToStart(afterBlock);
@@ -1632,9 +1804,18 @@ struct OmpOutliningPass
       ctx["upper"]      = dsl::makeStr("%ub");
       ctx["step"]       = dsl::makeStr("%step");
       ctx["last"]       = dsl::makeStr("%last");
-      // Removed: no construct references a bare `chunk`; the static schedule's
-      // chunk size flows from the runtime-level `let default_chunk` in rules.dsl.
-      // ctx["chunk"]      = dsl::makeInt(1);
+      // The bounds by value, next to the in/out slots above: a dispatch API
+      // takes them that way, and which upper bound it wants — the last valid
+      // iteration or the one past it — is its own convention, so both are
+      // offered and the rules pick.
+      ctx["lower_val"]  = dsl::makeStr("%lb_val");
+      ctx["upper_val"]  = dsl::makeStr("%ub_val");
+      ctx["upper_incl"] = dsl::makeStr("%ub_incl");
+      // The chunk size the clause asked for, absent when it named none — which
+      // is what lets the rules write `when has(chunk)` and fall back to their
+      // own default.
+      ctx["chunk"] = wsOp.getScheduleChunk() ? dsl::makeStr("%chunk")
+                                             : dsl::makeNull();
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride

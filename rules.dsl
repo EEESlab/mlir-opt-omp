@@ -163,6 +163,44 @@ runtime libgomp {
       when not nowait => call "GOMP_barrier"();
     }
   }
+  construct wsloop when schedule == dynamic {
+    // GOMP's dispatch ABI is long-based whatever the induction variable is, it
+    // answers with a C _Bool, and the bound it writes is the one-past-the-end
+    // rather than the last valid iteration.  All three differ from iomp, which
+    // is why they are stated rather than assumed.
+    chunk_index  = i64;
+    chunk_result = i8;
+    chunk_bound  = exclusive;
+
+    // OpenMP's chunk size when the clause gives none.  iomp keeps its own at
+    // runtime level (it serves the static schedule too); here nothing else
+    // needs one.
+    let default_chunk = 1;
+
+    // No `pre`: GOMP has no separate init call.  The start registers the
+    // work-share AND hands this thread its first chunk, so it is the call that
+    // opens the loop — dropping its result would lose those iterations.
+    first_chunk {
+      when has(chunk) => call "GOMP_loop_dynamic_start"(lower_val, upper_val, step, chunk, lower, upper);
+      otherwise       => call "GOMP_loop_dynamic_start"(lower_val, upper_val, step, default_chunk, lower, upper);
+    }
+    next_chunk {
+      call "GOMP_loop_dynamic_next"(lower, upper);
+    }
+
+    invoke {
+      emit loop_body;
+    }
+
+    post {
+      // Unlike everywhere else, `nowait` here does not switch a call off but
+      // picks a different one: the _nowait variant still releases the
+      // work-share, it just skips the barrier.  --omp-barrier-elim reaches this
+      // by setting nowait on the op when the fork's join already synchronises.
+      when nowait => call "GOMP_loop_end_nowait"();
+      otherwise   => call "GOMP_loop_end"();
+    }
+  }
   construct barrier {
     invoke {
       call "GOMP_barrier"();

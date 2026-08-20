@@ -43,6 +43,12 @@ Type i32Ty(MLIRContext *ctx);
 LLVM::LLVMStructType parseStructProp(MLIRContext *ctx, llvm::StringRef prop,
                                      LLVM::LLVMStructType fallback);
 
+// Map a DSL ABI type name ("i8", "i32", "i64", "ptr") to an MLIR type.  An
+// empty or unknown name falls back to the caller's default, which is what the
+// properties naming a runtime's widths rely on (chunk_index, chunk_result):
+// a DSL file that says nothing keeps the pass's own choice.
+Type parseAbiTypeProp(MLIRContext *ctx, llvm::StringRef name, Type fallback);
+
 // --- Runtime declarations ---------------------------------------------------
 // Get (creating on first use) a private external func declaration for a runtime
 // entry point, with the given argument types and no result.

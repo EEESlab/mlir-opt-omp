@@ -25,7 +25,7 @@ ready for `mlir-translate` and the LLVM back-end.
 |---|---|---|---|
 | `omp.parallel` | ✅ `__kmpc_fork_call` | ✅ `GOMP_parallel` | ✅ `ext_pi_cl_team_fork` |
 | `omp.barrier` | ✅ `__kmpc_barrier` | ✅ `GOMP_barrier` | ✅ `ext_pi_cl_team_barrier` |
-| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds | ✅ static — computed thread bounds |
+| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds<br>✅ dynamic — `GOMP_loop_dynamic_start`/`_next` | ✅ static — computed thread bounds |
 | `omp.task` | ⏳ planned | ✅ `GOMP_task` | ⏳ API to be defined |
 
 
@@ -321,7 +321,10 @@ only `LLVMSupport`), `MLIROmpLowering` (the dialect) and
 To add a construct or a runtime, start from [`rules.dsl`](rules.dsl): each
 `runtime` block declares its constructs, and each construct its
 `capture_strategy` — the sole ABI selector, which also fixes the outlined
-function's signature — and its `pre`/`invoke`/`post` blocks. A
+function's signature — and its blocks. A block is any name followed by `{ ... }`
+and says *when* its calls run: `pre`, `invoke` and `post` around the construct,
+and for a work-sharing loop whose iterations the runtime hands out a chunk at a
+time, `first_chunk` and `next_chunk` around each chunk. A
 change there is picked up at run time — no rebuild needed — which makes it easy
 to iterate with a regression test. Constructs whose lowering needs more than the
 DSL expresses (new `emit` primitives, a different outline shape) also require
