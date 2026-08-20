@@ -1,12 +1,12 @@
-// An explicit schedule(static) under pmsis.  Unlike iomp and libgomp, the pmsis
-// wsloop construct in rules.dsl carries NO `when schedule == static` guard, so
-// it matches whatever schedule is written — which is why schedule(dynamic) is
-// silently mislowered here (schedule-dynamic-pmsis.mlir).
+// An explicit schedule(static) under pmsis.  Like iomp and libgomp, the pmsis
+// wsloop construct in rules.dsl is guarded by `when schedule == static`, so
+// this is the side of that guard which must keep matching — the other side,
+// where nothing matches and the evaluation fails, is
+// schedule-dynamic-unsupported-pmsis.mlir.
 //
-// That makes this test worth having anyway, and worth reading carefully: it
-// pins that static gets the block distribution it is supposed to get, without
-// implying the guard exists.  If the guard is ever added — the right fix for
-// the dynamic gap — this test is what says static must keep matching.
+// What the guard selects here is the inline block distribution, not a runtime
+// call: pmsis asks for `emit thread_bounds`, so the CHECKs below are the core
+// id and team size the bounds are computed from.
 //
 // @sink after the loop keeps the barrier from being the region's trailing op,
 // so --omp-barrier-elim could not drop it as redundant with the fork's join.

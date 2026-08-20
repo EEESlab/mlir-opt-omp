@@ -7,10 +7,8 @@
 // static.  When a dynamic path lands (GOMP_loop_dynamic_start /
 // GOMP_loop_dynamic_next), replace this with a test checking that sequence.
 //
-// The third runtime behaves differently and deliberately so: pmsis declares an
-// UNGUARDED `construct wsloop`, so there the same input matches and is
-// mislowered as a static block distribution with no diagnostic
-// (schedule-dynamic-pmsis.mlir, XFAILed).
+// All three runtimes now agree: pmsis carries the same guard, for the same
+// reason (schedule-dynamic-unsupported-pmsis.mlir).
 // RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=libgomp \
 // RUN:   --omp-to-omp-lower --omp-outline --verify-diagnostics
 

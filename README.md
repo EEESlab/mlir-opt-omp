@@ -25,7 +25,7 @@ ready for `mlir-translate` and the LLVM back-end.
 |---|---|---|---|
 | `omp.parallel` | ✅ `__kmpc_fork_call` | ✅ `GOMP_parallel` | ✅ `ext_pi_cl_team_fork` |
 | `omp.barrier` | ✅ `__kmpc_barrier` | ✅ `GOMP_barrier` | ✅ `ext_pi_cl_team_barrier` |
-| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds | ✅ computed thread bounds |
+| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds | ✅ static — computed thread bounds |
 | `omp.task` | ⏳ planned | ✅ `GOMP_task` | ⏳ API to be defined |
 
 

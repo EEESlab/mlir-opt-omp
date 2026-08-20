@@ -58,7 +58,7 @@ Every cell now has a test; the symbol says what that test asserts.
 | | `firstprivate` | ✓ | ✓ | ✓ |
 | `wsloop` | — | ✓ | ✓ | ✓ |
 | | `schedule(static)` | ✓ | ✓ | ✓ |
-| | `schedule(dynamic)` | ! | ! | ✗ |
+| | `schedule(dynamic)` | ! | ! | ! |
 | | `nowait` | ✓ | ✓ | ✓ |
 | `barrier` | — | ✓ | ✓ | ✓ |
 | `task` | — | ✓ | ✓ | n/a |
@@ -71,11 +71,10 @@ Every cell now has a test; the symbol says what that test asserts.
 supported and a passing test asserts the diagnostic rather than a lowering,
 `✗` not supported **and not diagnosed** — the clause is accepted and silently
 dropped or mislowered, with an `XFAIL`ed test stating what it should do. Every
-`✗` is a latent wrong-code path:
-
-- **`schedule(dynamic)` on pmsis** matches the *unguarded* `construct wsloop`
-  and is lowered as a static block distribution. iomp and libgomp guard theirs
-  with `when schedule == static`, so there it fails loudly instead (`!`).
+`✗` is a latent wrong-code path, so the column is empty as of now: the last one
+was `schedule(dynamic)` on pmsis, which matched an unguarded `construct wsloop`
+and came out as a static block distribution. Guarding that construct like the
+other two runtimes turned it into the `!` it is today.
 
 ### Encoding a gap
 

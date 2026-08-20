@@ -225,7 +225,13 @@ runtime pmsis {
       call "ext_pi_cl_team_barrier"();
     }
   }
-  construct wsloop {
+  // The guard matters even though this is the only wsloop variant here: the
+  // cluster has no dispatch API, so `emit thread_bounds` can only ever produce
+  // a static block distribution.  Without it any schedule kind would match and
+  // be lowered as static — a wrong answer rather than a rejected one.  The
+  // context defaults to static when no schedule clause was written, so a bare
+  // `omp.wsloop` still matches.
+  construct wsloop when schedule == static {
     thread_id_function   = "ext_pi_core_id";
     num_threads_function = "ext_pi_cl_nb_cores";
     pre {
