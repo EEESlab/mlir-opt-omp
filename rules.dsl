@@ -2,8 +2,10 @@
       // How the global thread id is acquired
       global_tid_function = "__kmpc_global_thread_num";
 
-      // Chunk size for the static work-sharing schedule; flows into the final
-      // `chunk` argument of __kmpc_for_static_init_4 (wsloop construct).
+      // The `chunk` argument of both work-sharing entry points, shared by the
+      // two wsloop constructs below.  The dynamic one falls back to it when the
+      // clause names no chunk; the static one passes it always, which is why
+      // schedule(static, N) drops N — a gap test/README.md records.
       let default_chunk = 1;
 
       construct parallel {
@@ -68,6 +70,29 @@
         }
         post {
           call "__kmpc_for_static_fini"(ident(work_loop), global_tid);
+          when not nowait => call "__kmpc_barrier"(ident(barrier_impl_for), global_tid);
+        }
+      }
+
+      // None of the chunk_* properties: this ABI is what they default to (see
+      // the table in README.md).
+      construct wsloop when schedule == dynamic {
+        pre {
+          // 35 = kmp_sch_dynamic_chunked.  dispatch_init takes the bounds by
+          // value, unlike for_static_init_4's in/out slots.
+          when has(chunk) => call "__kmpc_dispatch_init_4"(ident(work_loop), global_tid, 35, lower_val, upper_incl, step, chunk);
+          otherwise       => call "__kmpc_dispatch_init_4"(ident(work_loop), global_tid, 35, lower_val, upper_incl, step, default_chunk);
+        }
+        // No first_chunk: the init hands out nothing, so this one call both
+        // opens the loop and repeats it.
+        next_chunk {
+          call "__kmpc_dispatch_next_4"(ident(work_loop), global_tid, last, lower, upper, stride);
+        }
+        invoke {
+          emit loop_body;
+        }
+        post {
+          // No fini — that one is for `ordered`, which this lowering ignores.
           when not nowait => call "__kmpc_barrier"(ident(barrier_impl_for), global_tid);
         }
       }
@@ -164,22 +189,16 @@ runtime libgomp {
     }
   }
   construct wsloop when schedule == dynamic {
-    // GOMP's dispatch ABI is long-based whatever the induction variable is, it
-    // answers with a C _Bool, and the bound it writes is the one-past-the-end
-    // rather than the last valid iteration.  All three differ from iomp, which
-    // is why they are stated rather than assumed.
+    // long-based slots, a C _Bool answer, a one-past-the-end bound: all three
+    // differ from the defaults, so all three are stated (README.md).
     chunk_index  = i64;
     chunk_result = i8;
     chunk_bound  = exclusive;
 
-    // OpenMP's chunk size when the clause gives none.  iomp keeps its own at
-    // runtime level (it serves the static schedule too); here nothing else
-    // needs one.
     let default_chunk = 1;
 
-    // No `pre`: GOMP has no separate init call.  The start registers the
-    // work-share AND hands this thread its first chunk, so it is the call that
-    // opens the loop — dropping its result would lose those iterations.
+    // No `pre`: the start call is the init, and it hands out the first chunk
+    // too — dropping its result would lose those iterations.
     first_chunk {
       when has(chunk) => call "GOMP_loop_dynamic_start"(lower_val, upper_val, step, chunk, lower, upper);
       otherwise       => call "GOMP_loop_dynamic_start"(lower_val, upper_val, step, default_chunk, lower, upper);
@@ -193,10 +212,8 @@ runtime libgomp {
     }
 
     post {
-      // Unlike everywhere else, `nowait` here does not switch a call off but
-      // picks a different one: the _nowait variant still releases the
-      // work-share, it just skips the barrier.  --omp-barrier-elim reaches this
-      // by setting nowait on the op when the fork's join already synchronises.
+      // `nowait` picks a call here rather than switching one off: the
+      // work-share has to be released either way.
       when nowait => call "GOMP_loop_end_nowait"();
       otherwise   => call "GOMP_loop_end"();
     }

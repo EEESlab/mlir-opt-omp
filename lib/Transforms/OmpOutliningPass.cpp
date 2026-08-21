@@ -1284,6 +1284,16 @@ static LogicalResult lowerWsloop(omp::WsloopOp wsOp,
   auto steps = loopNest.getLoopSteps();
   if (lbs.empty() || ubs.empty() || steps.empty()) return success();
 
+  // Only the outermost dimension is distributed and rewired below.  With a
+  // collapsed nest the inner induction variables keep their uses after the body
+  // has been moved out, and erasing the op at the end then destroys values that
+  // are still referenced — an abort rather than an answer.  Say so instead.
+  if (lbs.size() > 1) {
+    wsOp.emitError("omp-outline: a collapsed loop nest (")
+        << lbs.size() << " dimensions) is not supported";
+    return failure();
+  }
+
   Value lb = lbs[0], ub = ubs[0], step = steps[0];
   Type iterTy = lb.getType();
 
@@ -1307,20 +1317,21 @@ static LogicalResult lowerWsloop(omp::WsloopOp wsOp,
   // thing LLVM cannot delete for being unused — so a wsloop whose rules never
   // name %gtid (every libgomp and pmsis one: their loop APIs take no thread id)
   // would carry it into the binary for nothing.
-  auto actionsName = [](const std::vector<dsl::PlanAction> &actions,
-                        llvm::StringRef token) {
-    for (auto &a : actions)
-      if (auto *ca = std::get_if<dsl::PlanCall>(&a))
-        for (auto &av : ca->args)
-          if (auto *sv = std::get_if<dsl::StrVal>(&av))
-            if (sv->value == token) return true;
-    return false;
+  // Does any call in this plan name the token?  Used to skip materialising a
+  // value the rules never ask for — see %gtid here and %ub_incl further down.
+  auto planNames = [&plan](llvm::StringRef token) {
+    auto inBlock = [&](const std::vector<dsl::PlanAction> &actions) {
+      for (auto &a : actions)
+        if (auto *ca = std::get_if<dsl::PlanCall>(&a))
+          for (auto &av : ca->args)
+            if (auto *sv = std::get_if<dsl::StrVal>(&av))
+              if (sv->value == token) return true;
+      return false;
+    };
+    return inBlock(plan.pre) || inBlock(plan.invoke) || inBlock(plan.post) ||
+           inBlock(plan.firstChunk) || inBlock(plan.nextChunk);
   };
-  bool needsGtid = actionsName(plan.pre, "%gtid") ||
-                   actionsName(plan.invoke, "%gtid") ||
-                   actionsName(plan.post, "%gtid") ||
-                   actionsName(plan.firstChunk, "%gtid") ||
-                   actionsName(plan.nextChunk, "%gtid");
+  bool needsGtid = planNames("%gtid");
 
   Value gtidVal;
   if (needsGtid) gtidVal = LLVM::UndefOp::create(builder, loc, iterTy);
@@ -1462,11 +1473,28 @@ static LogicalResult lowerWsloop(omp::WsloopOp wsOp,
   Value pstride = LLVM::AllocaOp::create(builder, loc, ptrT, chunkIdxTy, one64);
   Value plast   = LLVM::AllocaOp::create(builder, loc, ptrT, chunkIdxTy, one64);
 
-  // Convert exclusive upper bound to inclusive last-iteration index.
-  // omp.loop_nest uses exclusive ub: trip = (ub - lb) / step iterations.
-  // __kmpc_for_static_init_4 expects inclusive upper bound: ub_incl = lb + (trip-1)*step
-  //   = lb + ((ub-lb)/step - 1)*step  = ub - step
-  Value ubInclusive = LLVM::SubOp::create(builder, loc, ub, step);
+  // The last valid iteration, for the entry points that take the upper bound
+  // that way — the __kmpc_* family does, GOMP's does not.
+  //
+  // NOT ub - step.  omp.loop_nest's upper bound is one past the end and the
+  // step need not divide the range: 0 to 10 by 3 runs 0, 3, 6, 9 and ends at 9,
+  // where ub - step is 7.  Handing 7 to the runtime loses the last iteration
+  // outright, since it is what the trip count is computed from.  Take the trip
+  // count first, the same rounded-up way the inline distribution below does,
+  // and walk back one step from the end.
+  //
+  // Only when something asks for it: this is five ops rather than one, and the
+  // runtimes with an exclusive-bound API never read it.
+  Value ubInclusive;
+  if (!isChunked || planNames("%ub_incl")) {
+    Value range   = LLVM::SubOp::create(builder, loc, ub, lb);
+    Value rangeUp = LLVM::AddOp::create(builder, loc, range,
+                      LLVM::SubOp::create(builder, loc, step, one32));
+    Value trip    = LLVM::SDivOp::create(builder, loc, rangeUp, step);
+    Value lastIdx = LLVM::SubOp::create(builder, loc, trip, one32);
+    ubInclusive   = LLVM::AddOp::create(builder, loc, lb,
+                      LLVM::MulOp::create(builder, loc, lastIdx, step));
+  }
 
   // For a chunked construct the slots are pure output — the bounds go in by
   // value through the acquisition call, and every read of a slot happens after
@@ -1492,8 +1520,8 @@ static LogicalResult lowerWsloop(omp::WsloopOp wsOp,
   // wants is its own ABI: iomp's dispatch_init is given the last valid
   // iteration, libgomp's loop_start the one-past-the-end.
   wsBindings["%lb_val"]  = lb;
-  wsBindings["%ub_val"]  = ub;           // exclusive, as loop_nest was normalised
-  wsBindings["%ub_incl"] = ubInclusive;  // last valid iteration
+  wsBindings["%ub_val"]  = ub;  // exclusive, as loop_nest was normalised
+  if (ubInclusive) wsBindings["%ub_incl"] = ubInclusive;  // last valid iteration
   if (chunkVal) wsBindings["%chunk"] = chunkVal;  // integer, checked above
 
   // Everything naming a loop index crosses into the runtime's index type: the

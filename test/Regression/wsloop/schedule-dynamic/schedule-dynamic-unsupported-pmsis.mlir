@@ -1,8 +1,13 @@
 // schedule(dynamic) is NOT implemented for pmsis: the only wsloop construct the
 // pmsis rules declare is guarded by `when schedule == static`, so no construct
-// matches and the DSL evaluation fails.  Same guard, same outcome, as iomp —
-// see schedule-dynamic-unsupported-iomp.mlir.  libgomp is the one runtime that
-// has the clause (schedule-dynamic-libgomp.mlir).
+// matches and the DSL evaluation fails.  It is now the only runtime in that
+// position — iomp and libgomp both have the clause
+// (schedule-dynamic-iomp.mlir, schedule-dynamic-libgomp.mlir).
+//
+// The reason it is missing here is not a missing construct but a missing API.
+// Both of the others delegate the distribution to their runtime; the cluster
+// has nothing to delegate to, and `emit thread_bounds`, which is all pmsis has,
+// can only ever produce a static split.
 //
 // The guard is what this test really pins.  pmsis used to declare an unguarded
 // `construct wsloop`, so this input matched and was lowered as a static block
