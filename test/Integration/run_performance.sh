@@ -53,6 +53,11 @@
 #                                  selection (the SUITE, full/bundled, or the
 #                                  explicit kernel name(s)) + the dataset size,
 #                                  e.g. _full_large or _gemm-omp_mini.
+#
+# The CSV and the chart carry a _barrier-elim suffix of their own under
+# BARRIER_ELIM=1. The folder already says which run they came from, but these
+# two are the files that leave it — into a paper, a slide, a mail — and there
+# the folder is gone and the name is all that is left.
 # =============================================================================
 
 set -uo pipefail
@@ -71,7 +76,7 @@ VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
 # Results are split per runtime and by BARRIER_ELIM — results/<runtime>/ and
 # results/<runtime>-barrier-elim/ — so a run only ever replaces one of its own
 # kind, and a baseline survives the optimised run it is compared against.
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_TAG"
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_DIR_TAG"
 PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
 
 # Performance times the kernel with the cycle-accurate TSC timer. This is
@@ -254,14 +259,6 @@ emit_na() {
     echo "$row" >> "$CSV"
 }
 
-# is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
-is_true() {
-    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 # Suffix naming what this run covered, appended to the plot filename:
 # the kernel selection — the SUITE name (full/bundled), or, when an explicit
 # KERNELS list (or a single-kernel argument) was given, the kernel basenames
@@ -285,30 +282,11 @@ plot_suffix() {
 
 # Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
-# Python resolution order: $PLOT_PYTHON, then the local venv ./.venv (create it
-# once with:  python3 -m venv .venv && .venv/bin/pip install matplotlib numpy),
-# then whatever python3 is on PATH.
+# plot_python (common.sh) picks the interpreter, the same way for every driver.
 render_plot() {
     local script="$SCRIPT_DIR/lib/plot_speedup.py"
-    local png="$OUTDIR/results_performance_$(plot_suffix).png"
-    local py
-    if [ -n "${PLOT_PYTHON:-}" ]; then
-        py="$PLOT_PYTHON"
-    elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
-        py="$SCRIPT_DIR/.venv/bin/python"
-    else
-        py="$(command -v python3 || command -v python)" || {
-            echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
-            return
-        }
-    fi
-    if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
-        echo -e "${YELLOW}[plot] matplotlib not available in $py — skipping plot.${RESET}" >&2
-        echo -e "${YELLOW}[plot] set it up once with:${RESET}" >&2
-        echo -e "${YELLOW}[plot]   python3 -m venv $SCRIPT_DIR/.venv${RESET}" >&2
-        echo -e "${YELLOW}[plot]   $SCRIPT_DIR/.venv/bin/pip install matplotlib numpy${RESET}" >&2
-        return
-    fi
+    local png="$OUTDIR/results_performance_$(plot_suffix)$BARRIER_ELIM_FILE_TAG.png"
+    local py; py="$(plot_python)" || return
     echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2
     if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME"; then
         echo "  Plot  — $png"
@@ -319,7 +297,7 @@ render_plot() {
 
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_performance.csv"
+CSV="$OUTDIR/results_performance$BARRIER_ELIM_FILE_TAG.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
 [ "$TARGET" = "pulp" ] && \
     CSV_HEADER="$CSV_HEADER;size_ref_seq;size_ref_par;size_opt_seq;size_opt_par"

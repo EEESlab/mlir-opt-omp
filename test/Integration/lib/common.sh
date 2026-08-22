@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # common.sh — shared setup for the Integration test drivers
-# (run_correctness.sh, run_performance.sh, tasks/run_tasks.sh).
+# (run_correctness.sh, run_performance.sh, run_barrier_stats.sh,
+# run_barrier_vs_native.sh, tasks/run_tasks.sh).
 #
 # This file holds the configuration: run.env loading, tool/path resolution
 # and the per-runtime knobs. The rest is sourced from sibling files at the end:
@@ -65,14 +66,19 @@ case "$BARRIER_ELIM" in
         ;;
 esac
 # FLAG is spliced into the mlir-opt-omp command line by native.sh and pulp.sh.
-# TAG is appended to the drivers' output directory, so an optimised run lands
-# next to its baseline instead of on top of it. Both empty when off, so the
-# baseline command line and paths stay exactly as they were.
+# DIR_TAG is appended to the drivers' output directory, so an optimised run
+# lands next to its baseline instead of on top of it. FILE_TAG does the same
+# for the result files of run_performance.sh: those get copied out of that
+# directory — into a paper, a slide deck — where the two configurations would
+# otherwise be two files with one name. All three empty when the pass is off,
+# so the baseline command line and paths stay exactly as they were.
 BARRIER_ELIM_FLAG=""
-BARRIER_ELIM_TAG=""
+BARRIER_ELIM_DIR_TAG=""
+BARRIER_ELIM_FILE_TAG=""
 if [ "$BARRIER_ELIM" = "1" ]; then
     BARRIER_ELIM_FLAG="--omp-barrier-elim"
-    BARRIER_ELIM_TAG="-barrier-elim"
+    BARRIER_ELIM_DIR_TAG="-barrier-elim"
+    BARRIER_ELIM_FILE_TAG="_barrier-elim"
 fi
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
@@ -151,6 +157,60 @@ case "$RUNTIME" in
         ;;
 esac
 unset __DATASET_EXPLICIT
+
+# --- Plotting ----------------------------------------------------------------
+# is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
+is_true() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Print the python a chart should be rendered with, or return non-zero after
+# saying why. Order: $PLOT_PYTHON, the local venv, then python3 on PATH.
+# Every caller treats the failure as a skipped plot rather than a failed run —
+# the CSV is the result, the figure is a convenience.
+plot_python() {
+    local py
+    if [ -n "${PLOT_PYTHON:-}" ]; then
+        py="$PLOT_PYTHON"
+    elif [ -x "$INTEGRATION_DIR/.venv/bin/python" ]; then
+        py="$INTEGRATION_DIR/.venv/bin/python"
+    else
+        py="$(command -v python3 || command -v python)" || {
+            echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
+            return 1
+        }
+    fi
+    if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
+        echo -e "${YELLOW}[plot] matplotlib not available in $py — skipping plot.${RESET}" >&2
+        echo -e "${YELLOW}[plot] set it up once with:${RESET}" >&2
+        echo -e "${YELLOW}[plot]   python3 -m venv $INTEGRATION_DIR/.venv${RESET}" >&2
+        echo -e "${YELLOW}[plot]   $INTEGRATION_DIR/.venv/bin/pip install matplotlib numpy${RESET}" >&2
+        return 1
+    fi
+    printf '%s' "$py"
+}
+
+# Render a bar chart of the team-barrier counts in $1 (a CSV from either
+# barrier driver) next to it, as $2. Both drivers call this the same way, and
+# plot_barriers.py picks the bars from the CSV header.
+#
+# --group-by pragma_form blocks the vs-native figure by how the kernel spells
+# its parallel loop, which is what separates the two regimes it shows. The
+# stats CSV has no such column and is left in suite order.
+render_barrier_plot() {   # $1 = csv, $2 = output image
+    is_true "${PLOT:-false}" || return 0
+    local py; py="$(plot_python)" || return 0
+    echo -e "${CYAN}[plot] rendering barrier chart...${RESET}" >&2
+    if "$py" "$COMMON_DIR/plot_barriers.py" "$1" "$2" \
+        --runtime "$RUNTIME" --group-by pragma_form; then
+        echo "  Plot  — $2"
+    else
+        echo -e "${YELLOW}[plot] plot_barriers.py failed — see output above${RESET}" >&2
+    fi
+}
 
 # --- Load the pieces ---------------------------------------------------------
 # kernels.sh  kernel lists + select_kernels/resolve_src

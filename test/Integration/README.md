@@ -226,6 +226,12 @@ results/
     <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
 
+Under `BARRIER_ELIM=1` those two names take a `_barrier-elim` suffix as well —
+`results_performance_barrier-elim.csv`,
+`results_performance_full_large_barrier-elim.png`. The folder already says
+which run they belong to, but these are the files that leave it, and a figure
+in a paper directory has no folder left to tell it by.
+
 ## Barrier elimination
 
 `--omp-barrier-elim` drops team barriers the surrounding OpenMP structure
@@ -285,6 +291,53 @@ counts once here and fires once per iteration at run time, so the dynamic
 saving is the larger number. `floyd-warshall` is the clearest case: one static
 barrier, executed once per `k`.
 
+### Barrier charts
+
+`PLOT=true` renders a bar chart beside each CSV, one bar per configuration per
+kernel:
+
+```sh
+PLOT=true SUITE=full ./run_barrier_stats.sh       # -> results/<runtime>/results_barrier_stats.png
+PLOT=true SUITE=full ./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.png
+```
+
+Both come from [`lib/plot_barriers.py`](lib/plot_barriers.py), which picks the
+bars from the CSV header: two from the stats CSV — ours without the pass and
+with it — and three from the vs-native one, clang first. A configuration keeps
+its colour in both figures, and the totals ride in the legend labels.
+
+What is drawn is the **emitted** count on either side, never the pass's own
+`explicit_removed`/`implicit_removed`. So a run that came out `MISMATCH` still
+plots the half that is trustworthy.
+
+A count of zero draws no bar and is labelled `0` instead — most of the clang
+column on `combined` kernels. A kernel that failed to build has no count at all
+and is dropped from the figure rather than drawn as zero.
+
+The vs-native figure is **blocked by `pragma_form`** (`--group-by`, passed by
+the driver), and that is what makes it readable. In suite order the two regimes
+interleave and the middle bar just looks worse than clang; in two blocks each
+half states one thing:
+
+| block | what it shows |
+|---|---|
+| `split` (19 kernels) | clang 44, our baseline 44 — *identical, kernel by kernel* — and 25 after the pass |
+| `combined` (11 kernels) | clang 0, ours 15, and 0 after the pass |
+
+So the baseline is not a weak one to beat: it is exactly clang's, everywhere
+clang does not apply its own elision. What the pass adds is one barrier per
+parallel region on the spelling clang's front-end skips.
+
+The rest matches the [speedup chart](#speedup-chart): `python3` + matplotlib,
+the local `.venv` picked up automatically, the extension deciding the format,
+and the script runnable by hand on a CSV already on disk.
+
+```sh
+python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv fig.pdf --runtime iomp
+```
+
+### Measuring the effect
+
 `BARRIER_ELIM=1` puts the pass in the real pipeline, so the other two drivers
 measure its effect. Run each configuration twice, changing only this variable:
 
@@ -296,8 +349,26 @@ BARRIER_ELIM=1 SUITE=full ./run_correctness.sh    # still bit-identical?
 
 The two configurations write into separate trees — `results/<runtime>/` for the
 baseline and `results/<runtime>-barrier-elim/` for the optimised run — so you
-can run them in either order and keep both CSVs. Compare the `opt_par_cyc`
-column of the two `results_performance.csv`.
+can run them in either order and keep both CSVs. Compare their `opt_par_cyc`
+column:
+
+```sh
+cd results
+awk -F';' '
+  BEGIN { printf "  %-24s %14s %14s %9s %s\n", "kernel","base","elim","gain","ref drift" }
+  FNR==1 { next }
+  NR==FNR { b[$1]=$5; r[$1]=$3; next }
+  ($1 in b) && b[$1]+0>0 && $5+0>0 {
+    printf "  %-24s %14.0f %14.0f %+8.2f%%  %+9.2f%%\n",
+           $1, b[$1], $5, 100*(b[$1]-$5)/b[$1], 100*($3-r[$1])/r[$1]
+  }' iomp/results_performance.csv \
+     iomp-barrier-elim/results_performance_barrier-elim.csv
+```
+
+`gain` above zero is time the pass saved. `ref drift` is the sanity check:
+`BARRIER_ELIM` only ever touches the opt cells, so the native column should
+come out the same in both runs — where it does not, that is the machine moving
+under the measurement, and a gain smaller than the drift means nothing.
 
 Give the timing enough runs to see the difference: removing a handful of
 barriers is usually worth a few percent, which `REPS=1` cannot resolve. Keep
@@ -415,7 +486,16 @@ a warning and fall back to `PATH`.
 |---------------------|---------|-------------------------------------------|
 | `REPS`              | `10`     | timed runs per cell, min+max dropped; ignored on `pmsis` (gvsoc is deterministic) |
 | `VARIANCE_ACCEPTED` | `5`     | warn if a cell's relative std-dev exceeds this % |
-| `PLOT`              | `false` | `true` → render `results/<runtime>/results_performance_<sel>.png` (needs matplotlib) |
+
+### Plots
+
+One switch for every driver that has a chart to draw: `run_performance.sh` and
+the two barrier drivers. Each renders next to its own CSV, so turning it on
+once covers all of them.
+
+| Variable            | Default | Meaning                                   |
+|---------------------|---------|-------------------------------------------|
+| `PLOT`              | `false` | `true` → also render the driver's chart (needs matplotlib) |
 | `PLOT_PYTHON`       | *empty* | python to render with; otherwise `./.venv`, then `python3` |
 
 ### PULP / gvsoc (`RUNTIME=pmsis`)

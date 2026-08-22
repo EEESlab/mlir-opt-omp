@@ -43,7 +43,7 @@ export OMP_NUM_THREADS="$THREADS"
 # Results are split per runtime and by BARRIER_ELIM — results/<runtime>/ and
 # results/<runtime>-barrier-elim/ — so a run only ever replaces one of its own
 # kind, and a baseline survives the optimised run it is compared against.
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_TAG"
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_DIR_TAG"
 
 # Correctness dumps the arrays and diffs them.
 POLYBENCH_CFLAGS="-DPOLYBENCH_DUMP_ARRAYS $POLYBENCH_ROOT_CFLAGS"

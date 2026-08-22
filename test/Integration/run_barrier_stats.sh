@@ -189,6 +189,12 @@ done
 echo
 echo "  claimed removed: $TOTAL_CLAIMED    barrier calls gone: $TOTAL_REMOVED"
 echo "  Done — $CSV"
+
+# Optional chart of the emitted half — the calls_base/calls_elim columns, which
+# stand whether or not the claimed half agreed. PLOT=true, as in the other
+# drivers.
+render_barrier_plot "$CSV" "${CSV%.csv}.png"
+
 if [ "$FAILED" -ne 0 ]; then
     echo -e "  ${RED}some kernels failed or came out MISMATCH${RESET} (VERBOSE=1 for the tool output)"
     exit 1

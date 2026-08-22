@@ -158,5 +158,10 @@ if [ "$T_CLANG" -gt 0 ]; then
         'BEGIN { printf "  %d fewer than clang (%.1f%%)\n", c - e, 100 * (c - e) / c }'
 fi
 echo "  Done — $CSV"
+
+# Optional chart: the three columns side by side, clang first. PLOT=true, as in
+# the other drivers.
+render_barrier_plot "$CSV" "${CSV%.csv}.png"
+
 [ "$FAILED" -ne 0 ] && { echo "  some kernels failed (VERBOSE=1 for the tool output)"; exit 1; }
 exit 0
