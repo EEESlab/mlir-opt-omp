@@ -284,9 +284,34 @@ matches clang kernel for kernel while the pass removes one per region. The pass
 reasons about structure on the `omp` dialect rather than about which directive
 was written, so it covers both spellings.
 
-iomp only. gcc is not comparable this way: at `-O3` it emits `GOMP_barrier`
-counts that exceed the number of work-sharing loops in the source, so the
-number reflects code duplication as much as synchronisation. A loop whose barrier sits inside a sequential outer loop
+The three LLVM columns are iomp, so they speak one ABI. **gcc gets a column of
+its own, counted before `-O3`** (`gcc -fopenmp -O0 -S`, counting
+`call GOMP_barrier`), because at `-O3` gcc clones loops and each copy carries
+its call site along: over this suite 27 becomes 36, gemver alone 3 becomes 6.
+That number would measure duplication as much as synchronisation. gcc decides
+the elision in the front-end, so it is already applied at `-O0`; our own count
+does not move between stages — the same 59/25 in MLIR and after `-O3` — so the
+comparison holds, but say which stage when you quote it.
+
+What that column says is worth knowing before quoting the clang one: **gcc
+performs this elision too**, and lands at 27 where the pass lands at 25, kernel
+for kernel on 28 of 30. The two compilers miss it in different places — clang
+on the `split` spelling, gcc on a region that holds a declaration, which puts
+the loop inside a block and out of reach of its check (add one line to
+`gemm-omp.c` and gcc's count goes 0 → 1). One rule on the dialect covers both,
+and covers a third runtime whose toolchain has no such optimisation at all.
+
+Its figure is a separate one — same reason it is a separate column:
+
+```sh
+python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv barriers_vs_gcc.pdf \
+  --runtime iomp --group-by pragma_form --only pragma_form=split --series gcc,elim
+```
+
+`gcc` is read from the CSV but never drawn unless `--series` names it, so no
+figure mixes the two stages by accident.
+
+A loop whose barrier sits inside a sequential outer loop
 counts once here and fires once per iteration at run time, so the dynamic
 saving is the larger number. `floyd-warshall` is the clearest case: one static
 barrier, executed once per `k`.

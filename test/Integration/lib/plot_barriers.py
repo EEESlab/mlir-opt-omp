@@ -54,6 +54,13 @@
 # reads "Clang (44)  Ours (44)  Ours + barrier elim (25)" — the baseline
 # stating for itself that it is clang's, before the pass moves it.
 #
+# The gcc bar is the exception: it is read from the CSV but never drawn unless
+# --series names it, because it is counted before -O3 and everything else
+# after. Ask for it and you get its own figure, which is the only honest place
+# for it:
+#
+#     --only pragma_form=split --series gcc,elim
+#
 # Output format follows the extension of <output.png> (.png, .pdf, .svg, ...);
 # .pdf gives a vector figure suitable for a paper. Defaults to <csv>.png.
 #
@@ -86,6 +93,7 @@ BARRIER_SYM = {
 # for colour-blind readers.
 SERIES = {
     "clang": dict(label="Clang", color="#4c78b4", edge="#2f4f7a", hatch=""),
+    "gcc": dict(label="GCC", color="#7b5aa6", edge="#4a3466", hatch="\\\\\\"),
     "base": dict(label="Ours", color="#c55a11", edge="#7a3708", hatch="///"),
     "elim": dict(
         label="Ours + barrier elim", color="#009e73", edge="#00654a", hatch="xxx"
@@ -98,6 +106,12 @@ LAYOUTS = [
     {"clang": "clang", "base": "ours_baseline", "elim": "ours_elim"},
     {"base": "calls_base", "elim": "calls_elim"},
 ]
+
+# Bars that are read when the column is there but never drawn unless --series
+# asks for them by name. gcc is counted before -O3 while everything else is
+# counted after it (see run_barrier_vs_native.sh), so it belongs in a figure of
+# its own rather than silently alongside bars from another stage.
+OPTIONAL = {"gcc": "gcc_o0"}
 
 ZERO_LABEL_COLOR = "#5a5a5a"
 GROUP_LABEL_COLOR = "#3a3a3a"
@@ -216,6 +230,10 @@ def load_rows(csv_path, group_col=None, only_col=None, only_value=None):
                 f"plot_barriers: {csv_path} has none of the expected column sets "
                 f"({' | '.join(', '.join(l.values()) for l in LAYOUTS)})"
             )
+        layout = dict(layout)
+        layout.update(
+            {r: c for r, c in OPTIONAL.items() if c in (reader.fieldnames or ())}
+        )
         if group_col and group_col not in (reader.fieldnames or ()):
             group_col = None
         if only_col and only_col not in (reader.fieldnames or ()):
@@ -292,7 +310,9 @@ def make_plot(kernels, series, blocks, args):
                 )
 
     ylabel = "Team barrier call sites"
-    if args.runtime:
+    # Naming the symbol is only honest while every bar counts the same one: the
+    # gcc bar counts GOMP_barrier, the rest count whatever $RUNTIME emits.
+    if args.runtime and not any(role == "gcc" for role, _ in series):
         ylabel += f" ({BARRIER_SYM[args.runtime]})"
     ax.set_ylabel(ylabel)
     if args.title:
@@ -356,6 +376,8 @@ def main(argv):
                 f"(it has {', '.join(role for role, _ in series)})"
             )
         series = [(role, values) for role, values in series if role in wanted]
+    else:
+        series = [(role, values) for role, values in series if role not in OPTIONAL]
 
     blocks = []
     if groups:
