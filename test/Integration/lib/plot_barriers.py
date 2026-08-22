@@ -32,15 +32,27 @@
 # Options:
 #     --runtime {iomp,libgomp,pmsis}   names the barrier symbol in the y label
 #     --group-by <column>        block the x axis by that column's value
+#     --only <column>=<value>    keep only the rows that match
+#     --series <roles>           draw a subset of the bars (clang,base,elim)
 #     --title "..."              optional chart title (default: none, paper style)
 #
-# --group-by pragma_form is what makes the vs-native figure readable: in suite
-# order the two regimes are interleaved, and the middle bar just looks worse
-# than clang. Blocked, each half states one thing — on `split` clang and our
-# baseline are identical and the pass takes one barrier per region off; on
+# --group-by pragma_form is what makes the whole-suite figure readable: in
+# suite order the two regimes are interleaved, and the middle bar just looks
+# worse than clang. Blocked, each half states one thing — on `split` clang and
+# our baseline are identical and the pass takes one barrier per region off; on
 # `combined` clang elides it in the front-end and the pass catches up. The
 # column is optional, so asking for one the CSV does not have simply leaves
 # the order alone.
+#
+# --only and --series cut that overview down to a figure that makes one point.
+# The `combined` half is a tie, so a figure about what the pass adds says:
+#
+#     --only pragma_form=split                    clang, ours, ours+pass
+#     --only pragma_form=split --series clang,elim    just the two that matter
+#
+# The legend totals follow the rows actually drawn, so the first of those
+# reads "Clang (44)  Ours (44)  Ours + barrier elim (25)" — the baseline
+# stating for itself that it is clang's, before the pass moves it.
 #
 # Output format follows the extension of <output.png> (.png, .pdf, .svg, ...);
 # .pdf gives a vector figure suitable for a paper. Defaults to <csv>.png.
@@ -98,6 +110,14 @@ GROUP_LABEL_Y = -0.30
 # the figure has something to show. Anything unlisted follows, in CSV order.
 GROUP_ORDER = ["split", "combined"]
 
+# What a block is called under the axis. `split`/`combined` name a column
+# value, which says nothing to a reader who has not read the driver: spell out
+# the directive each stands for instead. Any other value is used as it is.
+GROUP_LABELS = {
+    "split": "separate directives:  #pragma omp parallel { #pragma omp for }",
+    "combined": "combined directive:  #pragma omp parallel for",
+}
+
 
 def parse_args(argv):
     p = argparse.ArgumentParser(
@@ -123,8 +143,34 @@ def parse_args(argv):
         "value, separated by a rule (e.g. pragma_form). Ignored when the CSV "
         "has no such column",
     )
+    p.add_argument(
+        "--only",
+        default=None,
+        metavar="COLUMN=VALUE",
+        help="keep only the rows whose COLUMN holds VALUE, e.g. "
+        "pragma_form=split. Unlike --group-by this one is an error when the "
+        "column is missing: a filter that silently did nothing would draw "
+        "every kernel under a caption saying otherwise",
+    )
+    p.add_argument(
+        "--series",
+        default=None,
+        metavar="ROLES",
+        help="comma-separated subset of the bars to draw (%s); "
+        "default: all the CSV has" % ", ".join(SERIES),
+    )
     p.add_argument("--title", default=None, help="optional chart title")
     return p.parse_args(argv)
+
+
+def parse_only(spec):
+    """--only COLUMN=VALUE -> (column, value); exits on a malformed one."""
+    if spec is None:
+        return None, None
+    column, sep, value = spec.partition("=")
+    if not sep or not column.strip():
+        sys.exit(f"plot_barriers: --only wants COLUMN=VALUE, got '{spec}'")
+    return column.strip(), value.strip()
 
 
 def short_name(kernel):
@@ -155,11 +201,12 @@ def pick_layout(fieldnames):
     return None
 
 
-def load_rows(csv_path, group_col=None):
+def load_rows(csv_path, group_col=None, only_col=None, only_value=None):
     """Kernel names, one count list per role, and the group of each kernel.
 
-    Rows the driver could not build have no counts and are dropped. The group
-    is None throughout unless --group-by named a column the CSV actually has.
+    Rows the driver could not build have no counts and are dropped, as are the
+    ones --only rules out. The group is None throughout unless --group-by named
+    a column the CSV actually has.
     """
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
@@ -171,12 +218,16 @@ def load_rows(csv_path, group_col=None):
             )
         if group_col and group_col not in (reader.fieldnames or ()):
             group_col = None
+        if only_col and only_col not in (reader.fieldnames or ()):
+            sys.exit(f"plot_barriers: {csv_path} has no column '{only_col}'")
 
         kernels, groups = [], []
         counts = {role: [] for role in layout}
         for row in reader:
             name = (row.get("kernel") or "").strip()
             if not name:
+                continue
+            if only_col and (row.get(only_col) or "").strip() != only_value:
                 continue
             values = {role: _count(row.get(col)) for role, col in layout.items()}
             if any(v is None for v in values.values()):  # ERROR row, no counts
@@ -263,7 +314,8 @@ def make_plot(kernels, series, blocks, args):
         n = last - first + 1
         ax.text(
             (first + last) / 2, GROUP_LABEL_Y,
-            f"{label} ({n} kernel{'s' if n > 1 else ''})",
+            f"{GROUP_LABELS.get(label, label)}   —   "
+            f"{n} kernel{'s' if n > 1 else ''}",
             transform=ax.get_xaxis_transform(), ha="center", va="top",
             fontsize=10, color=GROUP_LABEL_COLOR,
         )
@@ -290,9 +342,20 @@ def main(argv):
         args.csv[:-4] + ".png" if args.csv.endswith(".csv") else args.csv + ".png"
     )
 
-    kernels, series, groups = load_rows(args.csv, args.group_by)
+    only_col, only_value = parse_only(args.only)
+    kernels, series, groups = load_rows(args.csv, args.group_by, only_col, only_value)
     if not kernels:
         sys.exit(f"plot_barriers: no plottable kernels in {args.csv}")
+
+    if args.series:
+        wanted = [r.strip() for r in args.series.split(",") if r.strip()]
+        unknown = [r for r in wanted if r not in dict(series)]
+        if unknown:
+            sys.exit(
+                f"plot_barriers: no {', '.join(unknown)} bar in {args.csv} "
+                f"(it has {', '.join(role for role, _ in series)})"
+            )
+        series = [(role, values) for role, values in series if role in wanted]
 
     blocks = []
     if groups:

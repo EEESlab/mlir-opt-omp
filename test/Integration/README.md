@@ -328,6 +328,27 @@ So the baseline is not a weak one to beat: it is exactly clang's, everywhere
 clang does not apply its own elision. What the pass adds is one barrier per
 parallel region on the spelling clang's front-end skips.
 
+For a figure that makes one point instead of showing everything, `--only`
+drops rows and `--series` drops bars:
+
+```sh
+# what the pass adds, on the spelling clang's front-end skips
+python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv barriers_split.pdf \
+  --runtime iomp --group-by pragma_form --only pragma_form=split
+
+# the same, cut to the comparison itself
+python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv barriers_vs_clang.pdf \
+  --runtime iomp --group-by pragma_form --only pragma_form=split --series clang,elim
+```
+
+The `combined` half is a tie — zero against zero — so dropping it costs the
+figure nothing and buys back half the x axis. Keep `--group-by` even with one
+value left: it is what writes the directive form under the axis, which is the
+caption a filtered figure needs to stay honest about what it left out. Legend
+totals follow the rows actually drawn, so the first reads `Clang (44)`,
+`Ours (44)`, `Ours + barrier elim (25)` — the baseline saying for itself that
+it is clang's, before the pass moves it.
+
 The rest matches the [speedup chart](#speedup-chart): `python3` + matplotlib,
 the local `.venv` picked up automatically, the extension deciding the format,
 and the script runnable by hand on a CSV already on disk.
