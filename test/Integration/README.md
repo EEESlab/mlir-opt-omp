@@ -572,6 +572,24 @@ See [PULP / gvsoc](#pulp--gvsoc-runtimepmsis) for what these drive.
 | `POLYBENCH_LFLAGS`| *empty* | extra link flags; running as root auto-adds `-DPOLYBENCH_LINUX_FIFO_SCHEDULER` and `-lc` |
 | `OMP_PLACES`      | `cores` | exported for the parallel runs              |
 | `OMP_PROC_BIND`   | `true`  | exported for the parallel runs              |
+| `OMP_WAIT_POLICY` | `ACTIVE` | keep idle workers spinning — see below     |
+| `KMP_BLOCKTIME`   | `infinite` | the same for iomp/libomp                 |
+| `GOMP_SPINCOUNT`  | `infinite` | the same for libgomp                     |
+
+The three wait-policy variables are there to make the *timing* repeatable, not
+to make it fast. Left at their defaults the runtime parks its workers once a
+wait exceeds the block time, and every later region entry then pays a wake-up
+syscall per thread — a cost that depends on how the timing happened to fall
+rather than on the code under test. Two runs of the **same binary** here
+disagreed by 88% on `durbin` and by a factor of ten on `trisolv`, while their
+sequential cells repeated to four decimal places and `3mm` — one big region —
+repeated to 0.05%. The kernels this ruins are exactly the fine-grained ones,
+which are also the ones a synchronisation optimisation shows up on.
+
+Spinning holds a core doing nothing while the region is closed, so it assumes
+the machine is yours for the duration. That is the assumption a benchmark run
+makes anyway, but it does mean numbers taken with these settings are not
+comparable with numbers taken without them.
 
 The strict FP flags are enabled by default and must match between ref and opt —
 without them FMA contraction and reordered reductions make iterative kernels

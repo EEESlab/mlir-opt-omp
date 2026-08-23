@@ -101,6 +101,20 @@ esac
 export OMP_PLACES="${OMP_PLACES:-cores}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 
+# Keep the worker threads spinning between regions instead of parking in the
+# kernel. Left to its default, the runtime parks them once the wait exceeds its
+# block time, and every later region entry pays a wake-up syscall per thread —
+# which is not a property of the code under test but of how the timing happened
+# to fall. It made the fine-grained kernels unmeasurable here: run to run, on
+# the *same binary*, durbin moved by 88% and trisolv by a factor of ten, while
+# their sequential cells repeated to four decimal places and 3mm (one big
+# region) repeated to 0.05%. Spinning costs a core doing nothing while the
+# region is closed, so it assumes the machine is yours for the run — which is
+# the assumption a benchmark makes anyway.
+export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-ACTIVE}"
+export KMP_BLOCKTIME="${KMP_BLOCKTIME:-infinite}"     # iomp/libomp
+export GOMP_SPINCOUNT="${GOMP_SPINCOUNT:-infinite}"   # libgomp
+
 # --- Root / FIFO scheduler handling ----------------------------------------
 # Running as root lets PolyBench use the FIFO scheduler for lower variance, but
 # it needs the define + an explicit libc link. Exposed as POLYBENCH_ROOT_CFLAGS
