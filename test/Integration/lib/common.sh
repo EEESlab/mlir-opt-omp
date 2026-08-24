@@ -57,11 +57,11 @@ OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp | pmsis (pulp/gvsoc)
 # Redundant team-barrier elimination (--omp-barrier-elim). Off by default so a
 # plain run is the baseline to compare against.
-BARRIER_ELIM="${BARRIER_ELIM:-0}"    # 0 | 1
+BARRIER_ELIM="${BARRIER_ELIM:-0}"    # 0 | 1 | both
 case "$BARRIER_ELIM" in
-    0|1) ;;
+    0|1|both) ;;
     *)
-        echo "ERROR: BARRIER_ELIM='$BARRIER_ELIM' is not 0 or 1." >&2
+        echo "ERROR: BARRIER_ELIM='$BARRIER_ELIM' is not 0, 1 or both." >&2
         exit 1
         ;;
 esac
@@ -72,14 +72,25 @@ esac
 # directory — into a paper, a slide deck — where the two configurations would
 # otherwise be two files with one name. All three empty when the pass is off,
 # so the baseline command line and paths stay exactly as they were.
+#
+# `both` is a mode rather than a setting, and only run_performance.sh knows
+# what to do with it: build the kernel both ways and time the two against each
+# other inside one run. FLAG stays empty here — that driver needs one build of
+# each, so it sets the flag around each compile itself.
 BARRIER_ELIM_FLAG=""
 BARRIER_ELIM_DIR_TAG=""
 BARRIER_ELIM_FILE_TAG=""
-if [ "$BARRIER_ELIM" = "1" ]; then
-    BARRIER_ELIM_FLAG="--omp-barrier-elim"
-    BARRIER_ELIM_DIR_TAG="-barrier-elim"
-    BARRIER_ELIM_FILE_TAG="_barrier-elim"
-fi
+case "$BARRIER_ELIM" in
+    1)
+        BARRIER_ELIM_FLAG="--omp-barrier-elim"
+        BARRIER_ELIM_DIR_TAG="-barrier-elim"
+        BARRIER_ELIM_FILE_TAG="_barrier-elim"
+        ;;
+    both)
+        BARRIER_ELIM_DIR_TAG="-barrier-ab"
+        BARRIER_ELIM_FILE_TAG="_barrier-ab"
+        ;;
+esac
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
 SUITE="${SUITE:-bundled}"            # bundled | full

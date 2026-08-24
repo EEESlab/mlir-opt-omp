@@ -422,6 +422,48 @@ barriers is usually worth a few percent, which `REPS=1` cannot resolve. Keep
 check the `[noisy]` warnings — a cell flagged there is measuring the machine,
 not the pass.
 
+### A/B in one run (`BARRIER_ELIM=both`)
+
+On a host runtime the two-run flow above has a problem that no number of `REPS`
+fixes: the two configurations are measured **hours apart**, and `REPS` only
+averages the noise *inside* a run. Between two runs on this machine the native
+cells — the same binary, untouched by the pass — moved by 6% in total and by
+far more on individual kernels, which is larger than the effect being looked
+for.
+
+`BARRIER_ELIM=both` measures the two configurations against each other inside
+one run instead:
+
+```sh
+BARRIER_ELIM=both SUITE=full ./run_performance.sh
+```
+
+Per kernel it builds `opt_par` twice, with and without the pass, then times
+them **alternately** — one repetition of each in turn, so the two are always
+seconds apart and anything the machine does lands on both. There is no native
+comparison and no sequential cell: they answer a different question, and the
+sequential build has no barriers at all (it is compiled without `-fopenmp`), so
+it is identical in the two configurations by construction. Two cells per kernel
+instead of four means the whole thing costs **half a normal run**, against the
+two full runs the split flow needs.
+
+Output goes to `results/<runtime>-barrier-ab/results_performance_barrier-ab.csv`:
+
+```
+kernel;base_par_cyc;base_sd;elim_par_cyc;elim_sd;delta_pct;delta_sd_pct
+```
+
+`delta_pct` is the saving, positive when the pass won, and `delta_sd_pct` is
+its error bar — the two standard deviations propagated. **A saving smaller than
+its own error bar is not a result**, and the summary counts how many kernels
+clear twice their error rather than reporting a single headline number.
+`PLOT=true` draws it ([`lib/plot_delta.py`](lib/plot_delta.py)): one bar per
+kernel with its error bar, and the ones that do not clear it drawn in grey.
+
+Host runtimes only. On `pmsis` gvsoc is deterministic — `REPS` does not even
+apply — so two ordinary runs already compare exactly, and the driver says so
+rather than pretending the mode is needed.
+
 ## PULP / gvsoc (`RUNTIME=pmsis`)
 
 The same two drivers also target PULP/GAP8 through the **gvsoc** simulator.
@@ -524,7 +566,7 @@ a warning and fall back to `PATH`.
 | `KERNELS` | *empty* | explicit space-separated kernel list; overrides `SUITE`, paths resolved against `$POLYBENCH` |
 | `DATASET` | `MINI_DATASET` for correctness, `LARGE_DATASET` for performance, always `MINI_DATASET` on `pmsis` unless set | PolyBench dataset size macro |
 | `THREADS` | `16`    | thread count for the parallel runs; ignored on `pmsis` |
-| `BARRIER_ELIM` | `0` | `1` adds `--omp-barrier-elim` to the pipeline and writes to `results/<runtime>-barrier-elim/`. Off by default so a plain run is the baseline to compare against |
+| `BARRIER_ELIM` | `0` | `1` adds `--omp-barrier-elim` to the pipeline and writes to `results/<runtime>-barrier-elim/`. Off by default so a plain run is the baseline to compare against. `both` (perf driver, host only) builds the kernel each way and times the two against each other — see [Measuring the effect](#measuring-the-effect) |
 
 ### Performance only (`run_performance.sh`)
 
