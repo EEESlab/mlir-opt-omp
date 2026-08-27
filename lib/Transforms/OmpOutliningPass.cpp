@@ -1297,6 +1297,41 @@ static Value loopScratchSlot(OpBuilder &builder, Operation *anchor,
   return LLVM::AllocaOp::create(builder, loc, ptrT, elemTy, one);
 }
 
+// The same rule, applied to the allocas we did not write.
+//
+// The front-end puts a local's slot in the scope that declares it, so a body
+// with a sequential loop around the work-sharing loop arrives with allocas
+// inside that loop. An IR pipeline normally promotes them and the question
+// never comes up — but the PULP path runs `opt` with no passes at all
+// (PULP_OPT_FLAGS is empty by default) and llc's -O3 is codegen only, so
+// nothing does, and they reach the assembly as stack pointer adjustments that
+// repeat every iteration.
+//
+// Moving a constant-size alloca to the top of the entry block is what LLVM's
+// own inliner does with a callee's frame: the slot is one slot however many
+// times control reaches it. A variable-size alloca really is dynamic, so it is
+// left where it stands.
+static void hoistStaticAllocas(func::FuncOp fn) {
+  if (fn.getBody().empty()) return;
+  Block &entry = fn.getBody().front();
+
+  SmallVector<LLVM::AllocaOp> movable;
+  fn.getBody().walk([&](LLVM::AllocaOp alloca) {
+    if (alloca->getBlock() == &entry) return;
+    if (alloca.getArraySize().getDefiningOp<LLVM::ConstantOp>())
+      movable.push_back(alloca);
+  });
+
+  for (auto alloca : movable) {
+    // The size constant moves first, or the alloca would read a value defined
+    // after it. A constant takes no operands, so hoisting one is always safe.
+    auto size = alloca.getArraySize().getDefiningOp<LLVM::ConstantOp>();
+    if (size->getBlock() != &entry)
+      size->moveBefore(&entry, entry.begin());
+    alloca->moveAfter(size);
+  }
+}
+
 static void lowerWsloop(omp::WsloopOp wsOp,
                         ModuleOp module,
                         const dsl::LoweringPlan &plan) {
@@ -1687,6 +1722,11 @@ struct OmpOutliningPass
 
       lowerWsloop(wsOp, module, *plan);
     }
+
+    // Step 3: every alloca to the entry block of the function that holds it.
+    // Last, so it sees both what the front-end left inside a loop and anything
+    // the two steps above added.
+    module.walk([](func::FuncOp fn) { hoistStaticAllocas(fn); });
 
     // The trailing team barrier of a parallel region, redundant with the join
     // of the fork call, is not dropped here: that rule lives in
