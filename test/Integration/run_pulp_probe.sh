@@ -37,6 +37,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The probe runs on the cluster, so the SDK and the toolchain are wanted.
 RUNTIME="${RUNTIME:-pmsis}"
+# Stream by default, the opposite of the other drivers. A probe is watched, not
+# summarised: the thing it is asked about is where it stops, and a probe that
+# stops never reaches the code that would print the log at the end. Set
+# PULP_VERBOSE=0 to send it all to the log instead.
+PULP_VERBOSE="${PULP_VERBOSE:-1}"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 

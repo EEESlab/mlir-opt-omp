@@ -31,8 +31,10 @@
  * which is the comparison that makes a stage failure ours.
  */
 
+/* No pmsis.h: under opt_par the front-end is ClangIR, which is not given the
+   SDK include path — the kernels do not include it either, they just define
+   cluster_main. Nothing here needs it. */
 #include <stdio.h>
-#include "pmsis.h"
 
 /* seidel-2d at MINI. */
 #define PB_TSTEPS 2

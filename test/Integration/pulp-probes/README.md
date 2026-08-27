@@ -54,6 +54,39 @@ the probe that did not come back.**
 | hangs in `[5]`, `[2]`–`[4]` clean | The chunk arithmetic is wrong for seidel's bounds specifically. `reached t=/w=` says where. |
 | `=== all probes returned ===` | The team barrier is not the problem. Look at the ELF and the stack next: the outlined body is larger than any other kernel's, and the cluster gives each core a small stack. |
 
+## shape-1.c … shape-5.c
+
+One OpenMP shape per binary, walking from the shape twenty-nine kernels use to
+seidel-2d's. They are two lines each over `shape-stages.h`, which holds the
+bodies and picks one with `PROBE_STAGE`.
+
+```
+1  parallel { for }                          29 kernels use this
+2  parallel { for; for }                     a real barrier between them
+3  parallel { for(k) { for } }                wsloop inside a sequential loop
+4  parallel { for(t) { for(w) { for } } }     seidel's nesting
+5  as 4, bounds computed inside the region    seidel-2d exactly
+```
+
+```sh
+for n in 1 2 3 4 5; do
+  CELL=opt_par ./run_pulp_probe.sh pulp-probes/shape-$n.c
+done
+```
+
+**Why one per binary and not one probe with five stages.** `omp-shape-probe.c`
+is that probe, and it works under `ref_par` and `opt_seq` — which is how we know
+the pipeline and `printf` are fine. Under `opt_par` it printed *nothing at all*,
+not even the first line, which executes before any pragma: on gvsoc the console
+output only reaches the log when the program exits, so a run that hangs loses
+everything it had already printed. The progression cannot localise a hang on
+this platform. Here the signal is whether the run comes back at all — `stage N
+ok` means that shape survives, an empty log means that is where it stops.
+
+A `-DPROBE_STAGE=n` would have been tidier, but `PULP_POLYBENCH_DEFS` reaches
+the ClangIR front-end and not the harness Makefile, so the `ref_par` control
+would be built without it.
+
 ### What is already excluded
 
 Checked on the host before writing this, so the probe does not re-ask them:
