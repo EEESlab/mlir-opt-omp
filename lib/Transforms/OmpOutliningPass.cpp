@@ -1264,6 +1264,39 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
 // 2. WSLOOP LOWERING — driven by DSL plan
 // ---------------------------------------------------------------------------
 
+// One scratch slot for the loop, placed where a function's frame is fixed.
+//
+// An alloca outside the entry block is a *dynamic* stack allocation: it moves
+// the stack pointer, and nothing gives it back before the function returns.
+// Emitting these at the wsloop puts them inside whatever encloses it, and when
+// that is a sequential loop — `parallel { for (k) { omp for } }`, which is how
+// seidel-2d is written — the stack pointer walks down once per iteration and
+// never comes back up.
+//
+// A host absorbs it: an eight-megabyte thread stack swallows a few kilobytes
+// and the program merely runs. A PULP cluster core has a couple of kilobytes,
+// so the frame overruns, the return address goes with it, and the team returns
+// to nowhere — gvsoc reports every worker fetching from the same rising
+// nonsense address, in lockstep, forever.
+//
+// These slots are one per loop and not one per iteration, so the entry block is
+// where they belong regardless. The count constant is created alongside them:
+// left behind at the wsloop it would not dominate its own use.
+static Value loopScratchSlot(OpBuilder &builder, Operation *anchor,
+                             Location loc, Type ptrT, Type elemTy) {
+  OpBuilder::InsertionGuard guard(builder);
+
+  // Outlined bodies are func.func. A wsloop that reaches here without one
+  // keeps the old placement rather than being moved somewhere unverified.
+  if (auto fn = anchor->getParentOfType<func::FuncOp>())
+    if (!fn.getBody().empty())
+      builder.setInsertionPointToStart(&fn.getBody().front());
+
+  Value one = LLVM::ConstantOp::create(builder, loc, builder.getI64Type(),
+                                       builder.getI64IntegerAttr(1));
+  return LLVM::AllocaOp::create(builder, loc, ptrT, elemTy, one);
+}
+
 static void lowerWsloop(omp::WsloopOp wsOp,
                         ModuleOp module,
                         const dsl::LoweringPlan &plan) {
@@ -1328,20 +1361,19 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   }
 
   auto ptrT = ptrTy(ctx);
-  Value one64 = LLVM::ConstantOp::create(builder, loc,
-    IntegerType::get(ctx, 64), IntegerAttr::get(IntegerType::get(ctx,64), 1));
   Value zero32 = LLVM::ConstantOp::create(builder, loc, iterTy,
     IntegerAttr::get(iterTy, 0));
   Value one32 = LLVM::ConstantOp::create(builder, loc, iterTy,
     IntegerAttr::get(iterTy, 1));
 
-  // Allocate plb, pub, pstride, plast.
+  // Allocate plb, pub, pstride, plast — in the entry block, see
+  // loopScratchSlot.
   // plb/pub/plast are in/out: initialized here, overwritten by the runtime.
   // pstride is pure output: NOT initialized — runtime writes the stride value.
-  Value plb     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value pub     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value pstride = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value plast   = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
+  Value plb     = loopScratchSlot(builder, wsOp, loc, ptrT, iterTy);
+  Value pub     = loopScratchSlot(builder, wsOp, loc, ptrT, iterTy);
+  Value pstride = loopScratchSlot(builder, wsOp, loc, ptrT, iterTy);
+  Value plast   = loopScratchSlot(builder, wsOp, loc, ptrT, iterTy);
 
   // Convert exclusive upper bound to inclusive last-iteration index.
   // omp.loop_nest uses exclusive ub: trip = (ub - lb) / step iterations.
@@ -1499,8 +1531,10 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   parentRegion.getBlocks().insertAfter(loopHeader->getIterator(), loopBody);
   parentRegion.getBlocks().insertAfter(loopBody->getIterator(), loopLatch);
 
+  // The induction slot goes to the entry block for the same reason the four
+  // above do; only the store that arms it stays here, where the loop starts.
+  Value pi = loopScratchSlot(builder, wsOp, loc, ptrT, iterTy);
   builder.setInsertionPointToEnd(preBlock);
-  Value pi = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
   LLVM::StoreOp::create(builder, loc, loopStart, pi);
   LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
