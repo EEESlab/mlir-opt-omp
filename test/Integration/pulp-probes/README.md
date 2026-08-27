@@ -24,10 +24,18 @@ barrier fires once per region entry. That is the difference the probe attacks.
 
 ### Running it
 
+The drivers source the SDK environment and pass `platform=` themselves
+(`lib/pulp.sh`); running `make` by hand means doing both:
+
 ```sh
+source $PULP_SDK_ENV          # e.g. $GAP_SDK/configs/gap8_v3.sh — sets RULES_DIR
 cd $PULP_APP_DIR
-make clean all run KERNEL_SRC=<repo>/test/Integration/pulp-probes/barrier-probe.c
+make clean all run platform=gvsoc \
+  KERNEL_SRC=<repo>/test/Integration/pulp-probes/barrier-probe.c
 ```
+
+Without the `source`, `RULES_DIR` is empty and the harness Makefile fails on
+`include /pmsis_rules.mk`.
 
 No `OMP_NATIVE` and no `OMP_OPT`: the probe *is* the kernel, and wants neither
 gcc's OpenMP runtime nor a `kernel.o`.
