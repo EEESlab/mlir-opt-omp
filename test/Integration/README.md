@@ -275,8 +275,11 @@ SUITE=full ./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_nat
 ```
 
 Both sides are counted in LLVM IR after `-O3`, so neither is measured at a
-kinder stage than the other. On PolyBench/MINI the totals are clang 44, our
-pipeline 59 without the pass and 25 with it: **19 fewer than clang, 43%**. The
+kinder stage than the other. On PolyBench the totals are clang 45, our pipeline
+59 without the pass and 26 with it: **19 fewer than clang, 42%**. The dataset
+does not enter into it — `MINI` and `LARGE` give the same table row for row, on
+every column including gcc's, since the macros move loop bounds and the count is
+static. The
 `pragma_form` column explains the whole delta. clang elides a work-sharing
 loop's trailing barrier only for the *combined* `#pragma omp parallel for`; on
 the split `parallel { ... for ... }` it emits it, and there our baseline
@@ -285,16 +288,46 @@ reasons about structure on the `omp` dialect rather than about which directive
 was written, so it covers both spellings.
 
 The three LLVM columns are iomp, so they speak one ABI. **gcc gets a column of
-its own, counted before `-O3`** (`gcc -fopenmp -O0 -S`, counting
-`call GOMP_barrier`), because at `-O3` gcc clones loops and each copy carries
-its call site along: over this suite 27 becomes 36, gemver alone 3 becomes 6.
-That number would measure duplication as much as synchronisation. gcc decides
-the elision in the front-end, so it is already applied at `-O0`; our own count
-does not move between stages — the same 59/25 in MLIR and after `-O3` — so the
-comparison holds, but say which stage when you quote it.
+its own, counted before `-O3`** (`gcc -fopenmp -O0 -S`, counting `GOMP_barrier`
+call sites), because from `-O1` on gcc spreads the same barriers over more call
+sites than the program needs: over this suite 28 at `-O0` becomes 43 at `-O3`,
+gemver alone 3 becomes 7. That number would measure duplication as much as
+synchronisation. gcc decides the elision in the front-end, so it is already
+applied at `-O0`; our own count does not move between stages — the same 59/25
+in MLIR and after `-O3` — so the comparison holds, but say which stage when you
+quote it.
+
+**`run_gcc_stage_check.sh` is that stage choice, checked rather than asserted:**
+
+```sh
+SUITE=full ./run_gcc_stage_check.sh   # -> results/gcc-stage/results_gcc_stage_check.csv
+```
+
+It counts gcc's barriers at `-O0`, `-O1`, `-O2` and `-O3`, then again at each
+level with `-fno-thread-jumps`, and asserts that the second set equals the
+`-O0` count **kernel by kernel**. It does, on all 30: 28 at every level. So one
+pass accounts for the whole 28 → 43 — jump threading splits the path where a
+thread's chunk comes out empty, and the split path carries its own copy of the
+barrier sequence. No execution gains a barrier. That makes `-O0` not the
+convenient stage but the only one that measures the elision instead of the CFG
+shape, and the script exits non-zero if a future gcc breaks the invariant.
+
+It is *not* loop cloning: `GCC_STRICT_FP` already turns the vectoriser off, so
+no kernel gets a vector and a scalar copy. Phase 1 of the script is a
+self-contained reproducer, [`gcc-stage/jump-threading.c`](gcc-stage/jump-threading.c),
+that needs nothing but a gcc with OpenMP — four `omp for` in one region, 3 call
+sites at `-O0`, 6 from `-O1`, 3 again with `-fno-thread-jumps`:
+
+```sh
+gcc -fopenmp -O3 -S gcc-stage/jump-threading.c -o - | grep -c GOMP_barrier
+```
+
+Count `GOMP_barrier`, not `call GOMP_barrier`: from `-O2` gcc emits the last
+barrier of a region as a tail call, which prints as `jmp` and which an anchor
+on `call` silently drops — 6 of the 43 at `-O3`, and none at `-O0`.
 
 What that column says is worth knowing before quoting the clang one: **gcc
-performs this elision too**, and lands at 27 where the pass lands at 25, kernel
+performs this elision too**, and lands at 28 where the pass lands at 26, kernel
 for kernel on 28 of 30. The two compilers miss it in different places — clang
 on the `split` spelling, gcc on a region that holds a declaration, which puts
 the loop inside a block and out of reach of its check (add one line to
