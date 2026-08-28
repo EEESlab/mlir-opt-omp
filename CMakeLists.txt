@@ -15,7 +15,7 @@ include(AddMLIR)
 set(LLVM_LIT_ARGS "-sv --show-xfail" CACHE STRING "Default options for lit")
 
 # The binary goes in the build root, not build/bin: that is where OMP_TOOL_BIN
-# and the quick-compile/ scripts look for it.
+# looks for it.
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR})
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
 

@@ -26,5 +26,4 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
-# Note: build artefacts of the helper trees are ignored by their own
-# .gitignore files — quick-compile/, quick-compile/pulp/, test/Integration/.
+# Note: build artefacts of test/Integration/ are ignored by its own .gitignore.

@@ -117,7 +117,7 @@ struct BranchStmt {
 };
 struct LetStmt       { LetDecl decl; };
 // `let <name> = call "<callee>"(<args>);` — binds <name> to the call's SSA
-// result so later statements can reference it (see docs/dsl-result-binding-proposal.md).
+// result so later statements can reference it.
 struct LetCallStmt   { std::string name; CallAction call; };
 
 // ===========================================================================

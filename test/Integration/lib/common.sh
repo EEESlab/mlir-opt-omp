@@ -33,7 +33,7 @@ fi
 
 # --- Config ------------------------------------------------------------------
 # Two files, both optional and both git-ignored:
-#   <repo>/local.env      where the tools are — shared with quick-compile/
+#   <repo>/local.env      where the tools are
 #   Integration/run.env   what to run
 # The shared loader handles both, plus the tool defaults, PATH and the sanity
 # checks. run.env wins over local.env, and anything already in the environment

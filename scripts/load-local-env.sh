@@ -3,8 +3,8 @@
 # load-local-env.sh — resolve the per-machine tool paths.
 #
 # Sourced by everything that drives the compiler pipeline (the test/Integration
-# drivers and the quick-compile/ scripts) so they all find the tools the same
-# way. Not meant to be executed on its own.
+# drivers) so they all find the tools the same way. Not meant to be executed on
+# its own.
 #
 #   OMP_REPO_ROOT=/path/to/repo
 #   . "$OMP_REPO_ROOT/scripts/load-local-env.sh" [extra-config-file ...]
@@ -38,7 +38,7 @@ WARN_SUPPRESS PULP_APP_DIR PULP_PLATFORM PULP_MAKE PULP_MAKE_ARGS PULP_OPT
 PULP_LLC PULP_OPT_FLAGS PULP_LLC_FLAGS PULP_BUILD_BIN PULP_POLYBENCH_DEFS
 PULP_SDK_ENV PULP_TOOLCHAIN_BIN PULP_VERBOSE"
 
-# Self-contained so the quick-compile scripts do not have to define colours.
+# Self-contained so the sourcing scripts do not have to define colours.
 # An empty label prints an indented continuation line.
 __omp_msg() {   # $1 = label, rest = text
     local label="$1"; shift

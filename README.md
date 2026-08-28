@@ -103,8 +103,7 @@ LLVM **install** prefix, if you installed it. Everything resolves through
 `LLVM_LIBRARY_DIR`, so both work unchanged.
 
 Keep the build directory named `build`: it is what `local.env.example` and the
-setups in [`docs/setups/`](docs/setups/) use for `OMP_TOOL_BIN`, and what the
-`quick-compile/` scripts fall back to.
+setups in [`docs/setups/`](docs/setups/) use for `OMP_TOOL_BIN`.
 
 If `<LLVM_DIR>` is an install prefix and its build tree is gone, CMake warns
 here that it found no `lit` and the regression suite will not run. Either
@@ -130,7 +129,8 @@ cmake --build build --target check-omp
 different runtimes.
 
 ```sh
-build/mlir-opt-omp quick-compile/test.mlir --omp-lower-dsl=rules.dsl \
+build/mlir-opt-omp test/Regression/wsloop/schedule-static/schedule-static-iomp.mlir \
+  --omp-lower-dsl=rules.dsl \
   --omp-to-omp-lower --omp-outline --omp-lower-plan \
   --omp-lower-runtime=iomp | grep 'call @'
 ```
@@ -139,7 +139,7 @@ build/mlir-opt-omp quick-compile/test.mlir --omp-lower-dsl=rules.dsl \
 call @__kmpc_for_static_init_4(...)
 call @__kmpc_for_static_fini(...)
 call @__kmpc_barrier(...)
-%6 = call @__kmpc_global_thread_num(...)
+llvm.call @sink(...)
 llvm.call @__kmpc_fork_call(...)
 ```
 
@@ -147,29 +147,27 @@ Change one word — `--omp-lower-runtime=libgomp` — and the same loop comes ou
 against the GCC runtime instead:
 
 ```mlir
-%17 = call @omp_get_thread_num() : () -> i32
-%27 = call @omp_get_num_threads() : () -> i32
+%15 = call @omp_get_thread_num() : () -> i32
+%16 = call @omp_get_num_threads() : () -> i32
 call @GOMP_barrier() : () -> ()
+llvm.call @sink(...)
 call @GOMP_parallel(...)
 ```
 
+`@sink` is the loop body of that test case — everything around it is what the
+rule file put there.
 
-**3. Run binary.** Takes the same MLIR to a linked executable and checks the
-numbers it prints. Besides `gcc` and `libgomp` it drives `mlir-opt`,
-`mlir-translate`, `opt` and `llc`, which it locates through `local.env` — so
-either copy the template first or have them on `PATH`:
+**3. Run it end to end.** The suite above checks IR. The integration drivers
+take a real PolyBench kernel through clang→CIR→`mlir-opt-omp`→binary and compare
+the numbers it prints against the same kernel built on the native runtime. They
+need the full toolchain, which they locate through `local.env`:
 
 ```sh
-cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN
-quick-compile/compile-from-mlir.sh
+cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN, INC_OMP
+cd test/Integration && ./run_correctness.sh
 ```
 
-```
-PASS (libgomp): ./test printed 11..110
-```
-
-From here: [Usage](#usage) for the pass pipeline,
-[`quick-compile/`](quick-compile/README.md) for the C front-end pipelines, and
+From here: [Usage](#usage) for the pass pipeline, and
 [`test/Integration/`](test/Integration/README.md) for the PolyBench
 correctness and performance suites.
 
@@ -234,8 +232,8 @@ llc -relocation-model=pic -filetype=obj s4.ll -o test.o
 clang -O3 -fopenmp test.o main.o -o test
 ```
 
-Runnable versions of this, per runtime, are in
-[`quick-compile/`](quick-compile/README.md)
+A runnable version of this, per runtime, is what the integration drivers do —
+see [`test/Integration/`](test/Integration/README.md).
 
 ## Testing
 
@@ -261,9 +259,9 @@ cd test/Integration
 RUNTIME=libgomp ./run_performance.sh
 ```
 
-`local.env` holds the per-machine tool paths and is git-ignored; the
-`quick-compile/` scripts read the same file. Ready-made ones for the machines
-this project is developed on are in [`docs/setups/`](docs/setups/). What the
+`local.env` holds the per-machine tool paths and is git-ignored. Ready-made ones
+for the machines this project is developed on are in
+[`docs/setups/`](docs/setups/). What the
 tests *run* is separate and optional
 ([`test/Integration/run.env.example`](test/Integration/run.env.example)).
 
@@ -295,9 +293,8 @@ docs/
   lowering-specs/            lowering specifications (ident_t parity, omp.task)
                              and DSL design notes
   setups/                    ready-made local.env files, per dev machine
-quick-compile/               one-shot pipeline scripts for a small kernel
 scripts/                     load-local-env.sh — the tool-path resolution the
-                             test drivers and quick-compile/ share
+                             test drivers share
 ```
 
 The sources behind it:

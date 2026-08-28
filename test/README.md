@@ -182,7 +182,3 @@ Fully parametrized via env vars / `run.env` — see [`Integration/README.md`](In
 These depend on the full toolchain (clang/clangir, cir-opt, mlir tools, the
 OpenMP runtime libraries) and a PolyBench checkout, so they are slower and
 environment-dependent; keep them for whole-pipeline / numerical validation.
-
-For a quick one-off check of the pipeline on a small C file — outside either
-suite — see the per-runtime `compile-*.sh` scripts in
-[`quick-compile/`](../quick-compile/).

@@ -32,9 +32,9 @@
 # path where a thread's chunk comes out empty, and the split path carries its
 # own copy of the barrier sequence. Over this suite the total goes 28 at -O0 to
 # 43 at -O3, gemver alone 3 -> 7 — and `-O3 -fno-thread-jumps` puts every kernel
-# back on its -O0 number exactly. run_gcc_stage_check.sh checks that, and is
-# what this stage choice rests on: -O0 is not the convenient stage, it is the
-# one that measures the elision instead of the CFG shape.
+# back on its -O0 number exactly. That is what this stage choice rests on: -O0
+# is not the convenient stage, it is the one that measures the elision instead
+# of the CFG shape.
 #
 # (Not loop cloning: $GCC_STRICT_FP already turns the vectoriser off, so no
 # kernel here gets a vector and a scalar copy.)
@@ -130,7 +130,7 @@ build_gcc() {   # $1 = source, $2 = output .s
 # Tail calls count: from -O2 gcc emits the last barrier of a region as
 # `jmp GOMP_barrier`, which an anchor on `call` alone drops. At -O0, the stage
 # this column is taken at, there are none — but the regex has to be right for
-# anyone who reruns it at another level, and for run_gcc_stage_check.sh.
+# anyone who reruns it at another level.
 count_gcc_barriers() {   # $1 = .s file
     grep -cE '\b(call|jmp)\b.*GOMP_barrier' "$1" || true
 }

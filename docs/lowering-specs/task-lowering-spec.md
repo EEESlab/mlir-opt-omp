@@ -84,10 +84,8 @@ The entry must load `shareds` from `task_t` before unpacking captures. This does
 ### 2.3 pmsis — embedded cluster
 
 PMSIS provides the fork/barrier team model (`ext_pi_cl_team_fork`,
-`ext_pi_cl_team_barrier` — shims over the PMSIS API, see
-[`quick-compile/pulp/interface-adapter.c`](../quick-compile/pulp/interface-adapter.c))
-but **no standard
-deferred-task API**. A task mapping
+`ext_pi_cl_team_barrier` — shims over the PMSIS API, provided and linked by the
+PULP harness) but **no standard deferred-task API**. A task mapping
 must be defined explicitly (e.g. a custom `ext_pi_cl_task_push` / wait pair, or
 declaring tasks unsupported on this target). No invented API is assumed here.
 
@@ -182,10 +180,9 @@ Symbolic tokens, all bound by the outlining pass and resolved by the plan pass:
 | `shareds_size` | i64 `sizeof(capture struct)` |
 | `task` | the **result** of `__kmpc_omp_task_alloc`, bound by the `let` |
 
-**Result binding (Approach B).** `let <name> = call …` binds the call's SSA
-result under `%<name>`; every later argument naming it resolves to that value.
-The rationale, and the implicit alternative it replaced, are in
-[dsl-result-binding-proposal.md](dsl-result-binding-proposal.md).
+**Result binding.** `let <name> = call …` binds the call's SSA result under
+`%<name>`; every later argument naming it resolves to that value. It was chosen
+over an implicit `task` token so that nothing in the DSL is named by convention.
 
 **`if` clause.** iomp has no boolean parameter for it, so the clause becomes a
 `branch` on the runtime value: true schedules the task deferred, false runs it
@@ -317,9 +314,6 @@ struct). It cannot share the `void(void*)` closure path. Concretely:
 - `ident` / `global_tid` are resolved on demand by the plan pass (default ident +
   a memoised `__kmpc_global_thread_num`), the same resolve-on-reference model
   parallel/barrier/wsloop use — no `emit` declaration anywhere.
-
-See [dsl-result-binding-proposal.md](dsl-result-binding-proposal.md) for how the
-`let = call` binding was chosen over an implicit `task` token.
 
 ### 5.4 pmsis (planned)
 

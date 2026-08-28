@@ -68,7 +68,7 @@ it changes:
 
 | File | Holds | Required? |
 |---|---|---|
-| [`local.env`](../../local.env.example) (repo root) | where the tools are | yes — and shared with `quick-compile/` |
+| [`local.env`](../../local.env.example) (repo root) | where the tools are | yes |
 | `run.env` (here) | what the tests run | no, everything has a default |
 
 So the setup is one file:
@@ -297,30 +297,19 @@ applied at `-O0`; our own count does not move between stages — the same 59/25
 in MLIR and after `-O3` — so the comparison holds, but say which stage when you
 quote it.
 
-**`run_gcc_stage_check.sh` is that stage choice, checked rather than asserted:**
-
-```sh
-SUITE=full ./run_gcc_stage_check.sh   # -> results/gcc-stage/results_gcc_stage_check.csv
-```
-
-It counts gcc's barriers at `-O0`, `-O1`, `-O2` and `-O3`, then again at each
-level with `-fno-thread-jumps`, and asserts that the second set equals the
-`-O0` count **kernel by kernel**. It does, on all 30: 28 at every level. So one
-pass accounts for the whole 28 → 43 — jump threading splits the path where a
-thread's chunk comes out empty, and the split path carries its own copy of the
-barrier sequence. No execution gains a barrier. That makes `-O0` not the
+That stage choice was checked, not assumed. Counting gcc's barriers at `-O0`,
+`-O1`, `-O2` and `-O3`, then again at each level with `-fno-thread-jumps`, puts
+every one of the 30 kernels back on its `-O0` number exactly: 28 at every level.
+So one pass accounts for the whole 28 → 43 — jump threading splits the path
+where a thread's chunk comes out empty, and the split path carries its own copy
+of the barrier sequence. No execution gains a barrier. That makes `-O0` not the
 convenient stage but the only one that measures the elision instead of the CFG
-shape, and the script exits non-zero if a future gcc breaks the invariant.
+shape.
 
 It is *not* loop cloning: `GCC_STRICT_FP` already turns the vectoriser off, so
-no kernel gets a vector and a scalar copy. Phase 1 of the script is a
-self-contained reproducer, [`gcc-stage/jump-threading.c`](gcc-stage/jump-threading.c),
-that needs nothing but a gcc with OpenMP — four `omp for` in one region, 3 call
-sites at `-O0`, 6 from `-O1`, 3 again with `-fno-thread-jumps`:
-
-```sh
-gcc -fopenmp -O3 -S gcc-stage/jump-threading.c -o - | grep -c GOMP_barrier
-```
+no kernel gets a vector and a scalar copy. Four `omp for` in one region are
+enough to see the effect on its own — 3 call sites at `-O0`, 6 from `-O1`, 3
+again with `-fno-thread-jumps`.
 
 Count `GOMP_barrier`, not `call GOMP_barrier`: from `-O2` gcc emits the last
 barrier of a region as a tail call, which prints as `jmp` and which an anchor
@@ -525,9 +514,7 @@ cross-compiles the kernel to
 from the host tools.
 
 The pmsis rules emit calls to a small `ext_pi_*` shim layer over the PMSIS
-API (fork/barrier/core-id); the harness provides and links those shims. A
-reference implementation is kept at
-[`quick-compile/pulp/interface-adapter.c`](../../quick-compile/pulp/interface-adapter.c).
+API (fork/barrier/core-id); the harness provides and links those shims.
 
 Differences from the native runtimes:
 
