@@ -14,7 +14,11 @@
 //
 // An implicit barrier is never emitted directly: it is removed by setting
 // `nowait` on the omp.wsloop, which is the condition every runtime's wsloop
-// rule already guards its barrier call with (`when not nowait => call ...`).
+// rule already keys its closing call on.  Usually that is a barrier call the
+// rule guards with `when not nowait`; libgomp's dynamic schedule instead picks
+// between GOMP_loop_end and GOMP_loop_end_nowait, since the work-share has to be
+// released either way and only the barrier inside is what nowait drops.  Either
+// shape reads the same flag, so this pass says nothing about which.
 //
 // ASSUMES a parallel region joins its team on the way out: the fork call does
 // not return until every thread has finished.  The two rules that drop a

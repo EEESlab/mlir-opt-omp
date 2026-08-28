@@ -25,7 +25,7 @@ ready for `mlir-translate` and the LLVM back-end.
 |---|---|---|---|
 | `omp.parallel` | ✅ `__kmpc_fork_call` | ✅ `GOMP_parallel` | ✅ `ext_pi_cl_team_fork` |
 | `omp.barrier` | ✅ `__kmpc_barrier` | ✅ `GOMP_barrier` | ✅ `ext_pi_cl_team_barrier` |
-| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds | ✅ computed thread bounds |
+| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4`<br>✅ dynamic — `__kmpc_dispatch_init_4`/`_next_4` | ✅ static — computed thread bounds<br>✅ dynamic — `GOMP_loop_dynamic_start`/`_next` | ✅ static — computed thread bounds |
 | `omp.task` | ⏳ planned | ✅ `GOMP_task` | ⏳ API to be defined |
 
 
@@ -318,7 +318,25 @@ only `LLVMSupport`), `MLIROmpLowering` (the dialect) and
 To add a construct or a runtime, start from [`rules.dsl`](rules.dsl): each
 `runtime` block declares its constructs, and each construct its
 `capture_strategy` — the sole ABI selector, which also fixes the outlined
-function's signature — and its `pre`/`invoke`/`post` blocks. A
+function's signature — and its blocks. A block is any name followed by `{ ... }`
+and says *when* its calls run: `pre`, `invoke` and `post` around the construct,
+and for a work-sharing loop whose iterations the runtime hands out a chunk at a
+time, `first_chunk` and `next_chunk` around each chunk. `next_chunk` is what
+makes a loop chunked; `first_chunk` is only for a runtime whose opening call
+differs from the repeat one, as libgomp's does.
+
+Such a loop also has three properties for the shape of its dispatch ABI. Each
+defaults to what iomp's `__kmpc_dispatch_*_4` does, so a runtime that agrees
+declares none of them, and a value none of them understands is an error rather
+than a silent fallback:
+
+| property | default | says |
+|---|---|---|
+| `chunk_index` | the induction variable's type | width of the bound slots and of the values passed by value (`i64` for libgomp, which is `long`-based whatever the loop is) |
+| `chunk_result` | `i32` | what the acquisition call answers with (`i8` for a C `_Bool`) |
+| `chunk_bound` | `inclusive` | whether the upper bound written into the slot is the last valid iteration or the one past it |
+
+A
 change there is picked up at run time — no rebuild needed — which makes it easy
 to iterate with a regression test. Constructs whose lowering needs more than the
 DSL expresses (new `emit` primitives, a different outline shape) also require

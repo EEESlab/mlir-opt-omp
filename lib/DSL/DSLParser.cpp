@@ -24,7 +24,11 @@ using llvm::inconvertibleErrorCode;
 
 enum class TK {
   // Keywords
-  RUNTIME, CONSTRUCT, WHEN, OTHERWISE, PRE, INVOKE, POST,
+  // pre/invoke/post are deliberately NOT keywords: a block is any identifier
+  // followed by '{', which is what lets a construct declare first_chunk /
+  // next_chunk without a token of their own.  The evaluator is what rejects a
+  // name it has no meaning for.
+  RUNTIME, CONSTRUCT, WHEN, OTHERWISE,
   LET, CALL, EMIT, HAS, AND, OR, NOT, TRUE, FALSE, BRANCH,
   // Punctuation
   LBRACE, RBRACE, LPAREN, RPAREN, LBRACKET, RBRACKET,
@@ -119,8 +123,7 @@ class Lexer {
     static const std::unordered_map<std::string, TK> kw = {
       {"runtime",   TK::RUNTIME},   {"construct", TK::CONSTRUCT},
       {"when",      TK::WHEN},      {"otherwise", TK::OTHERWISE},
-      {"pre",       TK::PRE},       {"invoke",    TK::INVOKE},
-      {"post",      TK::POST},      {"let",       TK::LET},
+      {"let",       TK::LET},
       {"call",      TK::CALL},      {"emit",      TK::EMIT},
       {"has",       TK::HAS},       {"and",       TK::AND},
       {"or",        TK::OR},        {"not",       TK::NOT},
@@ -194,6 +197,11 @@ class Parser {
 
   const Token &cur() const { return toks[pos]; }
   bool at(TK k) const { return cur().kind == k; }
+  // One-token lookahead, for the places where the token after the current one
+  // decides how to read it (an identifier opening a block vs a property).
+  bool at(TK k, size_t off) const {
+    return pos + off < toks.size() && toks[pos + off].kind == k;
+  }
 
   Expected<Token> expect(TK k) {
     if (!at(k))
@@ -503,11 +511,12 @@ class Parser {
 
   // ---- Construct items ----------------------------------------------------
 
+  // `<name> { <statements> }`.  Any identifier will do — the name says *when*
+  // the statements run (before the construct, before each chunk, after it), and
+  // which names have a meaning is the evaluator's business, not the parser's.
   Expected<BlockDecl> parseBlock() {
-    std::string name;
-    if (at(TK::PRE))    { name = "pre";    advance(); }
-    else if (at(TK::INVOKE)) { name = "invoke"; advance(); }
-    else { name = "post"; if (auto e = expect(TK::POST); !e) return e.takeError(); }
+    std::string name = cur().value;
+    if (auto e = expect(TK::IDENT); !e) return e.takeError();
 
     if (auto e = expect(TK::LBRACE); !e) return e.takeError();
     std::vector<Statement> stmts;
@@ -561,14 +570,18 @@ class Parser {
         auto ld = parseLetDecl();
         if (!ld) return ld.takeError();
         items.push_back(std::move(*ld));
-      } else if (at(TK::PRE) || at(TK::INVOKE) || at(TK::POST)) {
-        auto bd = parseBlock();
-        if (!bd) return bd.takeError();
-        items.push_back(std::move(*bd));
       } else if (at(TK::IDENT)) {
-        auto pd = parsePropertyDecl();
-        if (!pd) return pd.takeError();
-        items.push_back(std::move(*pd));
+        // The token after the name is what tells the two apart: '{' opens a
+        // block, '=' a property.
+        if (at(TK::LBRACE, 1)) {
+          auto bd = parseBlock();
+          if (!bd) return bd.takeError();
+          items.push_back(std::move(*bd));
+        } else {
+          auto pd = parsePropertyDecl();
+          if (!pd) return pd.takeError();
+          items.push_back(std::move(*pd));
+        }
       } else {
         return make_error<StringError>(
           "unexpected token in construct at line " + std::to_string(cur().line),

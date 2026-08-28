@@ -24,7 +24,8 @@ it is named after the pass.
 ```
 Regression/
   parallel/   if/  num_threads/  proc_bind/  private/  firstprivate/
-  wsloop/     schedule-static/  schedule-dynamic/  nowait/
+  wsloop/     schedule-static/  schedule-dynamic/  schedule-guided/
+              collapse/  nowait/
   barrier/
   task/       if/  firstprivate/
   taskwait/
@@ -58,7 +59,11 @@ Every cell now has a test; the symbol says what that test asserts.
 | | `firstprivate` | ✓ | ✓ | ✓ |
 | `wsloop` | — | ✓ | ✓ | ✓ |
 | | `schedule(static)` | ✓ | ✓ | ✓ |
-| | `schedule(dynamic)` | ! | ! | ✗ |
+| | `schedule(static, N)` | ✗ | ✗ | ✗ |
+| | `schedule(dynamic)` | ✓ | ✓ | ! |
+| | `schedule(dynamic, N)` | ✓ | ✓ | ! |
+| | `schedule(guided)` | ! | ! | ! |
+| | `collapse(N)` | ! | ! | ! |
 | | `nowait` | ✓ | ✓ | ✓ |
 | `barrier` | — | ✓ | ✓ | ✓ |
 | `task` | — | ✓ | ✓ | n/a |
@@ -73,9 +78,37 @@ supported and a passing test asserts the diagnostic rather than a lowering,
 dropped or mislowered, with an `XFAIL`ed test stating what it should do. Every
 `✗` is a latent wrong-code path:
 
-- **`schedule(dynamic)` on pmsis** matches the *unguarded* `construct wsloop`
-  and is lowered as a static block distribution. iomp and libgomp guard theirs
-  with `when schedule == static`, so there it fails loudly instead (`!`).
+- **`schedule(static, N)`** matches `construct wsloop when schedule == static`
+  on every runtime and the chunk size is then dropped. libgomp and pmsis run
+  `emit thread_bounds`, one contiguous block per thread, which is not the
+  round-robin distribution of `N` iterations the clause asks for; iomp passes
+  schedule constant 34 with `default_chunk` rather than 33 with the clause's
+  value. No test covers it yet — the `✗` is the record that it is known.
+
+Three more gaps are properties of the loop rather than of a clause, so they have
+no row of their own:
+
+- **A descending loop** — a negative step — runs zero iterations under every
+  wsloop lowering. The comparison is fixed at `sle` (iomp) or `slt` (the two
+  inline ones, and libgomp's dynamic chunks), all of which are false on entry
+  when the loop counts down. The trip count the iomp bound is derived from is
+  wrong for a negative step too. Which way to fix it is open: a step known to be
+  negative could be rejected outright, the way pmsis rejects `schedule(dynamic)`
+  today, while a step whose sign is only known at run time would need the
+  comparison chosen there.
+- **A non-`i32` induction variable** — `__kmpc_for_static_init_4` and
+  `__kmpc_dispatch_*_4` are the 32-bit entry points, and nothing checks that the
+  loop agrees with them. An `i64` loop gets `i64` bound slots, of which those
+  entry points write only the low half, and the schedule constant is widened to
+  match. The real answer is the `_8` variants, guarded on the loop's own width.
+  libgomp is unaffected: its `chunk_index = i64` makes the conversion explicit
+  at the ABI boundary.
+- **The `nonmonotonic` modifier** — since OpenMP 5.0 `schedule(dynamic)` is
+  nonmonotonic by default and clang emits `35 | (1<<30)`. `rules.dsl` emits a
+  plain 35, which asks the runtime for the ordered dispatch path rather than the
+  work-stealing one: slower, not wrong. An explicit `schedule(nonmonotonic:
+  dynamic)` is dropped with no diagnostic — the pass seeds no `schedule_mod` in
+  the evaluation context, so the rules have no way to name it.
 
 ### Encoding a gap
 

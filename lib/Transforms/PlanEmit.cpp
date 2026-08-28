@@ -37,7 +37,13 @@ static Type parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
   if (t == "i32") return i32Ty(ctx);
   if (t == "i64") return IntegerType::get(ctx, 64);
   if (t == "i8")  return IntegerType::get(ctx, 8);
-  return ptrTy(ctx);
+  return Type();
+}
+
+Type mlir::omp_lower::parseAbiTypeProp(MLIRContext *ctx, llvm::StringRef name,
+                                       Type fallback) {
+  Type t = parseAbiType(ctx, name.trim());
+  return t ? t : fallback;
 }
 
 LLVM::LLVMStructType mlir::omp_lower::parseStructProp(
@@ -48,7 +54,9 @@ LLVM::LLVMStructType mlir::omp_lower::parseStructProp(
   SmallVector<Type> fields;
   for (auto tok : toks) {
     tok = tok.trim();
-    if (!tok.empty()) fields.push_back(parseAbiType(ctx, tok));
+    // An unknown field type stays a pointer, as it was before the name parser
+    // grew a "no such type" answer.
+    if (!tok.empty()) fields.push_back(parseAbiTypeProp(ctx, tok, ptrTy(ctx)));
   }
   if (fields.empty()) return fallback;
   return LLVM::LLVMStructType::getLiteral(ctx, fields);

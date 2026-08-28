@@ -614,6 +614,10 @@ Expected<LoweringPlan> Evaluator::buildPlan(
         for (auto &a : *actions) plan.invoke.push_back(std::move(a));
       else if (bd->name == "post")
         for (auto &a : *actions) plan.post.push_back(std::move(a));
+      else if (bd->name == "first_chunk")
+        for (auto &a : *actions) plan.firstChunk.push_back(std::move(a));
+      else if (bd->name == "next_chunk")
+        for (auto &a : *actions) plan.nextChunk.push_back(std::move(a));
       else
         return make_error<StringError>(
           "unknown block: " + bd->name, inconvertibleErrorCode());
