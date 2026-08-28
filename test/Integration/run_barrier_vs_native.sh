@@ -3,9 +3,8 @@
 # run_barrier_vs_native.sh — team barrier call sites, ours against the stock
 # compiler, counted at the same stage
 #
-# run_barrier_stats.sh answers "does the pass do what it claims", inside our
-# own pipeline. This answers the different question a reader asks: how many
-# barriers are left compared with the compiler people actually use.
+# This answers the question a reader asks: how many barriers are left compared
+# with the compiler people actually use.
 #
 # The comparison is only worth anything if both sides are counted at the same
 # point, so both are taken from LLVM IR *after* -O3:
@@ -213,10 +212,6 @@ fi
 # already does this reach the same place". Different stage, different claim.
 [ "$T_GCC" -gt 0 ] && echo "  gcc (before -O3): $T_GCC    ours with the pass: $T_ELIM"
 echo "  Done — $CSV"
-
-# Optional chart: the three columns side by side, clang first. PLOT=true, as in
-# the other drivers.
-render_barrier_plot "$CSV" "${CSV%.csv}.png"
 
 [ "$FAILED" -ne 0 ] && { echo "  some kernels failed (VERBOSE=1 for the tool output)"; exit 1; }
 exit 0

@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # common.sh — shared setup for the Integration test drivers
-# (run_correctness.sh, run_performance.sh, run_barrier_stats.sh,
-# run_barrier_vs_native.sh, tasks/run_tasks.sh).
+# (run_correctness.sh, run_performance.sh, run_barrier_vs_native.sh,
+# tasks/run_tasks.sh).
 #
 # This file holds the configuration: run.env loading, tool/path resolution
 # and the per-runtime knobs. The rest is sourced from sibling files at the end:
@@ -218,25 +218,6 @@ plot_python() {
     printf '%s' "$py"
 }
 
-# Render a bar chart of the team-barrier counts in $1 (a CSV from either
-# barrier driver) next to it, as $2. Both drivers call this the same way, and
-# plot_barriers.py picks the bars from the CSV header.
-#
-# --group-by pragma_form blocks the vs-native figure by how the kernel spells
-# its parallel loop, which is what separates the two regimes it shows. The
-# stats CSV has no such column and is left in suite order.
-render_barrier_plot() {   # $1 = csv, $2 = output image
-    is_true "${PLOT:-false}" || return 0
-    local py; py="$(plot_python)" || return 0
-    echo -e "${CYAN}[plot] rendering barrier chart...${RESET}" >&2
-    if "$py" "$COMMON_DIR/plot_barriers.py" "$1" "$2" \
-        --runtime "$RUNTIME" --group-by pragma_form; then
-        echo "  Plot  — $2"
-    else
-        echo -e "${YELLOW}[plot] plot_barriers.py failed — see output above${RESET}" >&2
-    fi
-}
-
 # --- Load the pieces ---------------------------------------------------------
 # kernels.sh  kernel lists + select_kernels/resolve_src
 # native.sh   compile_opt/compile_ref (host pipelines)
@@ -247,7 +228,7 @@ render_barrier_plot() {   # $1 = csv, $2 = output image
 # shellcheck source=native.sh
 . "$COMMON_DIR/native.sh"
 # SKIP_PULP_SDK is for a driver that only goes as far as MLIR
-# (run_barrier_stats.sh): RUNTIME=pmsis then needs the lowering rules but
+# (run_barrier_vs_native.sh): RUNTIME=pmsis then needs the lowering rules but
 # neither the GAP SDK nor PULP_APP_DIR, which pulp.sh insists on.
 if [ "$TARGET" = "pulp" ] && [ -z "${SKIP_PULP_SDK:-}" ]; then
     # shellcheck source=pulp.sh

@@ -9,11 +9,9 @@ kernels and the same `run.env`:
   produce **bit-identical** array dumps.
 - **`run_performance.sh`** — times our tool against the native compiler and
   reports speedups (see [Performance](#performance) below).
-- **`run_barrier_stats.sh`** — counts the team barriers `--omp-barrier-elim`
-  removes from each kernel, and checks that count against the calls left in the
-  emitted code (see [Barrier elimination](#barrier-elimination)).
-- **`run_barrier_vs_native.sh`** — the same count against clang's, both taken
-  from LLVM IR after `-O3`.
+- **`run_barrier_vs_native.sh`** — counts the team barriers left with and
+  without `--omp-barrier-elim`, against clang's and gcc's count on the same
+  kernels (see [Barrier elimination](#barrier-elimination)).
 
 A third, lighter driver covers the task construct (it lives in
 [`tasks/`](tasks/) together with its test cases):
@@ -240,28 +238,8 @@ ends a parallel region, which the team join makes redundant. It runs on the
 `omp` dialect before any runtime is chosen, so the same removals apply to all
 three; what differs is only what a barrier costs.
 
-Two things to measure, and they answer different questions.
-
-`run_barrier_stats.sh` counts what disappears, without running anything:
-
-```sh
-SUITE=full ./run_barrier_stats.sh   # -> results/<runtime>/results_barrier_stats.csv
-```
-
-It counts the same thing twice, and the two must agree. `explicit_removed` and
-`implicit_removed` are what the pass reports about itself through
-`--mlir-pass-statistics`, on the `omp` dialect. `calls_base` and `calls_elim`
-are the runtime barrier calls left in the **fully lowered IR** — the kernel is
-lowered for `$RUNTIME` twice, once without the pass and once with it, and the
-emitted `__kmpc_barrier` / `GOMP_barrier` / `ext_pi_cl_team_barrier` call sites
-are counted in each. That second count is the one that costs cycles: an
-implicit barrier is dropped by setting `nowait`, and only the runtime's wsloop
-rule (`when not nowait => call ...`) turns that into one call less.
-
-A kernel where the two disagree is flagged `MISMATCH` and the script exits
-non-zero. Both lowerings are kept as
-`results/<runtime>/<kernel>/barrier-stats/{base,elim}.mlir`, so a surprising
-row can be diffed by hand; `VERBOSE=1` lets the tools say why one failed.
+Two things to measure, and they answer different questions: how many barrier
+call sites disappear, and what that is worth at run time.
 
 The statistics half is runtime-independent, the emitted half is not, so run it
 once per runtime you care about. Either way the count is **static** — barriers
@@ -323,48 +301,15 @@ the loop inside a block and out of reach of its check (add one line to
 `gemm-omp.c` and gcc's count goes 0 → 1). One rule on the dialect covers both,
 and covers a third runtime whose toolchain has no such optimisation at all.
 
-Its figure is a separate one — same reason it is a separate column:
-
-```sh
-python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv barriers_vs_gcc.pdf \
-  --runtime iomp --group-by pragma_form --only pragma_form=split --series gcc,elim
-```
-
-`gcc` is read from the CSV but never drawn unless `--series` names it, so no
-figure mixes the two stages by accident.
-
 A loop whose barrier sits inside a sequential outer loop
 counts once here and fires once per iteration at run time, so the dynamic
 saving is the larger number. `floyd-warshall` is the clearest case: one static
 barrier, executed once per `k`.
 
-### Barrier charts
+### What the two regimes say
 
-`PLOT=true` renders a bar chart beside each CSV, one bar per configuration per
-kernel:
-
-```sh
-PLOT=true SUITE=full ./run_barrier_stats.sh       # -> results/<runtime>/results_barrier_stats.png
-PLOT=true SUITE=full ./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.png
-```
-
-Both come from [`lib/plot_barriers.py`](lib/plot_barriers.py), which picks the
-bars from the CSV header: two from the stats CSV — ours without the pass and
-with it — and three from the vs-native one, clang first. A configuration keeps
-its colour in both figures, and the totals ride in the legend labels.
-
-What is drawn is the **emitted** count on either side, never the pass's own
-`explicit_removed`/`implicit_removed`. So a run that came out `MISMATCH` still
-plots the half that is trustworthy.
-
-A count of zero draws no bar and is labelled `0` instead — most of the clang
-column on `combined` kernels. A kernel that failed to build has no count at all
-and is dropped from the figure rather than drawn as zero.
-
-The vs-native figure is **blocked by `pragma_form`** (`--group-by`, passed by
-the driver), and that is what makes it readable. In suite order the two regimes
-interleave and the middle bar just looks worse than clang; in two blocks each
-half states one thing:
+The `pragma_form` column splits the suite in two, and read that way the totals
+say something the suite-order sum hides:
 
 | block | what it shows |
 |---|---|
@@ -374,35 +319,6 @@ half states one thing:
 So the baseline is not a weak one to beat: it is exactly clang's, everywhere
 clang does not apply its own elision. What the pass adds is one barrier per
 parallel region on the spelling clang's front-end skips.
-
-For a figure that makes one point instead of showing everything, `--only`
-drops rows and `--series` drops bars:
-
-```sh
-# what the pass adds, on the spelling clang's front-end skips
-python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv barriers_split.pdf \
-  --runtime iomp --group-by pragma_form --only pragma_form=split
-
-# the same, cut to the comparison itself
-python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv barriers_vs_clang.pdf \
-  --runtime iomp --group-by pragma_form --only pragma_form=split --series clang,elim
-```
-
-The `combined` half is a tie — zero against zero — so dropping it costs the
-figure nothing and buys back half the x axis. Keep `--group-by` even with one
-value left: it is what writes the directive form under the axis, which is the
-caption a filtered figure needs to stay honest about what it left out. Legend
-totals follow the rows actually drawn, so the first reads `Clang (44)`,
-`Ours (44)`, `Ours + barrier elim (25)` — the baseline saying for itself that
-it is clang's, before the pass moves it.
-
-The rest matches the [speedup chart](#speedup-chart): `python3` + matplotlib,
-the local `.venv` picked up automatically, the extension deciding the format,
-and the script runnable by hand on a CSV already on disk.
-
-```sh
-python3 lib/plot_barriers.py results/iomp/results_barrier_vs_native.csv fig.pdf --runtime iomp
-```
 
 ### Measuring the effect
 
