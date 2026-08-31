@@ -51,7 +51,10 @@
 #   <kernel>-omp/performance/...   the four binaries and raw timing logs
 #   results_performance_<sel>.png  speedup bar chart (only when PLOT=true;
 #                                  needs python3 + matplotlib — see
-#                                  plot_speedup.py). <sel> = the kernel
+#                                  plot_speedup.py). On RUNTIME=pmsis a second
+#                                  chart, ..._size.png, plots the binary size
+#                                  change from the size_* columns.
+#                                  <sel> = the kernel
 #                                  selection (the SUITE, full/bundled, or the
 #                                  explicit kernel name(s)) + the dataset size,
 #                                  e.g. _full_large or _gemm-omp_mini.
@@ -394,12 +397,14 @@ plot_suffix() {
 # Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
 # missing python/matplotlib is a warning, not a failure (the CSV is the result).
 # plot_python (common.sh) picks the interpreter, the same way for every driver.
-render_plot() {
+render_plot() {   # $1 = metric (speedup | size), default speedup
+    local metric="${1:-speedup}"
     local script="$SCRIPT_DIR/lib/plot_speedup.py"
-    local png="$OUTDIR/results_performance_$(plot_suffix)$BARRIER_ELIM_FILE_TAG.png"
+    local tag=""; [ "$metric" = "size" ] && tag="_size"
+    local png="$OUTDIR/results_performance_$(plot_suffix)$BARRIER_ELIM_FILE_TAG$tag.png"
     local py; py="$(plot_python)" || return
-    echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2
-    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME"; then
+    echo -e "${CYAN}[plot] rendering $metric chart...${RESET}" >&2
+    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME" --metric "$metric"; then
         echo "  Plot  — $png"
     else
         echo -e "${YELLOW}[plot] plot_speedup.py failed — see output above${RESET}" >&2
@@ -551,7 +556,13 @@ echo "    A ratio > 1.0 means lower runtime (faster); < 1.0 means higher (slower
 echo ""
 echo "  Done — $CSV"
 
-# --- Optional speedup plot -------------------------------------------------
+# --- Optional plots ---------------------------------------------------------
 # (an `if`, not `&&`: as the last command, a false PLOT must not turn into a
 # non-zero exit code for the whole script)
-if is_true "$PLOT"; then render_plot; fi
+if is_true "$PLOT"; then
+    render_plot
+    # Only the PULP path writes the size_* columns, and only there is the
+    # footprint a result in its own right rather than a footnote — memory is
+    # the binding constraint on the target, so it gets its own figure.
+    if [ "$TARGET" = "pulp" ]; then render_plot size; fi
+fi

@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 # =============================================================================
-# plot_speedup.py -- parallel-speedup bar chart from run_performance.sh output.
+# plot_speedup.py -- per-kernel bar charts from run_performance.sh output.
 #
-# Renders, per kernel, two bars of self-relative parallel speedup (each variant
-# against its OWN sequential baseline):
+# Two metrics, same figure shape: one bar per toolchain per kernel, each
+# measured against its OWN sequential baseline, so the two sides stay
+# comparable even when their backends differ in code quality.
 #
+#   --metric speedup   (default) parallel speedup
 #     native (ref)  =  ref_seq / ref_par     (stock OpenMP compiler)
 #     our    (opt)  =  opt_seq / opt_par     (CIR/MLIR pipeline through this tool)
 #
-# These are exactly the speedup_native / speedup_opt columns that
-# run_performance.sh already writes, so the plot is consistent with the CSV and
-# the console summary. If those columns are missing/NA the value is recomputed
-# from the raw cycle columns; kernels with no usable data are dropped.
+#     These are exactly the speedup_native / speedup_opt columns that
+#     run_performance.sh already writes, so the plot is consistent with the CSV
+#     and the console summary. If those columns are missing/NA the value is
+#     recomputed from the raw cycle columns.
+#
+#   --metric size      binary size change, parallel against sequential
+#     native (ref)  =  size_ref_par / size_ref_seq - 1
+#     our    (opt)  =  size_opt_par / size_opt_seq - 1
+#
+#     What parallelising costs in bytes of linked ELF. Signed: a toolchain
+#     whose parallel build is smaller than its sequential one plots below zero.
+#     The size_* columns are written only for RUNTIME=pmsis (the footprint of
+#     an embedded target is what makes them worth reporting), so this metric
+#     needs a pmsis CSV.
+#
+# Kernels with no usable data for the chosen metric are dropped.
 #
 # The reference (native) bar is labelled by runtime, matching the paper figures:
 #     iomp    -> "Clang frontend"
@@ -22,12 +36,15 @@
 #     python3 plot_speedup.py <results.csv> [output.png] [options]
 #
 # Options:
+#     --metric {speedup,size}    what to plot (default: speedup)
 #     --runtime {iomp,libgomp,pmsis}   picks the native bar's legend label
 #     --title "..."              optional chart title (default: none, paper style)
 #     --our-label "..."          override the "Our" legend label (default: "Our")
 #
 # Output format follows the extension of <output.png> (.png, .pdf, .svg, ...);
-# .pdf gives a vector figure suitable for a paper. Defaults to <csv>.png.
+# .pdf gives a vector figure suitable for a paper. Defaults to <csv>.png, or
+# <csv>-size.png for --metric size, so the two figures never overwrite each
+# other when both are rendered from the same CSV.
 #
 # Requires: matplotlib, numpy  (pip install matplotlib numpy)
 # =============================================================================
@@ -41,7 +58,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless-safe: no X display needed (servers, WSL, CI)
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.ticker import MaxNLocator  # noqa: E402
+from matplotlib.ticker import MaxNLocator, PercentFormatter  # noqa: E402
 import numpy as np  # noqa: E402
 
 # Legend label for the reference/native bar, per runtime (matches the figures).
@@ -61,14 +78,21 @@ OUR_HATCH = "///"
 
 def parse_args(argv):
     p = argparse.ArgumentParser(
-        description="Plot parallel speedup from run_performance.sh CSV output."
+        description="Plot parallel speedup or binary size change from "
+        "run_performance.sh CSV output."
     )
     p.add_argument("csv", help="results_performance.csv produced by run_performance.sh")
     p.add_argument(
         "out",
         nargs="?",
-        help="output image (default: <csv> with a .png extension). "
-        "Format follows the extension (.png/.pdf/.svg).",
+        help="output image (default: <csv>.png, or <csv>-size.png for "
+        "--metric size). Format follows the extension (.png/.pdf/.svg).",
+    )
+    p.add_argument(
+        "--metric",
+        choices=("speedup", "size"),
+        default="speedup",
+        help="speedup (default) or binary size change; size needs a pmsis CSV",
     )
     p.add_argument(
         "--runtime",
@@ -112,7 +136,24 @@ def speedup(row, ratio_col, seq_col, par_col):
     return None
 
 
-def load_rows(csv_path):
+def size_change(row, seq_col, par_col):
+    """Percent change in linked-ELF bytes, the parallel build against its own
+    sequential one.
+
+    Signed on purpose. A parallel build that comes out *smaller* than its
+    sequential counterpart is a real outcome, not a bad measurement, so it has
+    to reach the plot as a negative bar rather than be dropped the way a
+    missing cell is. Only the two inputs go through _num, which rejects the
+    non-positive: a byte count of zero is a failed link, the result is free to
+    be negative.
+    """
+    seq, par = _num(row.get(seq_col)), _num(row.get(par_col))
+    if seq is None or par is None:
+        return None
+    return (par / seq - 1.0) * 100.0
+
+
+def load_rows(csv_path, metric):
     kernels, native, our = [], [], []
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f, delimiter=";")
@@ -120,8 +161,12 @@ def load_rows(csv_path):
             name = (row.get("kernel") or "").strip()
             if not name or name == "GEOMEAN":  # skip the summary row
                 continue
-            sn = speedup(row, "speedup_native", "ref_seq_cyc", "ref_par_cyc")
-            so = speedup(row, "speedup_opt", "opt_seq_cyc", "opt_par_cyc")
+            if metric == "size":
+                sn = size_change(row, "size_ref_seq", "size_ref_par")
+                so = size_change(row, "size_opt_seq", "size_opt_par")
+            else:
+                sn = speedup(row, "speedup_native", "ref_seq_cyc", "ref_par_cyc")
+                so = speedup(row, "speedup_opt", "opt_seq_cyc", "opt_par_cyc")
             if sn is None or so is None:  # skipped / failed kernel
                 continue
             kernels.append(short_name(name))
@@ -147,7 +192,6 @@ def make_plot(kernels, native, our, args):
         linewidth=0.6, hatch=OUR_HATCH,
     )
 
-    ax.set_ylabel("Parallel speedup")
     if args.title:
         ax.set_title(args.title)
 
@@ -155,9 +199,23 @@ def make_plot(kernels, native, our, args):
     ax.set_xticklabels(kernels, rotation=45, ha="right", fontsize=9)
     ax.set_xlim(-0.6, len(kernels) - 0.4)
 
-    ymax = max(max(native), max(our))
-    ax.set_ylim(0, math.ceil(ymax * 1.08))
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    if args.metric == "size":
+        # A signed quantity: the axis has to show zero, and show it as the
+        # baseline rather than as the floor, or a shrinking binary reads as a
+        # missing bar. The span is padded on whichever sides the data uses.
+        ax.set_ylabel("Binary size change")
+        lo = min(0.0, min(native), min(our))
+        hi = max(0.0, max(native), max(our))
+        pad = max((hi - lo) * 0.12, 0.05)
+        ax.set_ylim(lo - (pad if lo < 0 else 0), hi + pad)
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=1))
+        ax.axhline(0, color="#444444", linewidth=0.8, zorder=2)
+    else:
+        ax.set_ylabel("Parallel speedup")
+        ymax = max(max(native), max(our))
+        ax.set_ylim(0, math.ceil(ymax * 1.08))
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
     ax.yaxis.grid(True, linestyle="--", alpha=0.6)
     ax.set_axisbelow(True)
 
@@ -169,12 +227,22 @@ def make_plot(kernels, native, our, args):
 
 def main(argv):
     args = parse_args(argv)
+    # The two metrics come from one CSV, so their default names have to differ
+    # or rendering both silently leaves only the second.
+    suffix = "-size" if args.metric == "size" else ""
     out = args.out or (
-        args.csv[:-4] + ".png" if args.csv.endswith(".csv") else args.csv + ".png"
+        args.csv[:-4] + suffix + ".png"
+        if args.csv.endswith(".csv")
+        else args.csv + suffix + ".png"
     )
 
-    kernels, native, our = load_rows(args.csv)
+    kernels, native, our = load_rows(args.csv, args.metric)
     if not kernels:
+        if args.metric == "size":
+            sys.exit(
+                f"plot_speedup: no size data in {args.csv}: the size_* columns "
+                "are written only by RUNTIME=pmsis runs"
+            )
         sys.exit(f"plot_speedup: no plottable kernels in {args.csv}")
 
     fig = make_plot(kernels, native, our, args)

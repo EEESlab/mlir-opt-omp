@@ -139,6 +139,35 @@ The script exits non-zero if any kernel is not PASS, so it can gate CI.
 
 ## Performance
 
+### Reproducing a figure
+
+One config per figure, in [`configs/`](configs/). `RUN_ENV` reads one **instead
+of** `run.env`, so a stale personal `run.env` cannot contaminate the run and the
+command line says which configuration produced the numbers:
+
+```sh
+RUN_ENV=configs/paper-libgomp.env PLOT=true ./run_performance.sh   # Figure 4
+RUN_ENV=configs/paper-iomp.env    PLOT=true ./run_performance.sh   # Figure 5
+RUN_ENV=configs/paper-pmsis.env   PLOT=true ./run_performance.sh   # Figures 6 and 7
+```
+
+Each is hours: 30 kernels × 4 cells × 10 repetitions at `LARGE`. For a shorter
+run put `REPS=` on the command line, where an environment variable wins over the
+file — `REPS=5` halves it and keeps a standard deviation over three samples,
+`REPS=3` is 3.3× faster and reports the median of three with no deviation at
+all. The **dataset is deliberately not the knob**: fewer repetitions cost
+confidence in a value, a smaller dataset changes which value is being measured
+and the result stops being comparable with the figure. On `pmsis` neither
+applies — gvsoc is deterministic, so every cell runs once and `DATASET` is
+already pinned to `MINI` by the GAP8 memory budget.
+
+A name that matches no file is a hard error listing what exists, rather than a
+silent fall-back to the defaults.
+
+To compare a result against the paper rather than read it in isolation, see
+[`reference/`](reference/) — provisional expected speedups, and the numbers the
+paper states exactly.
+
 `run_performance.sh` builds a 2×2 matrix per kernel and times each cell with
 PolyBench's cycle-accurate TSC timer:
 
@@ -189,6 +218,18 @@ explicit `KERNELS` list, the kernel basename(s) — plus the dataset size, e.g.
 `_full_large` or `_gemm-omp_mini`. The
 native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
+
+On `RUNTIME=pmsis` a **second chart** is rendered beside it,
+`..._size.png`: the binary size change of each parallel build against its own
+sequential one, from the `size_*` columns. It is signed — a toolchain whose
+parallel build comes out smaller plots below zero — and it exists only on the
+PULP path, where the footprint is a result rather than a footnote. By hand on
+a CSV already on disk:
+
+```sh
+python3 lib/plot_speedup.py results/pmsis/results_performance.csv fig.pdf \
+  --metric size --runtime pmsis
+```
 
 The rendering is done by [`lib/plot_speedup.py`](lib/plot_speedup.py) and needs
 `python3` + `matplotlib`/`numpy`; if they are missing the run still succeeds
@@ -548,11 +589,16 @@ See [PULP / gvsoc](#pulp--gvsoc-runtimepmsis) for what these drive.
 | `GCC_STRICT_FP`   | `-ffp-contract=off -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize` | see below |
 | `WARN_SUPPRESS`   | `-Wno-ignored-attributes` | silences the harmless warnings clang emits parsing GCC's `omp.h` |
 | `POLYBENCH_LFLAGS`| *empty* | extra link flags; running as root auto-adds `-DPOLYBENCH_LINUX_FIFO_SCHEDULER` and `-lc` |
-| `OMP_PLACES`      | `cores` | exported for the parallel runs              |
-| `OMP_PROC_BIND`   | `true`  | exported for the parallel runs              |
-| `OMP_WAIT_POLICY` | `ACTIVE` | keep idle workers spinning — see below     |
-| `KMP_BLOCKTIME`   | `infinite` | the same for iomp/libomp                 |
-| `GOMP_SPINCOUNT`  | `infinite` | the same for libgomp                     |
+| `OMP_PLACES`      | *unset* | exported for the parallel runs              |
+| `OMP_PROC_BIND`   | *unset* | exported for the parallel runs              |
+| `OMP_WAIT_POLICY` | *unset* | keep idle workers spinning — see below      |
+| `KMP_BLOCKTIME`   | *unset* | the same for iomp/libomp                    |
+| `GOMP_SPINCOUNT`  | *unset* | the same for libgomp                        |
+
+Those five have **no default** — `common.sh` no longer sets them, so a bare run
+takes whatever the runtime does on its own. The configs in
+[`configs/`](configs/) set them, which is what makes a run under one of them
+repeatable; anything else is on you to pin.
 
 The three wait-policy variables are there to make the *timing* repeatable, not
 to make it fast. Left at their defaults the runtime parks its workers once a

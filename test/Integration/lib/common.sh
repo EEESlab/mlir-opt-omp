@@ -38,9 +38,38 @@ fi
 # The shared loader handles both, plus the tool defaults, PATH and the sanity
 # checks. run.env wins over local.env, and anything already in the environment
 # wins over both, so `RUNTIME=libgomp ./run_correctness.sh` still overrides them.
+#
+# RUN_ENV names a config file to read *instead of* run.env — the named ones in
+# configs/ reproduce a figure of the paper. Instead of, not as well as: a stale
+# personal run.env silently contaminating a reproduction run is exactly the
+# failure this is meant to prevent, and the command line then says which
+# configuration produced the numbers rather than leaving it to whichever file
+# happened to be on disk.
+#
+# A relative RUN_ENV is resolved against this directory as well as the cwd, so
+# `RUN_ENV=configs/paper-iomp.env` works from either. A name that matches
+# nothing is a hard error: the loader skips files it cannot find, which for
+# run.env is right (it is optional) and for RUN_ENV would be the worst
+# outcome — a reproduction run silently taken under the defaults.
+OMP_RUN_ENV_FILE="$INTEGRATION_DIR/run.env"
+if [ -n "${RUN_ENV:-}" ]; then
+    if [ -f "$RUN_ENV" ]; then
+        OMP_RUN_ENV_FILE="$RUN_ENV"
+    elif [ -f "$INTEGRATION_DIR/$RUN_ENV" ]; then
+        OMP_RUN_ENV_FILE="$INTEGRATION_DIR/$RUN_ENV"
+    else
+        echo "ERROR: RUN_ENV='$RUN_ENV' names no readable file." >&2
+        echo "       Tried: $RUN_ENV" >&2
+        echo "          and: $INTEGRATION_DIR/$RUN_ENV" >&2
+        echo "       Available: $(cd "$INTEGRATION_DIR" 2>/dev/null \
+            && echo configs/*.env)" >&2
+        exit 2
+    fi
+fi
+
 OMP_REPO_ROOT="$REPO_ROOT"
 # shellcheck source=../../../scripts/load-local-env.sh
-. "$REPO_ROOT/scripts/load-local-env.sh" "$INTEGRATION_DIR/run.env"
+. "$REPO_ROOT/scripts/load-local-env.sh" "$OMP_RUN_ENV_FILE"
 
 # --- Paths -----------------------------------------------------------------
 # Defaults to the kernels vendored in this repo, so the tests are
@@ -109,22 +138,8 @@ case "$DATASET" in
         ;;
 esac
 
-export OMP_PLACES="${OMP_PLACES:-cores}"
-export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
-
-# Keep the worker threads spinning between regions instead of parking in the
-# kernel. Left to its default, the runtime parks them once the wait exceeds its
-# block time, and every later region entry pays a wake-up syscall per thread —
-# which is not a property of the code under test but of how the timing happened
-# to fall. It made the fine-grained kernels unmeasurable here: run to run, on
-# the *same binary*, durbin moved by 88% and trisolv by a factor of ten, while
-# their sequential cells repeated to four decimal places and 3mm (one big
-# region) repeated to 0.05%. Spinning costs a core doing nothing while the
-# region is closed, so it assumes the machine is yours for the run — which is
-# the assumption a benchmark makes anyway.
-export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-ACTIVE}"
-export KMP_BLOCKTIME="${KMP_BLOCKTIME:-infinite}"     # iomp/libomp
-export GOMP_SPINCOUNT="${GOMP_SPINCOUNT:-infinite}"   # libgomp
+#export OMP_PLACES="${OMP_PLACES:-cores}"
+#export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 
 # --- Root / FIFO scheduler handling ----------------------------------------
 # Running as root lets PolyBench use the FIFO scheduler for lower variance, but

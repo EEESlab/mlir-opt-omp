@@ -1,0 +1,359 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Artifact Appendix for mlir-opt-omp (AE template V20190108)
+%%
+%% Paste the part between \appendix and \subsection{Methodology}
+%% into the paper.  Items marked "TODO" are the ones only you can fill
+%% (DOI, license, exact machine, measured wall-clock times).
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\appendix
+\section{Artifact Appendix}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Abstract}
+
+The artifact is \texttt{mlir-opt-omp}, an out-of-tree \texttt{mlir-opt} that
+lowers the MLIR OpenMP dialect (\texttt{omp.*}) to calls into an OpenMP
+runtime library, driven by a declarative rule file (\texttt{rules.dsl}) that
+describes each runtime's ABI.  It contains the compiler sources, the rule file
+for the three runtimes evaluated in the paper (Intel/LLVM \texttt{\_\_kmpc\_*},
+GCC \texttt{GOMP\_*} and the PMSIS cluster API of PULP/GAP8), a lit+FileCheck
+regression suite over the passes, and shell drivers that take PolyBench/C
+kernels end to end (C $\rightarrow$ ClangIR $\rightarrow$ \texttt{mlir-opt-omp}
+$\rightarrow$ binary) and compare them against the same kernels built by a
+stock OpenMP compiler, for both correctness and performance.
+
+Reviewers can reproduce the IR-level claims --- that one rule file, and only
+the rule file, decides which runtime a construct is lowered onto --- in minutes
+on any machine where LLVM/MLIR builds.  Reproducing the end-to-end correctness
+and speedup numbers additionally needs the ClangIR front-end and a host OpenMP
+runtime; reproducing the PULP/GAP8 numbers needs the GAP SDK with the
+\texttt{gvsoc} simulator (no board is required).
+
+\subsection{Artifact check-list (meta-information)}
+
+{\small
+\begin{itemize}
+  \item {\bf Algorithm: } rule-driven lowering of OpenMP constructs: a
+    declarative per-runtime ABI description is evaluated against each
+    \texttt{omp.*} operation into a lowering plan, realised by three MLIR
+    passes (rule evaluation, outlining + work-sharing loop lowering, call
+    emission); plus an optional redundant team-barrier elimination pass.
+  \item {\bf Program: } PolyBench/C 4.2.1 OpenMP kernels (\texttt{gemm} and
+    \texttt{atax} vendored in the artifact; the full suite from an external
+    checkout), and 74 hand-written MLIR regression tests.
+  \item {\bf Compilation: } CMake $\geq$ 3.20, C++17, Ninja; LLVM/MLIR 23 built
+    with ClangIR enabled (EEESlab fork, branch
+    \texttt{users/lucap/cir-omp-clauses}, commit \texttt{9be70f177d9b}).
+    Baseline kernels are compiled with stock \texttt{clang} (\texttt{iomp}),
+    \texttt{gcc} (\texttt{libgomp}) or the PULP-SDK \texttt{gcc}
+    (\texttt{pmsis}), all at \texttt{-O3} with matched strict-FP flags.
+  \item {\bf Transformations: } \texttt{--omp-to-omp-lower},
+    \texttt{--omp-outline}, \texttt{--omp-lower-plan}, and optionally
+    \texttt{--omp-barrier-elim}, selected per runtime with
+    \texttt{--omp-lower-runtime=\{iomp,libgomp,pmsis\}}.
+  \item {\bf Binary: } the \texttt{mlir-opt-omp} tool, plus the per-kernel host
+    binaries (and, for \texttt{pmsis}, RISC-V ELFs) that the drivers build from
+    source at run time.
+  \item {\bf Data set: } PolyBench's own generated inputs, selected by dataset
+    macro: \texttt{MINI\_DATASET} for correctness,
+    \texttt{LARGE\_DATASET} for host performance, \texttt{MINI\_DATASET} for
+    PULP/GAP8 (memory bound).
+  \item {\bf Run-time environment: } Linux x86\_64 (Ubuntu 22.04/24.04) with
+    \texttt{libomp} or \texttt{libgomp}; runs use
+    \texttt{OMP\_PROC\_BIND=true}, \texttt{OMP\_PLACES=cores} and a spinning
+    wait policy (\texttt{OMP\_WAIT\_POLICY=ACTIVE},
+    \texttt{KMP\_BLOCKTIME=infinite}, \texttt{GOMP\_SPINCOUNT=infinite}) so that
+    timings are repeatable.  The \texttt{pmsis} target additionally needs the
+    GAP SDK and the \texttt{gvsoc} simulator.
+  \item {\bf Hardware: } a multi-core x86\_64 machine.  The reported host
+    numbers were taken on TODO (CPU model, core count), using every hardware
+    thread (\texttt{THREADS=16}) on an otherwise idle machine.  The
+    PULP/GAP8 results are obtained on the cycle-accurate \texttt{gvsoc}
+    simulator; no hardware board is needed.
+  \item {\bf Run-time state: } threads pinned to cores and kept spinning; the
+    machine must be otherwise idle, since idle workers hold their core.
+  \item {\bf Execution: } POSIX shell drivers; each timing cell is run
+    \texttt{REPS}=10 times, minimum and maximum dropped, mean $\pm$ standard
+    deviation reported, cells with relative std-dev above 5\% flagged as noisy.
+    On \texttt{gvsoc} each cell is run once (the simulator is deterministic).
+  \item {\bf Metrics: } correctness --- bit-identical PolyBench array dumps
+    between the reference build and ours.  Performance --- cycles from
+    PolyBench's TSC timer, reported as the self-relative parallel speedup of
+    each toolchain (\texttt{speedup\_native}, \texttt{speedup\_opt}) and as our
+    parallel/sequential time against the native one
+    (\texttt{opt\_vs\_native\_par}, \texttt{opt\_vs\_native\_seq}), summarised
+    over the suite with the geometric mean.  On PULP additionally the size of
+    the linked ELF.
+  \item {\bf Output: } console log plus, under
+    \texttt{test/Integration/results/<runtime>/},
+    \texttt{results\_correctness.csv} (\texttt{kernel;PASS|FAIL|ERROR}),
+    \texttt{results\_performance.csv} (per-kernel rows and a \texttt{GEOMEAN}
+    summary row) and, with \texttt{PLOT=true}, the speedup bar chart used for
+    Figures TODO (and the binary-size chart on \texttt{pmsis}); the intermediate
+    LLVM IR of every build is kept for inspection.
+  \item {\bf Experiments: } (i) the regression suite (\texttt{check-omp});
+    (ii) \texttt{run\_correctness.sh}; (iii) \texttt{run\_performance.sh};
+    (iv) \texttt{tasks/run\_tasks.sh} for the task construct; each of (ii)--(iv)
+    per runtime.  Driven by environment variables, no manual editing.
+    Expected variation: the correctness results are exact and deterministic;
+    speedups vary with the machine, run-to-run noise is bounded by the
+    repetition scheme above.
+  \item {\bf How much disk space required (approximately)?: } about 1\,GB for
+    the artifact and its results; about 80\,GB more for a Release LLVM/MLIR +
+    ClangIR build tree, if one is not already available.
+  \item {\bf How much time is needed to prepare workflow (approximately)?: }
+    about 15 minutes given an existing LLVM/MLIR+ClangIR build (configure,
+    build the tool, fill in \texttt{local.env}); 2--4 hours otherwise,
+    essentially all of it the LLVM build.
+  \item {\bf How much time is needed to complete experiments (approximately)?: }
+    under a minute for the regression suite, a few minutes for the bundled
+    kernels, and about TODO hours for the full PolyBench suite at
+    \texttt{LARGE\_DATASET} on both host runtimes; the \texttt{gvsoc} runs take
+    about TODO hours.
+  \item {\bf Publicly available?: } yes ---
+    \url{https://github.com/EEESlab/mlir-opt-omp}, together with the ClangIR
+    fork at \url{https://github.com/EEESlab/llvm-project}.
+  \item {\bf Code licenses (if publicly available)?: } TODO (the repository
+    carries no \texttt{LICENSE} file yet; Apache-2.0 with LLVM exceptions is
+    the natural choice for an out-of-tree MLIR tool).
+  \item {\bf Data licenses (if publicly available)?: } PolyBench/C 4.2.1 and
+    its OpenMP port, under their own (BSD-style) license.
+  \item {\bf Workflow framework used?: } none --- CMake, \texttt{lit} and
+    POSIX shell drivers configured through two environment files.
+  \item {\bf Archived (provide DOI)?: } TODO (Zenodo DOI of the tagged
+    snapshot).
+\end{itemize}
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Description}
+
+\subsubsection{How delivered}
+
+As a public Git repository, \url{https://github.com/EEESlab/mlir-opt-omp},
+and as an archived snapshot of the tag used for the paper (TODO: DOI).  The
+snapshot holds the compiler sources, \texttt{rules.dsl}, the regression suite,
+the integration drivers and the two vendored PolyBench kernels --- roughly
+TODO\,MB.  The ClangIR front-end is a separate repository (a fork of
+\texttt{llvm-project}) and is not vendored; the exact commit it is tested
+against is pinned in the top-level \texttt{README.md}.
+
+\subsubsection{Hardware dependencies}
+
+A multi-core x86\_64 Linux machine for the \texttt{iomp} and \texttt{libgomp}
+experiments; the parallel runs pin one thread per physical core, so the core
+count sets the achievable speedup.  Building LLVM/MLIR with ClangIR is the
+demanding step (a machine with $\geq$16\,GB of RAM and several cores is
+strongly recommended).  The PULP/GAP8 experiments need no hardware: they run on
+the \texttt{gvsoc} simulator.
+
+\subsubsection{Software dependencies}
+
+CMake $\geq$ 3.20, a C++17 compiler and Ninja; an LLVM/MLIR 23 build ---
+with ClangIR enabled if the C-to-MLIR path is to be exercised, any MLIR 23
+build or install otherwise --- configured with \texttt{LLVM\_INSTALL\_UTILS=ON}
+so that \texttt{FileCheck} and \texttt{lit} are available for the regression
+suite.  The end-to-end drivers additionally need a stock OpenMP compiler
+(\texttt{clang} for \texttt{iomp}, \texttt{gcc} for \texttt{libgomp}) and its
+OpenMP headers, and \texttt{python3} with \texttt{matplotlib} and
+\texttt{numpy} if the figures are to be rendered (the runs succeed without
+them, only the plot is skipped).  For \texttt{pmsis}: the GAP SDK with
+\texttt{gvsoc}, the GAP RISC-V GCC toolchain, an LLVM build with the RISC-V
+(\texttt{xpulpv}) back-end, and the external PolyBench-PULP harness that
+\texttt{PULP\_APP\_DIR} points at.
+
+\subsubsection{Data sets}
+
+PolyBench/C 4.2.1 with OpenMP pragmas.  Two kernels (\texttt{gemm} and
+\texttt{atax}, plus the PolyBench support code) are vendored under
+\texttt{test/Integration/kernels/} so that a first run is self-contained; the
+full suite is used by pointing \texttt{POLYBENCH} at an external checkout and
+setting \texttt{SUITE=full}.  Inputs are generated by PolyBench itself from the
+selected dataset macro; no external data files are needed.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Installation}
+
+\noindent 1.\ Obtain an LLVM/MLIR 23 build with ClangIR:
+
+{\small
+\begin{verbatim}
+git clone -b users/lucap/cir-omp-clauses \
+  https://github.com/EEESlab/llvm-project.git
+git -C llvm-project checkout 9be70f177d9b
+cmake -S llvm-project/llvm -B llvm-project/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_PROJECTS="clang;mlir;lld" \
+  -DCLANG_ENABLE_CIR=ON \
+  -DLLVM_TARGETS_TO_BUILD="X86;RISCV" \
+  -DLLVM_INSTALL_UTILS=ON
+cmake --build llvm-project/build
+\end{verbatim}
+}
+
+\noindent 2.\ Build the tool against it:
+
+{\small
+\begin{verbatim}
+git clone https://github.com/EEESlab/mlir-opt-omp.git
+cmake -S mlir-opt-omp -B mlir-opt-omp/build -G Ninja \
+  -DMLIR_DIR=<LLVM_DIR>/lib/cmake/mlir
+cmake --build mlir-opt-omp/build
+\end{verbatim}
+}
+
+\noindent where \texttt{<LLVM\_DIR>} is either the build tree from step 1 or an
+install prefix.
+
+\noindent 3.\ Tell the end-to-end drivers where the tools are (a single file at
+the repository root; the drivers validate it at start-up and report which entry
+is wrong):
+
+{\small
+\begin{verbatim}
+cp local.env.example local.env
+$EDITOR local.env     # LLVM_BIN, OMP_TOOL_BIN, INC_OMP
+\end{verbatim}
+}
+
+\noindent Ready-made configurations for the machines the work was developed on
+are under \texttt{docs/setups/}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Experiment workflow}
+
+\noindent {\bf E1 --- passes (minutes, no runtime needed).}
+
+{\small
+\begin{verbatim}
+cmake --build build --target check-omp
+\end{verbatim}
+}
+
+\noindent The same module lowered onto two runtimes, which is the claim the
+rule file embodies:
+
+{\small
+\begin{verbatim}
+build/mlir-opt-omp \
+  test/Regression/wsloop/schedule-static/\
+schedule-static-iomp.mlir \
+  --omp-lower-dsl=rules.dsl --omp-to-omp-lower \
+  --omp-outline --omp-lower-plan \
+  --omp-lower-runtime=iomp | grep 'call @'
+# then again with --omp-lower-runtime=libgomp
+\end{verbatim}
+}
+
+\noindent {\bf E2 --- end-to-end correctness.}
+
+{\small
+\begin{verbatim}
+cd test/Integration
+./run_correctness.sh                    # iomp, bundled
+RUNTIME=libgomp ./run_correctness.sh
+SUITE=full POLYBENCH=/path/to/checkout \
+  ./run_correctness.sh
+\end{verbatim}
+}
+
+\noindent {\bf E3 --- performance (Figures TODO).}
+
+{\small
+\begin{verbatim}
+POLYBENCH=/path/to/checkout \
+  RUN_ENV=configs/paper-libgomp.env PLOT=true ./run_performance.sh
+POLYBENCH=/path/to/checkout \
+  RUN_ENV=configs/paper-iomp.env    PLOT=true ./run_performance.sh
+
+# Shorter, less confident: an environment variable wins over the config file.
+#   REPS=5  halves the time, keeps a deviation over three samples
+#   REPS=3  3.3x faster, the median of three, no deviation
+# The dataset is deliberately not the knob to turn: fewer repetitions cost
+# confidence in a value, a smaller dataset changes which value is measured.
+\end{verbatim}
+}
+
+\noindent {\bf E4 --- tasks.}
+\texttt{tasks/run\_tasks.sh libgomp} (and \texttt{iomp}), two end-to-end checks
+against the real runtime library.
+
+\noindent {\bf E5 --- PULP/GAP8 (Figure TODO), only with the GAP SDK
+installed.}
+
+{\small
+\begin{verbatim}
+RUNTIME=pmsis ./run_correctness.sh
+RUN_ENV=configs/paper-pmsis.env PLOT=true ./run_performance.sh
+
+# PLOT=true renders both PULP figures here: the speedup chart, and a second
+# ..._size.png from the size_* columns that only this target writes.
+# There is no shorter variant: gvsoc is deterministic so every cell runs once,
+# and DATASET is already pinned to MINI by the GAP8 memory budget.
+\end{verbatim}
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Evaluation and expected result}
+
+E1 must report all 74 regression tests passing, and the two invocations must
+show the same loop lowered into \texttt{\_\_kmpc\_*} calls and into
+\texttt{GOMP\_*} calls respectively --- the only difference between the two
+commands being the runtime name.
+
+E2 must report \texttt{PASS} for every kernel in
+\texttt{results\_correctness.csv}: the array dumps of our binary and of the
+stock-compiler binary are compared bit for bit, so this is exact and
+deterministic, and the driver exits non-zero if any kernel is not \texttt{PASS}.
+
+E3 writes \texttt{results\_performance.csv} with one row per kernel and a
+\texttt{GEOMEAN} row.  The claim to check is the \texttt{opt\_vs\_native\_par}
+column and its geometric mean: our lowering is expected to stay within TODO of
+the native toolchain, and \texttt{speedup\_opt} is expected to track
+\texttt{speedup\_native} kernel by kernel (this is what the bar chart shows,
+and it corresponds to Figures TODO of the paper).  Absolute times, and hence
+individual speedups, depend on the machine; the shape of the comparison should
+not.  Cells flagged as noisy (relative std-dev above
+\texttt{VARIANCE\_ACCEPTED}) indicate the machine was not idle.
+
+E5 reproduces the PULP/GAP8 columns: cycles scraped from the \texttt{gvsoc}
+console and the size of the linked ELF.  Being a deterministic simulation,
+these numbers should match the paper's exactly for the same SDK version.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Experiment customization}
+
+Everything is driven by environment variables, set inline, in
+\texttt{test/Integration/run.env} or in \texttt{local.env}, in that order of
+precedence: \texttt{RUNTIME} (\texttt{iomp}, \texttt{libgomp},
+\texttt{pmsis}), \texttt{SUITE} (\texttt{bundled}, \texttt{full}) or an
+explicit \texttt{KERNELS} list, \texttt{DATASET}, \texttt{THREADS},
+\texttt{REPS}, \texttt{VARIANCE\_ACCEPTED}, \texttt{BARRIER\_ELIM},
+\texttt{PLOT} and \texttt{OUTDIR}.  Results of different runtimes and of the
+barrier-elimination variant land in separate directories, so runs never
+overwrite each other.  The full reference is the ``Configuration reference''
+section of \texttt{test/Integration/README.md}.
+
+The lowering itself is customised without rebuilding: \texttt{rules.dsl} is
+read at run time, so adding a runtime or changing how a construct is emitted is
+an edit to that file, passed with \texttt{--omp-lower-dsl=<file>} (or
+\texttt{RULES=<file>} for the drivers).  Constructs whose lowering needs
+primitives the DSL does not express still require C++ changes in the outlining
+pass.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Notes}
+
+The OpenMP emission this pipeline consumes is not upstream in ClangIR yet,
+which is why the pinned fork is required for the C-to-MLIR path; starting from
+\texttt{.mlir} input, any LLVM/MLIR 23 build works, and E1 is reproducible
+there.  \texttt{INC\_OMP} must point at the OpenMP headers of the same GCC the
+\texttt{libgomp} baseline uses, or the front-end and the baseline disagree.
+The strict floating-point flags applied to both sides are deliberate: without
+them FMA contraction and reordered reductions make iterative kernels diverge
+even though both binaries are IEEE-correct.  The spinning wait policy is there
+for repeatability, not speed --- numbers taken with it are not comparable with
+numbers taken without it.  Finally, the \texttt{pmsis} path drives an external
+PolyBench-PULP harness (\texttt{PULP\_APP\_DIR}) that is not part of this
+repository; TODO: say where reviewers get it.
