@@ -6,7 +6,8 @@ Reproduces Table 1 of the paper's supplementary material: 21,761 attributed
 lines out of 82,400, over 15 files. Which files and which entities count, and
 why, is in README.md.
 
-Usage:  gcc_omp_loc.py [--root PATH]      # GCC checkout, or $GCC_SRC
+Usage:  gcc_omp_loc.py [--root PATH]   # GCC checkout at PIN, or $GCC_SRC
+                                       # (README.md: how to get one)
 """
 import argparse
 import os
@@ -423,7 +424,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--root', default=os.environ.get('GCC_SRC', '.'),
                     help='GCC checkout (default: $GCC_SRC, or .)')
+    ap.add_argument('--list-files', action='store_true',
+                    help='print the files counted, and exit')
     args = ap.parse_args()
+    if args.list_files:
+        for path in FILES:
+            print(path)
+        return 0
     root = os.path.abspath(args.root)
     if not os.path.isfile(os.path.join(root, 'gcc', 'omp-low.cc')):
         sys.exit('%s is not a GCC checkout (no gcc/omp-low.cc)' % root)

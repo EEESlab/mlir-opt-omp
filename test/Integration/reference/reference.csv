@@ -16,7 +16,7 @@
 # Kernel order is the order the figures use, which is the suite
 # order of ALL_KERNELS in lib/kernels.sh -- not alphabetical.
 #
-kernel;fig4_native;fig4_our;fig5_native;fig5_our;fig6_native;fig6_our;fig7_native;fig7_our;fig8_native
+kernel;fig4_native;fig4_our;fig5_native;fig5_our;fig6_native;fig6_our;fig7_size_native;fig7_size_our;fig8_unroll_pct
 covariance;4.4772;4.5021;4.4399;4.4111;4.5103;4.462;0.0689;0.0926;
 correlation;4.4629;4.5037;4.4597;4.4447;4.0338;4.7302;0.3886;0.0924;2.8086
 jacobi-1d;6.7522;7.4137;2.8483;2.7725;6.3138;6.223;0.0752;0.1064;

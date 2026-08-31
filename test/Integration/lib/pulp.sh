@@ -47,6 +47,10 @@ PULP_LLC_FLAGS="${PULP_LLC_FLAGS:--O3 -mtriple=riscv32-unknown-elf -mattr=+m,+c,
 PULP_BUILD_BIN="${PULP_BUILD_BIN:-BUILD/GAP8_V3/GCC_RISCV_PULPOS/test}"
 PULP_POLYBENCH_DEFS="${PULP_POLYBENCH_DEFS:--DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME -DDATA_TYPE_IS_FLOAT}"
 PULP_VERBOSE="${PULP_VERBOSE:-0}"            # 1: stream make/gvsoc output
+# A cir-opt pass to run on the CIR before --cir-to-llvm. Empty here and set
+# per cell by run_unroll.sh, the same way run_performance.sh sets
+# BARRIER_ELIM_FLAG for the mlir-opt-omp call below.
+CIR_UNROLL_FLAG="${CIR_UNROLL_FLAG:-}"
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -91,8 +95,12 @@ compile_pulp_kernel_obj() {
         -DPULP_TARGET -D"$DATASET" $PULP_POLYBENCH_DEFS \
         "$src" -o "$tmpdir/$name.cir" || { rm -rf "$tmpdir"; return 1; }
 
-    # 2) CIR -> LLVM dialect MLIR (strip residual cir.* attrs)
-    "$CIR_OPT" "$tmpdir/$name.cir" --cir-to-llvm --reconcile-unrealized-casts \
+    # 2) CIR -> LLVM dialect MLIR (strip residual cir.* attrs). A CIR-level
+    #    pass, when one was asked for, runs here: on the CIR, while it is
+    #    still there to work on.
+    "$CIR_OPT" "$tmpdir/$name.cir" \
+        ${CIR_UNROLL_FLAG:+$CIR_UNROLL_FLAG} \
+        --cir-to-llvm --reconcile-unrealized-casts \
         -o "$tmpdir/$name-s1.mlir" || { rm -rf "$tmpdir"; return 1; }
     sed -i -E 's/cir\.[^,}]+,? ?//g' "$tmpdir/$name-s1.mlir"
 
@@ -123,7 +131,8 @@ compile_pulp_kernel_obj() {
     "$PULP_LLC" $PULP_LLC_FLAGS -filetype=obj "$tmpdir/$name.opt.ll" \
         -o "$PULP_APP_DIR/kernel.o" || { rm -rf "$tmpdir"; return 1; }
 
-    cp "$tmpdir/$name.opt.ll" "$outdir/${name}_omp-${omp}.ll"
+    cp "$tmpdir/$name.opt.ll" \
+        "$outdir/${name}_omp-${omp}${CIR_UNROLL_FLAG:+_unrolled}.ll"
     rm -rf "$tmpdir"
     [ -f "$PULP_APP_DIR/kernel.o" ]
 }

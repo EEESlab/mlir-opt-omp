@@ -178,6 +178,32 @@ plot_python() {
     printf '%s' "$py"
 }
 
+# --- The paper's own claims -------------------------------------------------
+# reference/claims.csv holds what the paper states in prose, one row per
+# sentence, so a driver can check its own totals against it instead of leaving
+# them to be read off the screen. reference/reference.csv is the other half:
+# what the figures plot. See reference/README.md.
+CLAIMS="$INTEGRATION_DIR/reference/claims.csv"
+
+# claim_row <metric> <subject> -> "value tolerance", empty when the file or the
+# row is missing. The header line cannot collide: its 4th field is the literal
+# "metric", which is not one.
+claim_row() {
+    [ -f "$CLAIMS" ] || return 0
+    awk -F';' -v m="$1" -v s="$2" \
+        '!/^#/ && $4 == m && $5 == s { print $7, $8; exit }' "$CLAIMS"
+}
+
+# claim_verdict <measured> <value> <tolerance> -> "as published" | "DIFFERS"
+claim_verdict() {
+    if awk -v m="$1" -v v="$2" -v t="${3:-0}" \
+           'BEGIN { exit !(m - v <= t && v - m <= t) }'; then
+        echo "as published"
+    else
+        echo "DIFFERS"
+    fi
+}
+
 . "$COMMON_DIR/kernels.sh"
 # shellcheck source=native.sh
 . "$COMMON_DIR/native.sh"

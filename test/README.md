@@ -1,6 +1,7 @@
 # Tests
 
-Two layers, following the LLVM/MLIR convention.
+Two layers of tests, following the LLVM/MLIR convention, plus the
+lines-of-code measurement the paper reports.
 
 ## Regression tests (`Regression/`) — lit + FileCheck
 
@@ -217,3 +218,11 @@ Fully parametrized via env vars / `run.env` — see [`Integration/README.md`](In
 These depend on the full toolchain (clang/clangir, cir-opt, mlir tools, the
 OpenMP runtime libraries) and a PolyBench checkout, so they are slower and
 environment-dependent; keep them for whole-pipeline / numerical validation.
+
+## Lowering complexity analysis (`LoC/`)
+
+Not tests: the two scripts behind the lines-of-code comparison of Section 4.4,
+which count how much of GCC and of Clang a minimal lowering of the supported
+constructs takes. They run over external GCC and llvm-project checkouts, at the
+commits the paper pins, and reproduce Tables 1 and 2 of the supplementary
+material. See [`LoC/README.md`](LoC/README.md).

@@ -27,6 +27,7 @@ config.test_exec_root = os.path.join(config.omp_lower_obj_root, "test")
 config.excludes = [
     "Inputs",
     "Integration",
+    "LoC",
     "CMakeLists.txt",
     "README.md",
     "lit.cfg.py",

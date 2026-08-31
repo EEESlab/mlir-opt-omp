@@ -12,6 +12,9 @@ kernels and the same `run.env`:
 - **`run_barrier_vs_native.sh`** — counts the team barriers left with and
   without `--omp-barrier-elim`, against clang's and gcc's count on the same
   kernels (see [Barrier elimination](#barrier-elimination)).
+- **`run_unroll.sh`** — what the CIR unroll-by-two pass is worth on GAP8,
+  which is Figure 8 (see [CIR unrolling](#cir-unrolling)). `pmsis` only,
+  and only with a `cir-opt` that carries the pass.
 
 A third driver covers the constructs and clauses PolyBench never writes — which
 is most of them (see [`constructs/`](constructs/)):
@@ -203,9 +206,23 @@ speedup is not comparable at all.
 | # | check | compares against | transfers? |
 |---|---|---|---|
 | 1 | **parity** — `speedup_opt / speedup_native` per kernel | the run itself | **yes** — a property of the compiler, and the paper's central claim |
-| 2 | **named kernels** — `doitgen` ahead on libgomp, `floyd-warshall`/`deriche`/`nussinov` behind on pmsis | §4.2 and §4.3, which name them | yes, they are claims about a mechanism |
-| 3 | **size** increase below 0.7% (pmsis only) | §4.3, an exact number | yes, decided by the compiler |
-| 4 | **absolute** speedups | [`reference/`](reference/) | **no** — orientation only |
+| 2 | **named kernels** — `doitgen` ahead on libgomp, `floyd-warshall`/`deriche`/`nussinov` behind on pmsis | [`reference/claims.csv`](reference/claims.csv), §4.2 and §4.3 | yes, they are claims about a mechanism |
+| 3 | **size** increase below 0.7% (pmsis only), and against Figure 7 itself | [`reference/claims.csv`](reference/claims.csv) §4.3, then `fig7_size_our` | yes, decided by the compiler |
+| 4 | **absolute** speedups | [`reference/reference.csv`](reference/reference.csv) | **no** — orientation only |
+| 6 | **claims nothing checks** — an inventory, not a check | [`reference/claims.csv`](reference/claims.csv) | — |
+
+What checks 2 and 3 expect is not written into the script: it is one row per
+sentence in [`reference/claims.csv`](reference/claims.csv), so the paper and
+the check that guards it stay one edit apart. Section 6 then prints the rows
+for this runtime that **no** driver reads, because a number in the paper with
+nothing behind it is exactly the kind that rots quietly.
+
+The two files under `reference/` divide the work strictly: `claims.csv` is what
+the paper *says*, typed in from the text; `reference.csv` is what its figures
+*plot*, read back out of the vector files. Where they disagree the paper has a
+problem — §4.3 claims the size increase stays below 0.7% and `fig7_size_our`
+reaches 0.7296 on `nussinov` — and keeping them apart is what makes that
+visible instead of averaged away.
 
 Check 1 needs no reference file: it is computed from the CSV that has just been
 written, and it is the strongest of the four because `preserves performance
@@ -367,6 +384,14 @@ else those files carry (`POLYBENCH`, the tool paths, `DATASET`, `KERNELS`,
 `RUNTIME=libgomp ./run_barrier_vs_native.sh` *is* refused: that asks for a
 comparison this script cannot make.
 
+On a full-suite run the four totals are checked against §4.5, which states all
+of them (59 without the pass, 26 with it, 45 for Clang, 28 for GCC at `-O0`);
+the expected values come from [`reference/claims.csv`](reference/claims.csv).
+A subset run, or one where a kernel failed to build, says why it is not
+comparing rather than comparing a short sum. A total that differs is not
+automatically a regression — one extra rule in the DSL moves these numbers, and
+the sentence in the paper is then the thing to revisit.
+
 Every file a number was counted in is kept, one directory per kernel, so the
 table can be rechecked instead of taken on trust:
 
@@ -526,6 +551,14 @@ two full runs the split flow needs.
 RUNTIME=pmsis BARRIER_ELIM=both PLOT=true ./run_performance.sh
 ```
 
+On a full-suite `pmsis` run the summary is followed by the four aggregates §4.5
+states — the 0.037% saving, 22 of 30 kernels improving, and the two ends of the
+per-kernel range — read against
+[`reference/claims.csv`](reference/claims.csv). The kernel currently holding
+the best and the worst delta is printed beside them, because the paper names
+`trisolv` at the top of that range and a different name there means the
+sentence needs one too.
+
 Two things do not carry over there, both of them simplifications. There is no
 alternation, because gvsoc has no drift to cancel, and no repetitions, because
 a second run of the same binary returns the same cycle count. So the deviation
@@ -550,6 +583,60 @@ kernel with its error bar, and the ones that do not clear it drawn in grey.
 Host runtimes only. On `pmsis` gvsoc is deterministic — `REPS` does not even
 apply — so two ordinary runs already compare exactly, and the driver says so
 rather than pretending the mode is needed.
+
+## CIR unrolling
+
+Figure 8 is the other half of §4.5: what a CIR-level unroll-by-two is worth on
+GAP8, and the case for keeping OpenMP in MLIR long enough that a CIR pass can
+still run underneath it.
+
+```sh
+RUNTIME=pmsis ./run_unroll.sh     # -> results/pmsis/results_unroll.csv
+```
+
+Per kernel it builds the parallel binary twice — with the pass and without —
+runs both on gvsoc and reports the cycle saving. One run per cell: the
+simulator is deterministic.
+
+**The pass is not in this repository.** It is a CIR pass, so it belongs to the
+ClangIR fork whose `cir-opt` this harness calls, and at the time of writing no
+`cir-opt` here carries it. The driver looks for it in `cir-opt --help`, and
+when it is missing it refuses and lists what that build does offer, rather than
+running two identical binaries and reporting a saving of zero. If the pass is
+spelled in a way the search misses, name it:
+
+```sh
+CIR_UNROLL_PASS=--your-pass ./run_unroll.sh
+```
+
+By default it runs the **11 kernels Figure 8 plots**, and it gets that list
+from `fig8_unroll_pct` in [`reference/reference.csv`](reference/reference.csv)
+rather than from a second copy — the figure decides its own kernel set. `ALL=1`
+runs the whole suite; the paper says the remaining kernels are only marginally
+affected, which is a claim `ALL=1` is the way to test.
+
+Two comparisons come out at the end: the two sentences of §4.5 (about 3% across
+the ten applications, about 24% on `floyd-warshall`) from
+[`reference/claims.csv`](reference/claims.csv), and then every kernel against
+the bar Figure 8 draws for it. The second is worth doing per kernel rather than
+in aggregate — unlike a host speedup, these were measured on a simulator anyone
+can rerun, so a divergence is a real difference and not the hardware.
+
+What it measures is the change in **parallel run time**, not in the
+parallel-speedup ratio. §4.5 calls it a "speedup increment", which admits both
+readings; unrolling also speeds up the sequential build, so in a ratio of two
+speedups each taken against its own sequential cell the gain would largely
+cancel and 24% could not survive. The driver's header states this reading
+explicitly, and if it is wrong the per-kernel comparison against Figure 8 is
+where it will show.
+
+Both `.ll` files are kept per kernel, so what the pass did is a diff away:
+
+```
+results/pmsis/unroll/<kernel>-omp/
+  <kernel>-omp_omp-on.ll           without the pass
+  <kernel>-omp_omp-on_unrolled.ll  with it
+```
 
 ## PULP / gvsoc (`RUNTIME=pmsis`)
 
@@ -687,6 +774,8 @@ See [PULP / gvsoc](#pulp--gvsoc-runtimepmsis) for what these drive.
 | `PULP_BUILD_BIN` | `BUILD/GAP8_V3/GCC_RISCV_PULPOS/test` | linked ELF relative to `PULP_APP_DIR`, used for the size columns |
 | `PULP_POLYBENCH_DEFS` | `-DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME` | defines baked into the opt `kernel.o`; **must match** the harness Makefile's native builds |
 | `PULP_VERBOSE`   | `0`     | `1` → stream the make/gvsoc output instead of logging it |
+| `CIR_UNROLL_PASS` | *auto-detected* | `run_unroll.sh` only: the `cir-opt` unrolling pass. Found in `cir-opt --help` when it is there; set this when it is spelled unexpectedly |
+| `ALL`            | `false` | `run_unroll.sh` only: run the whole suite instead of the 11 kernels Figure 8 plots |
 
 ### Advanced
 

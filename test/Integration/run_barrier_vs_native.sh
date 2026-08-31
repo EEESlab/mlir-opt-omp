@@ -12,6 +12,9 @@
 #   VERBOSE=1 ./run_barrier_vs_native.sh             # let the tools report why
 #
 # RUNTIME=iomp only. Leaves results_barrier_vs_native.csv.
+#
+# The four totals are what section 4.5 states, so on a full-suite run they are
+# checked against reference/claims.csv rather than left to be read.
 
 set -uo pipefail
 
@@ -102,6 +105,12 @@ else
     select_kernels
 fi
 
+# The published totals are sums over the whole suite, so a subset must not be
+# compared with them. Counting is enough: it also covers KERNELS= and a hand
+# written list that happens to be complete.
+FULL_SUITE=0
+[ "${#KERNEL_LIST[@]}" -eq "${#ALL_KERNELS[@]}" ] && FULL_SUITE=1
+
 echo "=== TEAM BARRIERS: OURS vs CLANG (both after -O3) ==="
 echo "runtime:   $RUNTIME (fixed)    dataset: $DATASET"
 echo "polybench: $POLYBENCH"
@@ -171,6 +180,64 @@ if [ "$T_GCC" -gt 0 ]; then
     echo "    the barrier sequence into it (28 -> 43 over the full suite; -O3"
     echo "    -fno-thread-jumps puts every kernel back on its -O0 number). Say"
     echo "    which stage when quoting the column."
+fi
+
+# --- against the paper -------------------------------------------------------
+# Section 4.5 gives all four of these numbers, and they are the kind that goes
+# stale without anyone noticing: one extra rule in the DSL moves them, and the
+# sentence stays as it was.
+compare_to_claims() {
+    local rows=0 bad=0
+    echo
+    echo "  === AGAINST SECTION 4.5 (reference/claims.csv) ==="
+    printf '  %-16s %9s %9s   %s\n' subject measured paper verdict
+    local pair subject measured value tol verdict
+    for pair in "ours_baseline:$T_BASE" "ours_elim:$T_ELIM" \
+                "clang:$T_CLANG" "gcc_o0:$T_GCC"; do
+        subject="${pair%%:*}"; measured="${pair#*:}"
+        # cleared first: read leaves them untouched when claim_row finds no
+        # row, and the previous subject's numbers would be compared again.
+        value=""; tol=""
+        read -r value tol < <(claim_row team_barriers "$subject")
+        [ -z "${value:-}" ] && continue
+        # gcc absent leaves its total at 0, which is a missing column rather
+        # than a count of zero.
+        if [ "$subject" = "gcc_o0" ] && [ "$measured" -eq 0 ]; then
+            printf '  %-16s %9s %9s   not built here\n' \
+                "$subject" "-" "$value"
+            continue
+        fi
+        rows=$((rows + 1))
+        verdict="$(claim_verdict "$measured" "$value" "${tol:-0}")"
+        [ "$verdict" = "DIFFERS" ] && bad=$((bad + 1))
+        printf '  %-16s %9s %9s   %s\n' \
+            "$subject" "$measured" "$value" "$verdict"
+    done
+    if [ "$rows" -eq 0 ]; then
+        echo "  no team_barriers rows in $CLAIMS"
+        return 0
+    fi
+    echo
+    if [ "$bad" -eq 0 ]; then
+        echo "  All $rows reproduce."
+    else
+        echo "  $bad of $rows differ. That is not automatically a regression:"
+        echo "  these are counts the paper states in prose, so the sentence in"
+        echo "  section 4.5 may simply be the thing that is out of date."
+    fi
+}
+
+if [ "$FULL_SUITE" -eq 1 ] && [ "$FAILED" -eq 0 ]; then
+    compare_to_claims
+elif [ -f "$CLAIMS" ]; then
+    echo
+    if [ "$FULL_SUITE" -ne 1 ]; then
+        echo "  Not compared with section 4.5: the published totals are sums"
+        echo "  over all ${#ALL_KERNELS[@]} kernels and this run had ${#KERNEL_LIST[@]}."
+    else
+        echo "  Not compared with section 4.5: a kernel failed, so the totals"
+        echo "  are short by whatever it would have contributed."
+    fi
 fi
 
 echo

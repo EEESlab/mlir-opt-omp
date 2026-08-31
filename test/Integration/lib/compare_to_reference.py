@@ -34,6 +34,11 @@
 #                  measured on other hardware, and an absolute speedup does not
 #                  survive a change of machine.
 #
+# Checks 2 and 3 read what they expect from reference/claims.csv rather than
+# carrying it here, so that a sentence in the paper and the check that guards
+# it stay one edit apart. The constants below are the fallback for a checkout
+# without that file, and say what it used to hold.
+#
 # Exit status is 0 unless --strict is given, in which case only check 3 -- the
 # one exact number -- can exit 1. The rest are readings, not assertions.
 # =============================================================================
@@ -51,23 +56,27 @@ REFERENCE_COLUMNS = {
     "pmsis": ("fig6_native", "fig6_our", "Figure 6"),
 }
 
-# Kernels the paper calls out by name, and which way it expects them to go.
-# "ahead" means our speedup should beat the native one, "behind" the reverse.
-# Named kernels are the checks that transfer best after the exact numbers,
-# because they are claims about a mechanism rather than about a measurement.
-KNOWN_OUTLIERS = {
-    "libgomp": ("section 4.2", "ahead of", ["doitgen"]),
-    "pmsis": ("section 4.3", "behind",
-              ["floyd-warshall", "deriche", "nussinov"]),
-}
+# Fallback for a checkout without reference/claims.csv: the same rows that
+# file holds, in the shape the loader hands on. Kernels the paper calls out by
+# name are the checks that transfer best after the exact numbers, because they
+# are claims about a mechanism rather than about a measurement.
+FALLBACK_CLAIMS = [
+    ("doitgen-ahead", "4.2", "libgomp", "speedup_ratio", "doitgen",
+     "above", 1.0, 0.10),
+    ("floyd-warshall-behind", "4.3", "pmsis", "speedup_ratio",
+     "floyd-warshall", "below", 1.0, 0.10),
+    ("deriche-behind", "4.3", "pmsis", "speedup_ratio", "deriche",
+     "below", 1.0, 0.10),
+    ("nussinov-behind", "4.3", "pmsis", "speedup_ratio", "nussinov",
+     "below", 1.0, 0.10),
+    ("size-bound", "4.3", "pmsis", "size_increase_pct", "all",
+     "max", 0.7, None),
+]
 
 # How far the parallel and sequential deficits may differ before the slowdown
 # stops being uniform. Below this they are the same number, which is what makes
 # it a codegen fact rather than a parallelisation one.
 UNIFORM_TOLERANCE = 0.05
-
-# Section 4.3: "the increase remains below 0.7% in all instances".
-SIZE_BOUND_PCT = 0.7
 
 # How far opt/native may stray before it is worth a look. Neither is a spec;
 # they only decide which rows get printed as notable.
@@ -89,6 +98,11 @@ def parse_args(argv):
         "--reference",
         default=os.path.join(here, os.pardir, "reference", "reference.csv"),
         help="reference CSV (default: ../reference/reference.csv)",
+    )
+    p.add_argument(
+        "--claims",
+        default=os.path.join(here, os.pardir, "reference", "claims.csv"),
+        help="claims CSV (default: ../reference/claims.csv)",
     )
     p.add_argument(
         "--strict", action="store_true",
@@ -132,6 +146,45 @@ def read_rows(path, skip_comments=False):
             continue
         rows[short_name(name)] = row
     return rows
+
+
+def read_claims(path):
+    """The paper's prose claims, as a list of dicts.
+
+    Falls back to FALLBACK_CLAIMS when the file is absent, so a checkout
+    without it behaves exactly as this script did before the file existed.
+    Rows the file carries but nothing here reads (the barrier counts, the
+    unroll gains) are kept: section 6 reports them as coverage.
+    """
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            lines = [ln for ln in f if not ln.lstrip().startswith("#")]
+    except OSError:
+        return [
+            {"claim": c, "section": sec, "runtime": rt, "metric": m,
+             "subject": subj, "relation": rel, "value": val,
+             "tolerance": tol, "checked_by": os.path.basename(__file__)}
+            for c, sec, rt, m, subj, rel, val, tol in FALLBACK_CLAIMS
+        ]
+    claims = []
+    for row in csv.DictReader(lines, delimiter=";"):
+        name = (row.get("claim") or "").strip()
+        if not name:
+            continue
+        row = {k: (v or "").strip() for k, v in row.items() if k}
+        row["claim"] = name
+        row["value"] = num(row.get("value"))
+        row["tolerance"] = num(row.get("tolerance"))
+        if row["value"] is None:
+            continue
+        claims.append(row)
+    return claims
+
+
+def select_claims(claims, metric, runtime=None):
+    return [c for c in claims
+            if c.get("metric") == metric
+            and (runtime is None or c.get("runtime") in (runtime, "any"))]
 
 
 def geomean(values):
@@ -229,49 +282,58 @@ def report_uniformity(run):
         print("   itself and is not explained by code generation.")
 
 
-def check_outliers(run, runtime, strict):
+def check_outliers(run, runtime, claims, strict):
     """The kernels the paper names, and which way it expects each to go.
 
-    These are claims about a mechanism — GCC leaving a loop-invariant guard
+    These are claims about a mechanism -- GCC leaving a loop-invariant guard
     inside doitgen's region that LLVM unswitches away, PULP GCC emitting
-    cheaper barrier sequences — so unlike a speedup value they should hold on
+    cheaper barrier sequences -- so unlike a speedup value they should hold on
     any machine. A named kernel that stops reproducing is not necessarily a
     regression: it can equally mean the sentence in the paper has gone out of
     date, which is worth knowing before the paper is submitted.
     """
-    if runtime not in KNOWN_OUTLIERS:
-        print("2. NAMED KERNELS - none for this runtime, skipped")
+    rows = select_claims(claims, "speedup_ratio", runtime)
+    if not rows:
+        print("2. NAMED KERNELS - none claimed for this runtime, skipped")
         print()
         return True
 
-    section, direction, names = KNOWN_OUTLIERS[runtime]
-    print("2. NAMED KERNELS - {} expects ours {} the native compiler here"
-          .format(section, direction))
+    sections = sorted({r["section"] for r in rows})
+    print("2. NAMED KERNELS - the kernels section{} {} call{} out by name"
+          .format("" if len(sections) == 1 else "s",
+                  ", ".join(sections),
+                  "s" if len(sections) == 1 else ""))
     print()
+    print("   {:<18}{:>9}{:>9}{:>9}{:>13}   {}".format(
+        "kernel", "expects", "native", "ours", "ours/native", "verdict"))
 
     reproduced, checked = 0, 0
-    for name in names:
+    for claim in rows:
+        name = claim["subject"]
+        wants = "ahead" if claim["relation"] == "above" else "behind"
         row = run.get(name)
         if row is None:
-            print("   {:<18}not in this run".format(name))
+            print("   {:<18}{:>9}   not in this run".format(name, wants))
             continue
         native, our = num(row.get("speedup_native")), num(row.get("speedup_opt"))
         if native is None or our is None or native <= 0:
-            print("   {:<18}no usable numbers".format(name))
+            print("   {:<18}{:>9}   no usable numbers".format(name, wants))
             continue
         checked += 1
         ratio = our / native
-        # A kernel within a few percent either way has simply stopped being an
-        # outlier, which is a third outcome and not a failure.
-        if abs(ratio - 1.0) <= PARITY_CLOSE:
+        target = claim["value"]
+        band = claim["tolerance"] if claim["tolerance"] is not None else 0.0
+        # A kernel within the claim's dead band either way has simply stopped
+        # being an outlier, which is a third outcome and not a failure.
+        if abs(ratio - target) <= band:
             verdict = "at parity now"
-        elif (ratio > 1.0) == direction.startswith("ahead"):
+        elif (ratio > target) == (claim["relation"] == "above"):
             verdict = "as documented"
             reproduced += 1
         else:
-            verdict = "REVERSED, ours " + ("ahead" if ratio > 1 else "behind")
-        print("   {:<18}native {:>6.2f}   ours {:>6.2f}   {:>6.3f}   {}".format(
-            name, native, our, ratio, verdict))
+            verdict = "REVERSED, ours " + ("ahead" if ratio > target else "behind")
+        print("   {:<18}{:>9}{:>9.2f}{:>9.2f}{:>13.3f}   {}".format(
+            name, wants, native, our, ratio, verdict))
 
     if checked:
         print()
@@ -283,24 +345,27 @@ def check_outliers(run, runtime, strict):
     return True
 
 
-def check_size(run, runtime, strict):
+def check_size(run, runtime, claims, reference, strict):
     """Section 4.3: below 0.7% in all instances. The size_* columns exist only
     on the PULP path, which is also the only target where the footprint is a
     result rather than a footnote."""
-    if runtime != "pmsis":
+    rows = select_claims(claims, "size_increase_pct", runtime)
+    if runtime != "pmsis" or not rows:
         print("3. SIZE - pmsis only (the size_* columns), skipped")
         print()
         return True
-    print("3. SIZE - section 4.3 expects every increase below {}%".format(
-        SIZE_BOUND_PCT))
-    over, checked = [], 0
+    bound = rows[0]["value"]
+    print("3. SIZE - section {} expects every increase below {}%".format(
+        rows[0]["section"], bound))
+    over, checked, ours = [], 0, {}
     for name, row in run.items():
         seq, par = num(row.get("size_opt_seq")), num(row.get("size_opt_par"))
         if seq is None or par is None or seq <= 0:
             continue
         checked += 1
         pct = (par / seq - 1.0) * 100.0
-        if pct > SIZE_BOUND_PCT:
+        ours[name] = pct
+        if pct > bound:
             over.append((name, pct))
     if not checked:
         print("   no size_* columns in this CSV - is this a pmsis run?")
@@ -312,8 +377,37 @@ def check_size(run, runtime, strict):
             print("     {:<18}{:>8.2f}%".format(name, pct))
     else:
         print("   all {} kernels within the bound".format(checked))
+    compare_size_to_figure(ours, reference)
     print()
     return not over or not strict
+
+
+def compare_size_to_figure(ours, reference):
+    """The one place where a published value should reproduce exactly.
+
+    A speedup does not survive a change of machine, but a binary size is not a
+    measurement of a machine at all: the same sources through the same
+    toolchain give the same bytes. So unlike check 4, a divergence here is
+    either a different SDK or a real change in what we emit -- and the second
+    is worth knowing. Figure 7 is the only figure this applies to.
+    """
+    pairs = []
+    for name, pct in ours.items():
+        published = num((reference.get(name) or {}).get("fig7_size_our"))
+        if published is not None:
+            pairs.append((name, pct, published))
+    if not pairs:
+        return
+    worst = max(pairs, key=lambda t: abs(t[1] - t[2]))
+    close = sum(1 for _, pct, pub in pairs if abs(pct - pub) <= 0.05)
+    print()
+    print("   Against Figure 7 itself: {}/{} kernels within 0.05 points of"
+          .format(close, len(pairs)))
+    print("   the published value, furthest is {} ({:.3f}% here, {:.3f}%"
+          .format(worst[0], worst[1], worst[2]))
+    print("   published). This one should reproduce: a binary size is decided")
+    print("   by the toolchain, not by the machine running it, so a gap means")
+    print("   a different SDK or a real change in what we emit.")
 
 
 def check_absolute(run, reference, runtime):
@@ -353,7 +447,7 @@ def check_absolute(run, reference, runtime):
     print()
 
 
-def explain_how(csv_path, runtime):
+def explain_how(csv_path, runtime, claims):
     """Every number above, traced back to the columns it came from.
 
     A summary a reader cannot re-derive is a summary they have to trust, and
@@ -373,8 +467,11 @@ def explain_how(csv_path, runtime):
     print("   uniformity  the geomean of opt_vs_native_par against that of")
     print("               opt_vs_native_seq. Same number = codegen; different")
     print("               = something the parallel path is doing.")
-    if runtime == "pmsis":
-        print("   size        size_opt_par / size_opt_seq - 1, against 0.7%.")
+    size_claims = select_claims(claims, "size_increase_pct", runtime)
+    if size_claims:
+        print("   size        size_opt_par / size_opt_seq - 1, against {}%,"
+              .format(size_claims[0]["value"]))
+        print("               and against fig7_size_our of reference.csv.")
     print("   absolute    speedup_opt against {} of reference.csv, which is".format(
         our_col))
     print("               what {} plots. Orientation only: other hardware.".format(
@@ -388,6 +485,29 @@ def explain_how(csv_path, runtime):
     print("   The four cells behind a row are kept next to it, so a surprising")
     print("   number can be run again by hand rather than taken on faith:")
     print("   results/{}/<kernel>-omp/performance/".format(runtime))
+    print()
+    print("   What checks 2 and 3 expect is not written into this script: it")
+    print("   is in reference/claims.csv, one row per sentence of the paper.")
+    print()
+
+
+def report_uncovered(claims, runtime):
+    """Claims about this runtime that nothing checks.
+
+    Printing them is the point. A number in the paper with no driver behind it
+    is exactly the kind that rots quietly, and a coverage gap is easier to act
+    on when it is named than when it is simply absent.
+    """
+    mine = [c for c in claims
+            if c.get("runtime") in (runtime, "any")
+            and c.get("checked_by", "-") in ("", "-")]
+    if not mine:
+        return
+    print("6. CLAIMS NOTHING CHECKS - {} for this runtime".format(len(mine)))
+    print()
+    for c in mine:
+        print("   {:<22}section {:<5}{} {} {}".format(
+            c["claim"], c["section"], c["metric"], c["relation"], c["value"]))
     print()
 
 
@@ -410,15 +530,18 @@ def main(argv):
     print("Runtime: {}   kernels: {}".format(args.runtime, len(run)))
     print()
 
+    claims = read_claims(args.claims)
+
     check_parity(run)
-    ok_outliers = check_outliers(run, args.runtime, args.strict)
-    ok_size = check_size(run, args.runtime, args.strict)
+    ok_outliers = check_outliers(run, args.runtime, claims, args.strict)
+    ok_size = check_size(run, args.runtime, claims, reference, args.strict)
     if reference:
         check_absolute(run, reference, args.runtime)
     else:
         print("4. ABSOLUTE - skipped, no reference at {}".format(args.reference))
         print()
-    explain_how(args.csv, args.runtime)
+    explain_how(args.csv, args.runtime, claims)
+    report_uncovered(claims, args.runtime)
 
     if args.strict and not (ok_outliers and ok_size):
         sys.exit(1)

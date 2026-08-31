@@ -1,7 +1,18 @@
 # Reference results
 
-The values the paper's figures plot, so a run can be compared against something
-instead of being read in isolation.
+The values the paper's figures plot and the numbers its text states, so a run
+can be compared against something instead of being read in isolation.
+
+The two CSVs here divide the work strictly, and the split is the point:
+
+| file | holds | comes from |
+|---|---|---|
+| [`reference.csv`](reference.csv) | what the figures **plot** | read back out of the vector files, exact |
+| [`claims.csv`](claims.csv) | what the text **says** | typed in from the paper, one row per sentence |
+
+Where the two disagree the paper has a problem, and keeping them apart is what
+makes that visible instead of averaging it away — the 0.7% bound under *What it
+reproduces* is the case in point.
 
 ## What is here
 
@@ -13,6 +24,7 @@ instead of being read in isolation.
 | `results_pulp_sizes.eps` | 7 | binary size change on GAP8 |
 | `unroll_speedup.eps` | 8 | the CIR unroll-by-two gain |
 | [`reference.csv`](reference.csv) | — | all five, as numbers |
+| [`claims.csv`](claims.csv) | — | the sentences with a number in them, §4.2–§4.5 |
 | [`extract_from_eps.py`](extract_from_eps.py) | — | how the numbers came out of the figures |
 
 ## The numbers are exact
@@ -56,6 +68,29 @@ paired to the right names.
 One claim does not survive. §4.3 says the binary size increase "remains below
 0.7% in all instances"; the figure it refers to has `nussinov` at **0.7296%**
 and `jacobi-2d` at **0.7096%**. The bound is real, but it is 0.75%, not 0.7%.
+
+## Which claims have a checker
+
+`claims.csv` carries a `checked_by` column naming the driver that reads each
+row, and `-` where nothing does. That is deliberate: the file is an inventory
+of what the paper asserts, not only of what happens to be testable today, and
+`compare_to_reference.py` prints the uncovered rows for the runtime it was
+given as its last section.
+
+| claim | checked by |
+|---|---|
+| §4.2/§4.3 named kernels, §4.3 size bound | `lib/compare_to_reference.py` |
+| §4.5 barrier counts (59/26/45/28) | `run_barrier_vs_native.sh`, full suite only |
+| §4.5 barrier saving, kernels improving, range | `run_performance.sh`, `BARRIER_ELIM=both` on pmsis |
+| Fig. 8 unroll gains (3%, 24%), and each bar of the figure | `run_unroll.sh` |
+
+Every row has a driver now. `run_unroll.sh` is the one that cannot run
+everywhere: the unroll-by-two pass is a CIR pass, so it is in the ClangIR
+fork and not in this repository, and the driver refuses rather than
+reporting a delta of zero when the `cir-opt` it is given does not have it.
+
+The Table 2 line counts are checked where they are produced, against the
+per-file constants in [`../../LoC/`](../../LoC/).
 
 ## Reading a run against these
 

@@ -26,13 +26,22 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "reference.csv")
 
-# figure file -> (column prefix, what it measures, the paper's figure number)
+# figure file -> (what it measures, the paper's figure number, the column
+# each series lands in). The column names are written out rather than derived
+# from the prefix: figures 7 and 8 do not plot a speedup, and calling their
+# columns fig7_native/fig8_native invited them to be read as one. The second
+# name is None where the figure has a single series.
 FIGURES = [
-    ("results_gomp_LARGE_FINAL.eps", "fig4", "speedup", "4"),
-    ("results_iomp_LARGE_FINAL.eps", "fig5", "speedup", "5"),
-    ("results_pulp.eps", "fig6", "speedup", "6"),
-    ("results_pulp_sizes.eps", "fig7", "size_pct", "7"),
-    ("unroll_speedup.eps", "fig8", "unroll_pct", "8"),
+    ("results_gomp_LARGE_FINAL.eps", "speedup", "4",
+     ("fig4_native", "fig4_our")),
+    ("results_iomp_LARGE_FINAL.eps", "speedup", "5",
+     ("fig5_native", "fig5_our")),
+    ("results_pulp.eps", "speedup", "6",
+     ("fig6_native", "fig6_our")),
+    ("results_pulp_sizes.eps", "size_pct", "7",
+     ("fig7_size_native", "fig7_size_our")),
+    ("unroll_speedup.eps", "unroll_pct", "8",
+     ("fig8_unroll_pct", None)),
 ]
 
 GLYPH = {
@@ -190,7 +199,7 @@ def collect():
     rows = {}
     order = []
     meta = []
-    for fname, prefix, kind, number in FIGURES:
+    for fname, kind, number, (col_native, col_our) in FIGURES:
         path = os.path.join(HERE, fname)
         if not os.path.exists(path):
             print(f"  skip {fname} (missing)")
@@ -212,9 +221,9 @@ def collect():
             if k not in rows:
                 rows[k] = {}
                 order.append(k)
-            rows[k][f"{prefix}_native"] = native[i]
-            if ours:
-                rows[k][f"{prefix}_our"] = ours[i]
+            rows[k][col_native] = native[i]
+            if ours and col_our:
+                rows[k][col_our] = ours[i]
         print(f"  {fname}: {n} kernels, {len(cols)} series")
 
     return rows, order, meta
@@ -224,8 +233,8 @@ def build():
     """Read the figures and rewrite reference.csv."""
     rows, order, meta = collect()
     fields = ["kernel"]
-    for _, prefix, kind, _ in FIGURES:
-        fields += [f"{prefix}_native", f"{prefix}_our"]
+    for _, _kind, _number, names in FIGURES:
+        fields += [n for n in names if n]
     fields = [f for f in fields
               if f == "kernel" or any(f in r for r in rows.values())]
 

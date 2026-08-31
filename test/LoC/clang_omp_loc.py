@@ -6,7 +6,8 @@ Reproduces Table 2 of the paper's supplementary material: 7,617 attributed
 lines out of 50,754, over 4 files. Which files and which entities count, and
 why, is in README.md.
 
-Usage:  clang_omp_loc.py [--root PATH]    # llvm-project checkout, or $LLVM_SRC
+Usage:  clang_omp_loc.py [--root PATH]  # llvm-project checkout at PIN,
+                                        # or $LLVM_SRC (README.md: how to get one)
 """
 import argparse
 import os
@@ -233,7 +234,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--root', default=os.environ.get('LLVM_SRC', '.'),
                     help='llvm-project checkout (default: $LLVM_SRC, or .)')
+    ap.add_argument('--list-files', action='store_true',
+                    help='print the files counted, and exit')
     args = ap.parse_args()
+    if args.list_files:
+        for path in FILES:
+            print(path)
+        return 0
     root = os.path.abspath(args.root)
     if not os.path.isdir(os.path.join(root, 'clang')):
         sys.exit('%s is not an llvm-project checkout (no clang/)' % root)
