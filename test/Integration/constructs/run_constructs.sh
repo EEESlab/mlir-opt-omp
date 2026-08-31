@@ -40,8 +40,12 @@
 #   RUNTIME=libgomp ./run_constructs.sh
 #   ./run_constructs.sh num_threads     # one test, by name or path
 #   FRONTEND=0 ./run_constructs.sh      # skip ClangIR, start from mlir/
-#   KEEP=1 ./run_constructs.sh          # keep the per-stage IR for inspection
+#   KEEP=0 ./run_constructs.sh          # verdicts only, discard the IR
 #   VERBOSE=1 ./run_constructs.sh       # let the tools say why one failed
+#
+# The IR of every stage is kept by default, under results/<runtime>/constructs/
+# <test>/. It is the point of these tests as much as the verdict is: a passing
+# line says the clause works, 02-lowered.mlir says what it turned into.
 #
 # FRONTEND=0 is the one to reach for on a machine whose ClangIR is older than
 # the clauses these tests use: the .c files stop compiling long before the
@@ -171,15 +175,20 @@ printf '  %-24s %-10s %-10s %s\n' test ref opt verdict
 echo "kernel;ref;opt;verdict" > "$CSV"
 
 PASS=0; FAIL=0
+# The IR is kept by default, like the other drivers keep theirs. These tests
+# exist to show how a construct is lowered, and a green line does not show it:
+# what does is 02-lowered.mlir, where the clause has become runtime calls and
+# nothing generic has run over them yet. KEEP=0 works in a temp directory
+# instead, for a run that only wants the verdicts.
 TMP="$(mktemp -d)"
-cleanup() { [ -n "${KEEP:-}" ] || rm -rf "$TMP"; }
+cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
 for src in "${TESTS[@]}"; do
     name="$(basename "${src%.c}")"
-    d="$TMP/$name"
-    [ -n "${KEEP:-}" ] && d="$OUTDIR/$name"
-    mkdir -p "$d"
+    d="$OUTDIR/$name"
+    [ "${KEEP:-1}" = "0" ] && d="$TMP/$name"
+    rm -rf "$d"; mkdir -p "$d"
 
     if build_ref "$src" "$d/ref"; then
         ref_out="$("$d/ref" 2>/dev/null | head -1)"
@@ -241,7 +250,21 @@ done
 
 echo
 echo "  $PASS passed, $FAIL failed out of ${#TESTS[@]}"
-[ -n "${KEEP:-}" ] && echo "  per-stage IR kept under $OUTDIR/<test>/"
+if [ "${KEEP:-1}" != "0" ]; then
+    echo
+    echo "  Every stage is under $OUTDIR/<test>/ :"
+    echo "    00-frontend.cir      what ClangIR emitted"
+    echo "    01-cir-to-llvm.mlir  the omp + llvm dialects, our input"
+    echo "    02-lowered.mlir      after mlir-opt-omp — the clause is now"
+    echo "                         runtime calls, and nothing generic has run"
+    echo "                         over them yet. Start here."
+    echo "    03-llvm-dialect.mlir 04-llvmir.ll  05-opt-O3.ll  06-obj.o"
+    echo
+    echo "  To see what one clause costs, diff a lowering against its own"
+    echo "  baseline — the rule file is the only thing that changed:"
+    echo "    diff <(grep 'call @' $OUTDIR/parallel_if/02-lowered.mlir) \\"
+    echo "         <(grep 'call @' $OUTDIR/num_threads/02-lowered.mlir)"
+fi
 echo "  Done — $CSV"
 
 [ "$FAIL" -eq 0 ] || exit 1

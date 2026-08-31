@@ -27,3 +27,7 @@ compile_commands.json
 Thumbs.db
 
 # Note: build artefacts of test/Integration/ are ignored by its own .gitignore.
+
+# Python bytecode.
+__pycache__/
+*.pyc

@@ -1,86 +1,86 @@
 # Reference results
 
-What a run of `run_performance.sh` is expected to look like, so a result can be
-compared against something instead of being read in isolation.
+The values the paper's figures plot, so a run can be compared against something
+instead of being read in isolation.
 
-## Status: provisional
+## What is here
 
-[`expected-from-paper.csv`](expected-from-paper.csv) holds speedups **digitised
-by eye from Figures 4, 5 and 6** of the paper. It is not a measurement, and it
-is not precise: about ±0.5 on the Figure 4 and 5 axes, ±0.3 on Figure 6.
+| file | figure | holds |
+|---|---|---|
+| `results_gomp_LARGE_FINAL.eps` | 4 | parallel speedup, libgomp: GCC frontend vs ours |
+| `results_iomp_LARGE_FINAL.eps` | 5 | parallel speedup, libomp: Clang frontend vs ours |
+| `results_pulp.eps` | 6 | parallel speedup on GAP8: PULP-SDK GCC vs ours |
+| `results_pulp_sizes.eps` | 7 | binary size change on GAP8 |
+| `unroll_speedup.eps` | 8 | the CIR unroll-by-two gain |
+| [`reference.csv`](reference.csv) | — | all five, as numbers |
+| [`extract_from_eps.py`](extract_from_eps.py) | — | how the numbers came out of the figures |
 
-Use it for the question it can answer — *does this run resemble the paper at
-all?* Is `cholesky` the libgomp outlier, does `doitgen` come out ahead for us,
-are `lu` / `ludcmp` / `trisolv` / `durbin` flat near 1. Do not use it to judge a
-difference of a few percent: at that scale the file's own error is larger than
-what you are measuring.
+## The numbers are exact
 
-## Why it should be replaced
+`reference.csv` is not a transcription and not an estimate. The figures are
+matplotlib EPS, which is vector: every bar is a rectangle with real
+coordinates, and every axis tick carries both its position and its label. The
+extractor fits the device-to-data transform from the ticks and reads each bar
+back through it, so what lands in the CSV is what the figure plots, to four
+decimal places.
 
-Two reasons, and the second is the serious one.
-
-Reading pixels off a chart loses precision that the original CSVs still have —
-`run_performance.sh` always writes them, they were simply never kept.
-
-More importantly, **the published figures predate the compiler in this repo**.
-Commits `bb13331` and `015587d` (2026-08-27) moved every alloca into its
-function's entry block. That changes the code generated for every wsloop, and
-it was motivated by a PULP bug — `seidel-2d` overrunning the cluster stack on
-GAP8. Figure 7 is the clearest case: it measures linked-ELF size, and moving
-the allocas changes the frame setup, so the bytes move with it.
-
-So the numbers here describe a compiler slightly different from the one a
-reviewer will build.
-
-## Replacing it
-
-Re-run the three configurations on the reference machine with the current
-branch built, and keep the CSVs this time:
+Regenerate it, or check it still matches, with:
 
 ```sh
-cd test/Integration
-RUN_ENV=configs/paper-libgomp.env PLOT=true ./run_performance.sh   # Fig 4
-RUN_ENV=configs/paper-iomp.env    PLOT=true ./run_performance.sh   # Fig 5
-RUN_ENV=configs/paper-pmsis.env   PLOT=true ./run_performance.sh   # Fig 6 + 7
+python3 extract_from_eps.py            # rewrite reference.csv
+python3 extract_from_eps.py --check    # exit non-zero if it drifted
 ```
 
-Copy each `results/<runtime>/results_performance.csv` in here, and regenerate
-the paper's figures from those same files — then chart, CSV and paper agree by
-construction rather than by trust. Record alongside them: machine, commit hash,
-date, `THREADS`, `DATASET`, and the wait-policy variables below. A CSV without
-the configuration it was taken under cannot be compared against.
+Three things are asserted while reading rather than assumed, because each would
+silently corrupt the result: that the y ticks are collinear (a log axis read as
+linear gives plausible nonsense), that every figure has exactly as many labels
+as bar groups (otherwise the pairing is guesswork), and that a bar below the
+baseline becomes a negative value rather than a positive one.
+
+## What it reproduces
+
+The extracted values agree with everything the paper states in prose, which is
+the check that the extraction is right:
+
+| the paper says | the CSV says |
+|---|---|
+| §4.2 `doitgen` is faster with our flow on libgomp | 8.91 native, **10.52** ours |
+| §4.3 `floyd-warshall`, `deriche`, `nussinov` are behind on PULP | 7.45/6.56, 7.39/6.27, 6.76/5.84 — all three |
+| Fig. 8 about 3% on average over ten applications | **2.95%**, excluding `floyd-warshall` |
+| Fig. 8 about 24% on `floyd-warshall` | **24.24%** |
+
+The kernel order recovered from the figures is identical to `ALL_KERNELS` in
+`../lib/kernels.sh`, which is a second, independent check that the bars were
+paired to the right names.
+
+One claim does not survive. §4.3 says the binary size increase "remains below
+0.7% in all instances"; the figure it refers to has `nussinov` at **0.7296%**
+and `jacobi-2d` at **0.7096%**. The bound is real, but it is 0.75%, not 0.7%.
+
+## Reading a run against these
+
+`run_performance.sh` prints the comparison itself when it finishes. By hand:
+
+```sh
+python3 ../lib/compare_to_reference.py \
+  ../results/libgomp/results_performance.csv --runtime libgomp
+```
+
+Note what that comparison can and cannot tell you. These figures were measured
+on the machine in §4.1, and an absolute speedup does not survive a change of
+CPU — a kernel reaching 8x there and 5x on a reviewer's machine means nothing is
+wrong. What does transfer is the relationship between the two bars, which is a
+property of the compiler and is what the paper actually claims. The comparison
+is ordered accordingly: the checks that survive a change of machine come first,
+and the absolute one is reported last and labelled as orientation.
 
 ## Configuration the numbers assume
 
+The host figures were taken at `THREADS=16` and `DATASET=LARGE_DATASET`,
+matching §4.1. Thread binding and wait policy were left at the runtime's own
+defaults — the configs under [`../configs/`](../configs/) carry the rest, and
+the commented-out lines there record an attempt to pin them that did not deliver
+the repeatability it promised.
 
-
-Run them with:
-
-```sh
-cd ..
-RUN_ENV=configs/paper-libgomp.env PLOT=true ./run_performance.sh   # Fig 4
-RUN_ENV=configs/paper-iomp.env    PLOT=true ./run_performance.sh   # Fig 5
-RUN_ENV=configs/paper-pmsis.env   PLOT=true ./run_performance.sh   # Fig 6 + 7
-```
-
-The host configs pin `THREADS=16` and `DATASET=LARGE_DATASET`, matching §4.1 of
-the paper ("16 hardware threads", "the large configuration"). For a shorter run
-add `REPS=5` (halves it, keeps a weak deviation) or `REPS=3` (3.3× faster, the
-median of three, no deviation) on the command line — the dataset is
-deliberately not the knob, since a smaller one changes which value you are
-measuring rather than how confident you are in it.
-
-## Numbers the paper states exactly
-
-These are prose, not chart pixels, so they are quoted rather than digitised —
-and they are the ones to check a run against when precision matters.
-
-| Claim | Value | Where it comes from |
-|---|---|---|
-| Binary size increase on PULP, ours vs sequential | **below 0.7%** in every case | `run_performance.sh` `RUNTIME=pmsis`, the `size_*` columns (Figure 7) |
-| Team-barrier call sites, ours without the pass | **59** | `run_barrier_vs_native.sh` |
-| …with `--omp-barrier-elim` | **26** | ” |
-| …clang, same kernels | **45** | ” |
-| …gcc, counted at `-O0` | **28** | ” |
-| Run-time saving from the pass on GAP8 | **0.037%** overall; 22 of 30 kernels improve; per-kernel −0.16% … +1.12% (`trisolv`) | `RUNTIME=pmsis BARRIER_ELIM=both ./run_performance.sh` |
-| CIR unroll-by-two gain | **~3%** average over ten kernels, **~24%** on `floyd-warshall` | Figure 8; the pass lives in the ClangIR fork, not in this repo |
+The PULP figures have no such caveat: gvsoc is deterministic, and none of those
+variables applies to a bare-metal runtime.

@@ -28,11 +28,11 @@
 #   3. SIZE        section 4.3: the parallel build stays within 0.7% of the
 #                  sequential one. An exact number from the prose, decided by
 #                  the compiler, checkable on pmsis runs only.
-#   4. ABSOLUTE    speedups against reference/expected-from-paper.csv. Reported
-#                  for orientation and explicitly NOT a verdict: those values
-#                  were read off the published charts by eye, and they were
-#                  measured on other hardware, so a difference is two kinds of
-#                  noise before it is ever a finding.
+#   4. ABSOLUTE    speedups against reference/reference.csv, which holds the
+#                  values the paper's own figures plot -- recovered from the
+#                  vector files, so exact. Still only orientation: they were
+#                  measured on other hardware, and an absolute speedup does not
+#                  survive a change of machine.
 #
 # Exit status is 0 unless --strict is given, in which case only check 3 -- the
 # one exact number -- can exit 1. The rest are readings, not assertions.
@@ -87,9 +87,8 @@ def parse_args(argv):
     )
     p.add_argument(
         "--reference",
-        default=os.path.join(here, os.pardir, "reference",
-                             "expected-from-paper.csv"),
-        help="reference CSV (default: ../reference/expected-from-paper.csv)",
+        default=os.path.join(here, os.pardir, "reference", "reference.csv"),
+        help="reference CSV (default: ../reference/reference.csv)",
     )
     p.add_argument(
         "--strict", action="store_true",
@@ -322,9 +321,9 @@ def check_absolute(run, reference, runtime):
     so it cannot be mistaken for a verdict."""
     _, our_col, figure = REFERENCE_COLUMNS[runtime]
     print("4. ABSOLUTE - your speedups against the ones in {}".format(figure))
-    print("   Orientation only. The published values were read off the printed")
-    print("   chart by eye, and measured on other hardware, so a difference")
-    print("   here is two kinds of noise before it is anything else.")
+    print("   The published values are exact -- read out of the figure files --")
+    print("   but they were measured on other hardware, so treat this as")
+    print("   orientation rather than a verdict.")
 
     ratios = []
     for name, row in run.items():
@@ -376,9 +375,9 @@ def explain_how(csv_path, runtime):
     print("               = something the parallel path is doing.")
     if runtime == "pmsis":
         print("   size        size_opt_par / size_opt_seq - 1, against 0.7%.")
-    print("   absolute    speedup_opt against {} of the reference file,".format(
+    print("   absolute    speedup_opt against {} of reference.csv, which is".format(
         our_col))
-    print("               which is {} read off by eye. Orientation only.".format(
+    print("               what {} plots. Orientation only: other hardware.".format(
         figure))
     print()
     print("   Spot-check one kernel, no tooling:")

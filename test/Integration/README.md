@@ -32,6 +32,14 @@ is most of them (see [`constructs/`](constructs/)):
 
   Run: `constructs/run_constructs.sh` (or one test by name, `... num_threads`).
 
+  **The IR of every stage is kept**, under
+  `results/<runtime>/constructs/<test>/`, because it is the point of these
+  tests as much as the verdict is: a passing line says the clause works,
+  `02-lowered.mlir` says what it turned into. That file is the one to read —
+  the clause has become runtime calls and no generic MLIR pass has run over
+  them yet, so `num_threads` shows up as `__kmpc_push_num_threads` and
+  `if(0)` as the `__kmpc_serialized_parallel` pair. `KEEP=0` discards them.
+
   **If ClangIR is older than the clauses**, the `.c` files stop compiling long
   before the lowering is reached — `Not Yet Implemented: OpenMPClause :
   num_threads` and so on — and the failure says nothing about the part this
@@ -190,10 +198,10 @@ speedup is not comparable at all.
 Check 1 needs no reference file: it is computed from the CSV that has just been
 written, and it is the strongest of the four because `preserves performance
 across all benchmarks` is a statement about the two bars, not about their
-height. Check 4 is printed as a single summary line rather than per kernel,
-because its reference values were read off the published charts by eye *and*
-measured on other hardware — a difference there is two kinds of noise before it
-is ever a finding.
+height. Check 4 is printed as a single summary line rather than per kernel: its
+reference values are exact — recovered from the figure files themselves, see
+[`reference/`](reference/) — but they were measured on the machine in §4.1, and
+an absolute speedup does not survive a change of CPU.
 
 Check 1 also prints the absolute `opt_vs_native` figures beside the parity one,
 because the driver's own summary table shows them and the two look like they
