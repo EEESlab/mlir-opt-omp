@@ -39,8 +39,14 @@
 #   ./run_constructs.sh                 # every test, $RUNTIME (default iomp)
 #   RUNTIME=libgomp ./run_constructs.sh
 #   ./run_constructs.sh num_threads     # one test, by name or path
+#   FRONTEND=0 ./run_constructs.sh      # skip ClangIR, start from mlir/
 #   KEEP=1 ./run_constructs.sh          # keep the per-stage IR for inspection
 #   VERBOSE=1 ./run_constructs.sh       # let the tools say why one failed
+#
+# FRONTEND=0 is the one to reach for on a machine whose ClangIR is older than
+# the clauses these tests use: the .c files stop compiling long before the
+# lowering is reached, and the pre-generated modules under mlir/ let the part
+# this repository actually owns be tested anyway.
 # =============================================================================
 
 set -uo pipefail
@@ -60,6 +66,12 @@ if [ "$TARGET" != "native" ]; then
 fi
 
 EXPECTED=42
+# auto | 0 (pre-generated IR only) | 1 (front-end only) — see the header.
+FRONTEND="${FRONTEND:-auto}"
+case "$FRONTEND" in
+    auto|0|1) ;;
+    *) echo "ERROR: FRONTEND='$FRONTEND' is not auto, 0 or 1." >&2; exit 2 ;;
+esac
 OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME/constructs"
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_constructs.csv"
@@ -74,26 +86,45 @@ build_ref() {   # $1 = source, $2 = output binary
         "$1" -o "$2" 2>"$ERRSINK"
 }
 
-# opt: C -> ClangIR -> mlir-opt-omp -> LLVM IR -> object -> link.
-# Each stage is written out under $d so a failure can be read rather than
-# guessed at; KEEP=1 leaves them behind.
-build_opt() {   # $1 = source, $2 = output binary, $3 = work dir
+# The opt pipeline, in two halves so the first one can be skipped.
+#
+#   frontend_to_mlir   C -> ClangIR -> the llvm dialect
+#   mlir_to_bin        that -> mlir-opt-omp -> LLVM IR -> object -> link
+#
+# Split because the front-end is the part that dates fastest. ClangIR's OpenMP
+# clause support lives in a fork and arrives clause by clause, so a machine
+# whose LLVM predates one of them cannot compile the .c at all — and would
+# report a failure that says nothing about the lowering, which is what these
+# tests are actually for. A pre-generated copy of each module is checked in
+# under mlir/, and FRONTEND selects between them:
+#
+#   auto (default)  compile the .c; if the front-end refuses, fall back to the
+#                   checked-in IR and SAY SO in the verdict
+#   0               skip the front-end entirely, start from mlir/
+#   1               front-end only; a front-end that cannot compile it fails
+#
+# The distinction is kept in the output rather than smoothed over: a run that
+# fell back has tested the lowering but not the front-end, and a reviewer must
+# be able to see which of the two they got.
+frontend_to_mlir() {   # $1 = source, $2 = output .mlir, $3 = work dir
     local src="$1" out="$2" d="$3"
-    mkdir -p "$d"
-
     "$CLANG" -S $CLANG_STRICT_FP $WARN_SUPPRESS \
         -Xclang -fclangir -Xclang -emit-cir -fopenmp \
         -I"$INC_OMP" "$src" -o "$d/00-frontend.cir" 2>"$ERRSINK" || return 1
     "$CIR_OPT" "$d/00-frontend.cir" --cir-to-llvm --reconcile-unrealized-casts \
-        -o "$d/01-cir-to-llvm.mlir" 2>"$ERRSINK" || return 1
+        -o "$out" 2>"$ERRSINK" || return 1
     # cir.* attributes survive the conversion and no dialect here owns them.
-    sed -i -E 's/cir\.[^,}]+,? ?//g' "$d/01-cir-to-llvm.mlir"
+    sed -i -E 's/cir\.[^,}]+,? ?//g' "$out"
+}
+
+mlir_to_bin() {   # $1 = input .mlir, $2 = output binary, $3 = work dir
+    local in="$1" out="$2" d="$3"
 
     "$MLIR_OPT_OMP" --allow-unregistered-dialect \
         --omp-lower-dsl="$RULES" --omp-lower-runtime="$RUNTIME" \
         ${BARRIER_ELIM_FLAG:+$BARRIER_ELIM_FLAG} \
         --omp-to-omp-lower --omp-outline --omp-lower-plan \
-        "$d/01-cir-to-llvm.mlir" > "$d/02-lowered.mlir" 2>"$ERRSINK" || return 1
+        "$in" > "$d/02-lowered.mlir" 2>"$ERRSINK" || return 1
 
     "$MLIR_OPT" "$d/02-lowered.mlir" \
         --canonicalize --cse --sccp --symbol-dce \
@@ -156,7 +187,28 @@ for src in "${TESTS[@]}"; do
         ref_out="BUILD"
     fi
 
-    if build_opt "$src" "$d/opt" "$d"; then
+    # Which half of the pipeline this test got, and why. `via` ends up in the
+    # verdict so a green run always says whether the front-end was exercised.
+    twin="$SCRIPT_DIR/mlir/$name.mlir"
+    ir="$d/01-cir-to-llvm.mlir"
+    via=""
+    case "$FRONTEND" in
+        0)  cp "$twin" "$ir" 2>/dev/null && via="pre-generated IR" ;;
+        1)  frontend_to_mlir "$src" "$ir" "$d" || via="FRONTEND" ;;
+        *)  if frontend_to_mlir "$src" "$ir" "$d"; then
+                via=""
+            elif [ -f "$twin" ]; then
+                cp "$twin" "$ir"; via="front-end refused, used pre-generated IR"
+            else
+                via="FRONTEND"
+            fi ;;
+    esac
+
+    if [ "$via" = "FRONTEND" ]; then
+        opt_out="FRONTEND"
+    elif [ ! -f "$ir" ]; then
+        opt_out="NO-IR"
+    elif mlir_to_bin "$ir" "$d/opt" "$d"; then
         opt_out="$("$d/opt" 2>/dev/null | head -1)"
     else
         opt_out="BUILD"
@@ -174,6 +226,12 @@ for src in "${TESTS[@]}"; do
     if [ "$ref_out" != "$EXPECTED" ]; then
         verdict="$verdict ${YELLOW}(ref says $ref_out — the test is suspect)${RESET}"
         csv="$csv;REF_SUSPECT"
+    fi
+    # Never let a fall-back pass silently: it proves the lowering, not the
+    # front-end, and the two are different claims.
+    if [ -n "$via" ] && [ "$via" != "FRONTEND" ]; then
+        verdict="$verdict ${YELLOW}($via)${RESET}"
+        csv="$csv;NO_FRONTEND"
     fi
 
     printf '  %-24s %-10s %-10s ' "$name" "$ref_out" "$opt_out"

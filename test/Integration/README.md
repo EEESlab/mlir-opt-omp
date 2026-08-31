@@ -32,6 +32,20 @@ is most of them (see [`constructs/`](constructs/)):
 
   Run: `constructs/run_constructs.sh` (or one test by name, `... num_threads`).
 
+  **If ClangIR is older than the clauses**, the `.c` files stop compiling long
+  before the lowering is reached — `Not Yet Implemented: OpenMPClause :
+  num_threads` and so on — and the failure says nothing about the part this
+  repository owns. A copy of each module after the front-end is checked in
+  under `constructs/mlir/`, so that part can be tested anyway:
+
+  ```sh
+  FRONTEND=0 constructs/run_constructs.sh
+  ```
+
+  The default (`FRONTEND=auto`) compiles the `.c` when it can and falls back
+  only when the front-end refuses. A run that fell back says so on every line —
+  it proved the lowering, not the front-end, and those are different claims.
+
 In both, the two compilers are:
 
 - **ref** — a stock OpenMP compiler (clang for `iomp`, gcc for `libgomp`, the

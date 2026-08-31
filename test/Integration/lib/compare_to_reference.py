@@ -199,19 +199,35 @@ def report_uniformity(run):
         return
     gpar, gseq = geomean(par), geomean(seq)
     print()
-    print("   Absolute runtime against native: {:.3f}x parallel, "
-          "{:.3f}x sequential.".format(gpar, gseq))
+    slower = (1 - gpar) * 100
+    verb = "slower" if slower > 0 else "faster"
+    print()
+    print("   In absolute cycles our code is {:.0f}% {} than the native"
+          .format(abs(slower), verb))
+    print("   compiler's: {:.3f}x in the parallel runs, {:.3f}x in the"
+          .format(gpar, gseq))
+    print("   sequential ones.")
+    print()
     if abs(gpar - gseq) <= UNIFORM_TOLERANCE:
-        print("   The two agree, so the deficit is uniform: it is backend code")
-        print("   quality rather than parallelisation, and it cancels in the")
-        print("   ratio above. That is why the driver's summary can read {:.2f}"
+        print("   Those two numbers are the same, which is the useful part: we")
+        print("   are equally {} with one thread and with all of them. So it is"
+              .format(verb))
+        print("   the back end generating the code, not the way we parallelise")
+        print("   it -- and because each speedup above is measured against that")
+        print("   compiler's OWN sequential run, the {:.0f}% is in both the top"
+              .format(abs(slower)))
+        print("   and the bottom of the fraction and cancels out.")
+        print()
+        print("   That is why the driver's own summary can say {:.2f} while"
               .format(gpar))
-        print("   while parity reads about 1.00; they measure different things.")
+        print("   parity here says about 1.00. Both are right; they answer")
+        print("   different questions.")
     else:
-        print("   The two DISAGREE, so the gap is not uniform: {:.3f}x of it is"
+        print("   Those two numbers DIFFER, and that is worth looking at: the")
+        print("   gap is {:.3f}x wider in the parallel runs than in the"
               .format(gpar / gseq if gseq else 0))
-        print("   specific to the parallel cells and is not explained by")
-        print("   backend code quality. That is worth looking into.")
+        print("   sequential ones, so part of it belongs to the parallelisation")
+        print("   itself and is not explained by code generation.")
 
 
 def check_outliers(run, runtime, strict):
@@ -305,8 +321,10 @@ def check_absolute(run, reference, runtime):
     """Orientation only, and printed as one summary line rather than per kernel
     so it cannot be mistaken for a verdict."""
     _, our_col, figure = REFERENCE_COLUMNS[runtime]
-    print("4. ABSOLUTE - against {}, for orientation only".format(figure))
-    print("   chart readings, other hardware: differences here are expected")
+    print("4. ABSOLUTE - your speedups against the ones in {}".format(figure))
+    print("   Orientation only. The published values were read off the printed")
+    print("   chart by eye, and measured on other hardware, so a difference")
+    print("   here is two kinds of noise before it is anything else.")
 
     ratios = []
     for name, row in run.items():
@@ -324,9 +342,15 @@ def check_absolute(run, reference, runtime):
         return
 
     above = sum(1 for r in ratios if r > 1)
-    print("   {} kernels compared, geomean ours/paper {:.2f} "
-          "({} of them above the published value)".format(
-              len(ratios), geomean(ratios), above))
+    g = geomean(ratios)
+    print()
+    print("   {} kernels compared. On average this run is {:.0f}% {} the".format(
+        len(ratios), abs(g - 1) * 100, "above" if g >= 1 else "below"))
+    print("   published figure ({} of the {} kernels came out higher).".format(
+        above, len(ratios)))
+    print("   Anything within roughly 20% either way is agreement at this")
+    print("   resolution; what would be worth a second look is a kernel that")
+    print("   moved by a factor, not a few percent.")
     print()
 
 
