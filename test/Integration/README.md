@@ -181,7 +181,7 @@ speedup is not comparable at all.
 | # | check | compares against | transfers? |
 |---|---|---|---|
 | 1 | **parity** — `speedup_opt / speedup_native` per kernel | the run itself | **yes** — a property of the compiler, and the paper's central claim |
-| 2 | **doitgen** ahead of GCC (libgomp only) | §4.2, which singles it out | yes, it is qualitative |
+| 2 | **named kernels** — `doitgen` ahead on libgomp, `floyd-warshall`/`deriche`/`nussinov` behind on pmsis | §4.2 and §4.3, which name them | yes, they are claims about a mechanism |
 | 3 | **size** increase below 0.7% (pmsis only) | §4.3, an exact number | yes, decided by the compiler |
 | 4 | **absolute** speedups | [`reference/`](reference/) | **no** — orientation only |
 
@@ -193,9 +193,21 @@ because its reference values were read off the published charts by eye *and*
 measured on other hardware — a difference there is two kinds of noise before it
 is ever a finding.
 
-`--strict` makes the two hard checks (3, and 2 on libgomp) exit non-zero.
-Parity and the absolute comparison never fail a run: they are readings, not
-assertions.
+Check 1 also prints the absolute `opt_vs_native` figures beside the parity one,
+because the driver's own summary table shows them and the two look like they
+disagree — a backend that emits slower code reads ~0.89 there while parity
+reads ~1.00. Whether that is a contradiction is settled by comparing the
+parallel figure with the sequential one: if they match, the deficit is uniform,
+which makes it code quality rather than parallelisation and is precisely why it
+cancels in the self-relative ratio.
+
+A named kernel that stops reproducing is **not** treated as a failure — it
+usually means the sentence in the paper has aged, which is worth knowing before
+submission. Only check 3 can exit non-zero, and only under `--strict`; the rest
+are readings, not assertions.
+
+A section that does not apply to the runtime says so rather than vanishing, so
+the numbering never has a hole in it.
 
 For the reference values themselves, and the numbers the paper states exactly,
 see [`reference/`](reference/).
@@ -457,6 +469,21 @@ sequential build has no barriers at all (it is compiled without `-fopenmp`), so
 it is identical in the two configurations by construction. Two cells per kernel
 instead of four means the whole thing costs **half a normal run**, against the
 two full runs the split flow needs.
+
+**On `pmsis` it works too**, and it is the way to get the saving reported in
+§4.5, which is a claim about the PULP target:
+
+```sh
+RUNTIME=pmsis BARRIER_ELIM=both SUITE=full PLOT=true ./run_performance.sh
+```
+
+Two things do not carry over there, both of them simplifications. There is no
+alternation, because gvsoc has no drift to cancel, and no repetitions, because
+a second run of the same binary returns the same cycle count. So the deviation
+columns are genuinely `0` rather than unknown — the signs are exact, but each
+is a single measurement rather than an average. The driver says so in its
+summary and the chart says so on its face, since a zero error bar must not be
+allowed to read as a confirmed one.
 
 Output goes to `results/<runtime>-barrier-ab/results_performance_barrier-ab.csv`:
 

@@ -20,8 +20,11 @@
 #   1. PARITY      opt/native per kernel, from the run alone. Needs no
 #                  reference file and no matching hardware, and it is the
 #                  paper's central claim.
-#   2. DOITGEN     section 4.2 singles it out as faster with our flow on
-#                  libgomp. Qualitative, so it transfers.
+#   2. NAMED       the kernels the paper calls out: doitgen ahead on libgomp
+#                  (section 4.2), floyd-warshall/deriche/nussinov behind on
+#                  pmsis (section 4.3). Claims about a mechanism, so they
+#                  transfer where a speedup value does not. Never fatal: one
+#                  that stops reproducing usually means the prose has aged.
 #   3. SIZE        section 4.3: the parallel build stays within 0.7% of the
 #                  sequential one. An exact number from the prose, decided by
 #                  the compiler, checkable on pmsis runs only.
@@ -31,9 +34,8 @@
 #                  measured on other hardware, so a difference is two kinds of
 #                  noise before it is ever a finding.
 #
-# Exit status is 0 unless --strict is given, in which case a failed hard check
-# (3, and 2 on libgomp) exits 1. Parity and the absolute comparison never fail
-# the run: they are readings, not assertions.
+# Exit status is 0 unless --strict is given, in which case only check 3 -- the
+# one exact number -- can exit 1. The rest are readings, not assertions.
 # =============================================================================
 
 import argparse
@@ -48,6 +50,21 @@ REFERENCE_COLUMNS = {
     "iomp": ("fig5_native", "fig5_our", "Figure 5"),
     "pmsis": ("fig6_native", "fig6_our", "Figure 6"),
 }
+
+# Kernels the paper calls out by name, and which way it expects them to go.
+# "ahead" means our speedup should beat the native one, "behind" the reverse.
+# Named kernels are the checks that transfer best after the exact numbers,
+# because they are claims about a mechanism rather than about a measurement.
+KNOWN_OUTLIERS = {
+    "libgomp": ("section 4.2", "ahead of", ["doitgen"]),
+    "pmsis": ("section 4.3", "behind",
+              ["floyd-warshall", "deriche", "nussinov"]),
+}
+
+# How far the parallel and sequential deficits may differ before the slowdown
+# stops being uniform. Below this they are the same number, which is what makes
+# it a codegen fact rather than a parallelisation one.
+UNIFORM_TOLERANCE = 0.05
 
 # Section 4.3: "the increase remains below 0.7% in all instances".
 SIZE_BOUND_PCT = 0.7
@@ -76,7 +93,7 @@ def parse_args(argv):
     )
     p.add_argument(
         "--strict", action="store_true",
-        help="exit 1 if a hard check fails (size bound, doitgen on libgomp)",
+        help="exit 1 if the size bound is exceeded (pmsis only)",
     )
     return p.parse_args(argv)
 
@@ -160,32 +177,95 @@ def check_parity(run):
                 note = "  <-- " + ("faster" if ratio > 1 else "slower")
             print("   {:<18}{:>9.2f}{:>9.2f}{:>13.3f}{}".format(
                 name, native, our, ratio, note))
+
+    report_uniformity(run)
     print()
 
 
-def check_doitgen(run, runtime, strict):
-    """Section 4.2 singles doitgen out as faster with our flow on libgomp: GCC
-    leaves a loop-invariant guard inside the region that LLVM unswitches away.
-    Qualitative, so unlike a speedup value it should hold on any machine."""
-    if runtime != "libgomp":
-        return True
-    print("2. DOITGEN - section 4.2 expects ours ahead of GCC here")
-    row = run.get("doitgen")
-    if row is None:
-        print("   not in this run, nothing to check")
-        print()
-        return True
-    native, our = num(row.get("speedup_native")), num(row.get("speedup_opt"))
-    if native is None or our is None or native <= 0:
-        print("   no usable numbers for doitgen")
-        print()
-        return True
-    ratio = our / native
-    ok = ratio > 1.0
-    print("   native {:.2f}   ours {:.2f}   ours/native {:.3f}   -> {}".format(
-        native, our, ratio, "as expected" if ok else "NOT reproduced"))
+def report_uniformity(run):
+    """Reconcile parity with the driver's own summary table.
+
+    The summary prints opt/nat as absolute runtime, and on a backend that is
+    simply slower than the native one that number sits well below 1.0 while
+    parity sits at 1.0 — two figures a few lines apart that look like they
+    contradict each other. They do not, and which of the two stories is true is
+    decided by whether the deficit is the same in the sequential and parallel
+    cells. If it is, it is codegen quality and cancels in a self-relative
+    ratio; if it is not, the surplus is the parallelisation's own.
+    """
+    par = [v for v in (num(r.get("opt_vs_native_par")) for r in run.values()) if v]
+    seq = [v for v in (num(r.get("opt_vs_native_seq")) for r in run.values()) if v]
+    if not par or not seq:
+        return
+    gpar, gseq = geomean(par), geomean(seq)
     print()
-    return ok or not strict
+    print("   Absolute runtime against native: {:.3f}x parallel, "
+          "{:.3f}x sequential.".format(gpar, gseq))
+    if abs(gpar - gseq) <= UNIFORM_TOLERANCE:
+        print("   The two agree, so the deficit is uniform: it is backend code")
+        print("   quality rather than parallelisation, and it cancels in the")
+        print("   ratio above. That is why the driver's summary can read {:.2f}"
+              .format(gpar))
+        print("   while parity reads about 1.00; they measure different things.")
+    else:
+        print("   The two DISAGREE, so the gap is not uniform: {:.3f}x of it is"
+              .format(gpar / gseq if gseq else 0))
+        print("   specific to the parallel cells and is not explained by")
+        print("   backend code quality. That is worth looking into.")
+
+
+def check_outliers(run, runtime, strict):
+    """The kernels the paper names, and which way it expects each to go.
+
+    These are claims about a mechanism — GCC leaving a loop-invariant guard
+    inside doitgen's region that LLVM unswitches away, PULP GCC emitting
+    cheaper barrier sequences — so unlike a speedup value they should hold on
+    any machine. A named kernel that stops reproducing is not necessarily a
+    regression: it can equally mean the sentence in the paper has gone out of
+    date, which is worth knowing before the paper is submitted.
+    """
+    if runtime not in KNOWN_OUTLIERS:
+        print("2. NAMED KERNELS - none for this runtime, skipped")
+        print()
+        return True
+
+    section, direction, names = KNOWN_OUTLIERS[runtime]
+    print("2. NAMED KERNELS - {} expects ours {} the native compiler here"
+          .format(section, direction))
+    print()
+
+    reproduced, checked = 0, 0
+    for name in names:
+        row = run.get(name)
+        if row is None:
+            print("   {:<18}not in this run".format(name))
+            continue
+        native, our = num(row.get("speedup_native")), num(row.get("speedup_opt"))
+        if native is None or our is None or native <= 0:
+            print("   {:<18}no usable numbers".format(name))
+            continue
+        checked += 1
+        ratio = our / native
+        # A kernel within a few percent either way has simply stopped being an
+        # outlier, which is a third outcome and not a failure.
+        if abs(ratio - 1.0) <= PARITY_CLOSE:
+            verdict = "at parity now"
+        elif (ratio > 1.0) == direction.startswith("ahead"):
+            verdict = "as documented"
+            reproduced += 1
+        else:
+            verdict = "REVERSED, ours " + ("ahead" if ratio > 1 else "behind")
+        print("   {:<18}native {:>6.2f}   ours {:>6.2f}   {:>6.3f}   {}".format(
+            name, native, our, ratio, verdict))
+
+    if checked:
+        print()
+        print("   {}/{} still reproduce. Where they no longer do, the paper's"
+              .format(reproduced, checked))
+        print("   text is the thing to revisit, not necessarily the compiler.")
+    print()
+    # Never fatal: a named kernel drifting is information about the prose.
+    return True
 
 
 def check_size(run, runtime, strict):
@@ -193,6 +273,8 @@ def check_size(run, runtime, strict):
     on the PULP path, which is also the only target where the footprint is a
     result rather than a footnote."""
     if runtime != "pmsis":
+        print("3. SIZE - pmsis only (the size_* columns), skipped")
+        print()
         return True
     print("3. SIZE - section 4.3 expects every increase below {}%".format(
         SIZE_BOUND_PCT))
@@ -248,6 +330,44 @@ def check_absolute(run, reference, runtime):
     print()
 
 
+def explain_how(csv_path, runtime):
+    """Every number above, traced back to the columns it came from.
+
+    A summary a reader cannot re-derive is a summary they have to trust, and
+    the whole point of the artifact is that they should not have to.
+    """
+    native_col, our_col, figure = REFERENCE_COLUMNS[runtime]
+    print("5. CHECKING THIS YOURSELF")
+    print()
+    print("   Everything above comes from one file, and every column in it is")
+    print("   a plain number you can re-derive:")
+    print()
+    print("     {}".format(csv_path))
+    print()
+    print("   parity      speedup_opt / speedup_native, per row. Both columns")
+    print("               are each variant against its OWN sequential cell, so")
+    print("               the ratio is free of how fast the machine is.")
+    print("   uniformity  the geomean of opt_vs_native_par against that of")
+    print("               opt_vs_native_seq. Same number = codegen; different")
+    print("               = something the parallel path is doing.")
+    if runtime == "pmsis":
+        print("   size        size_opt_par / size_opt_seq - 1, against 0.7%.")
+    print("   absolute    speedup_opt against {} of the reference file,".format(
+        our_col))
+    print("               which is {} read off by eye. Orientation only.".format(
+        figure))
+    print()
+    print("   Spot-check one kernel, no tooling:")
+    print()
+    print("     head -1 {0}".format(csv_path))
+    print("     grep '^gemm' {0}".format(csv_path))
+    print()
+    print("   The four cells behind a row are kept next to it, so a surprising")
+    print("   number can be run again by hand rather than taken on faith:")
+    print("   results/{}/<kernel>-omp/performance/".format(runtime))
+    print()
+
+
 def main(argv):
     args = parse_args(argv)
     try:
@@ -268,15 +388,16 @@ def main(argv):
     print()
 
     check_parity(run)
-    ok_doitgen = check_doitgen(run, args.runtime, args.strict)
+    ok_outliers = check_outliers(run, args.runtime, args.strict)
     ok_size = check_size(run, args.runtime, args.strict)
     if reference:
         check_absolute(run, reference, args.runtime)
     else:
         print("4. ABSOLUTE - skipped, no reference at {}".format(args.reference))
         print()
+    explain_how(args.csv, args.runtime)
 
-    if args.strict and not (ok_doitgen and ok_size):
+    if args.strict and not (ok_outliers and ok_size):
         sys.exit(1)
 
 

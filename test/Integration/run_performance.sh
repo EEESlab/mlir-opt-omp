@@ -297,6 +297,67 @@ run_kernel_ab() {
     echo "${name};${C_BASE};${SD_BASE};${C_ELIM};${SD_ELIM};${DELTA};${DELTA_SD}" >> "$CSV"
 }
 
+# --- Per-kernel driver: BARRIER_ELIM=both on PULP --------------------------
+# The same question as run_kernel_ab, answered the way a deterministic target
+# allows. Two differences from the host, both of them simplifications:
+#
+#   no alternation  the host interleaves base and elim runs to cancel drift.
+#                   gvsoc has no drift to cancel, so the two builds are simply
+#                   measured one after the other.
+#   no repetitions  REPS does not apply for the same reason: a second run of
+#                   the same binary returns the same cycle count.
+#
+# Which leaves the deviation columns genuinely zero rather than unknown. They
+# are written as 0, and plot_delta.py says on the figure that no error bar
+# exists — an absent deviation must not read as a confirmed one.
+run_kernel_pulp_ab() {
+    local src="$1" name="$2"
+    local d="$OUTDIR/$name/performance"
+    mkdir -p "$d"
+
+    echo -e "${BOLD}── $name${RESET}" >&2
+
+    # pulp.sh splices $BARRIER_ELIM_FLAG into the mlir-opt-omp command, exactly
+    # as native.sh does, so the flag is set around each build and cleared after.
+    local base elim
+    echo "  [1/2] base (senza la pass)..." >&2
+    : > "$d/ab_base.log"
+    BARRIER_ELIM_FLAG=""
+    if ! base="$(pulp_cell "$src" opt_par "$d" "$d/ab_base.log")"; then
+        echo "  ERROR: base failed" >&2; emit_na "$name"; return
+    fi
+    echo "  [2/2] elim (--omp-barrier-elim)..." >&2
+    : > "$d/ab_elim.log"
+    BARRIER_ELIM_FLAG="--omp-barrier-elim"
+    if ! elim="$(pulp_cell "$src" opt_par "$d" "$d/ab_elim.log")"; then
+        echo "  ERROR: elim failed" >&2; BARRIER_ELIM_FLAG=""; emit_na "$name"; return
+    fi
+    BARRIER_ELIM_FLAG=""
+
+    local C_BASE="${base%%;*}" C_ELIM="${elim%%;*}"
+    if [ "$C_BASE" = "NA" ] || [ "$C_ELIM" = "NA" ]; then
+        echo -e "    ${YELLOW}WARNING: no 'Cycles =' line — see $d/ab_*.log${RESET}" >&2
+        emit_na "$name"; return
+    fi
+
+    # Positive = the pass saved time. No uncertainty to propagate here.
+    local DELTA
+    DELTA=$(awk -v b="$C_BASE" -v e="$C_ELIM" 'BEGIN {
+        if (b + 0 == 0) { print "NA"; exit }
+        printf "%.4f", 100 * (b - e) / b
+    }')
+
+    {
+        echo ""
+        printf "  %-24s %18s\n" "base cycles" "$C_BASE"
+        printf "  %-24s %18s\n" "elim cycles" "$C_ELIM"
+        printf "  %-24s %17s%%\n" "risparmio" "$DELTA"
+        echo ""
+    } >&2
+
+    echo "${name};${C_BASE};0;${C_ELIM};0;${DELTA};0" >> "$CSV"
+}
+
 # --- Per-kernel driver -----------------------------------------------------
 run_kernel() {
     local kernel="$1" src
@@ -307,7 +368,11 @@ run_kernel() {
     local name; name="$(basename "${src%-omp.c}")-omp"
 
     if [ "$TARGET" = "pulp" ]; then
-        run_kernel_pulp "$src" "$name"
+        if [ "$BARRIER_ELIM" = "both" ]; then
+            run_kernel_pulp_ab "$src" "$name"
+        else
+            run_kernel_pulp "$src" "$name"
+        fi
         return
     fi
     if [ "$BARRIER_ELIM" = "both" ]; then
@@ -437,19 +502,22 @@ fi
 
 # gvsoc is deterministic and REPS does not apply there, so the drift this mode
 # exists to cancel cannot happen: two ordinary runs already compare exactly.
-if [ "$BARRIER_ELIM" = "both" ] && [ "$TARGET" = "pulp" ]; then
-    echo "ERROR: BARRIER_ELIM=both is for the host runtimes." >&2
-    echo "       On pmsis the simulator is deterministic — run it twice instead:" >&2
-    echo "         RUNTIME=pmsis BARRIER_ELIM=0 ./run_performance.sh" >&2
-    echo "         RUNTIME=pmsis BARRIER_ELIM=1 ./run_performance.sh" >&2
-    exit 2
-fi
+# `both` works on pmsis too, and is the natural way to ask the question there:
+# the saving the barrier pass buys is a claim about the PULP target (section
+# 4.5), so leaving it to two runs and a manual diff of two 30-row CSVs was
+# making the reader do arithmetic the driver can do. What does not carry over
+# from the host is the alternation and the repetitions — see run_kernel_pulp_ab.
 
 echo "=== MLIR OpenMP PERFORMANCE COMPARISON ==="
 if [ "$BARRIER_ELIM" = "both" ]; then
     echo "mode: A/B barrier elimination — our two builds against each other"
     echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
-    echo "reps: $REPS (alternati base/elim)    timer: cycle-accurate TSC"
+    if [ "$TARGET" = "pulp" ]; then
+        echo "timer: 'Cycles =' from the gvsoc log — 1 run per build, no alternation"
+        echo "       (the simulator is deterministic: REPS would return the same number)"
+    else
+        echo "reps: $REPS (alternati base/elim)    timer: cycle-accurate TSC"
+    fi
     echo "no native comparison: this run answers what the pass costs, nothing else"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
@@ -488,9 +556,16 @@ if [ "$BARRIER_ELIM" = "both" ]; then
     # kernel that runs for a millisecond the same weight as one that runs for a
     # minute. The per-kernel percentages, each with its error bar, are in the
     # table above and in the CSV.
-    read -r T_BASE T_ELIM T_DELTA N_OK N_SIG < <(awk -F';' '
+    # On a deterministic target the error is genuinely 0, so "bigger than twice
+    # its own error" degenerates into "positive" and would call every saving
+    # significant. There the honest count is simply how many kernels improved.
+    read -r T_BASE T_ELIM T_DELTA N_OK N_SIG < <(awk -F';' -v det="$([ "$TARGET" = "pulp" ] && echo 1 || echo 0)" '
         NR == 1 || $2 == "NA" { next }
-        { b += $2; e += $4; n++; if ($6 + 0 > 2 * ($7 + 0)) sig++ }
+        {
+            b += $2; e += $4; n++
+            if (det) { if ($6 + 0 > 0) sig++ }
+            else if ($6 + 0 > 2 * ($7 + 0)) sig++
+        }
         END {
             if (n == 0) { print "NA NA NA 0 0"; exit }
             printf "%.0f %.0f %.4f %d %d", b, e, 100 * (b - e) / b, n, sig
@@ -501,14 +576,26 @@ if [ "$BARRIER_ELIM" = "both" ]; then
     echo ""
     echo -e "${BOLD}=== SUMMARY A/B (${DATASET}, ${THREADS}T, runtime=${RUNTIME}) ===${RESET}"
     printf "${BOLD}  %-20s %16s %16s %12s${RESET}\n" "kernel" "base" "elim" "risparmio"
-    awk -F';' 'NR > 1 && $1 != "TOTAL" && $2 != "NA" {
-        printf "  %-20s %16.0f %16.0f %10s%% ± %s\n", $1, $2, $4, $6, $7
-    }' "$CSV"
+    if [ "$TARGET" = "pulp" ]; then
+        awk -F';' 'NR > 1 && $1 != "TOTAL" && $2 != "NA" {
+            printf "  %-20s %16.0f %16.0f %10s%%\n", $1, $2, $4, $6
+        }' "$CSV"
+    else
+        awk -F';' 'NR > 1 && $1 != "TOTAL" && $2 != "NA" {
+            printf "  %-20s %16.0f %16.0f %10s%% ± %s\n", $1, $2, $4, $6, $7
+        }' "$CSV"
+    fi
     echo "  --------------------------------------------------------------------"
     printf "${BOLD}  %-20s %16s %16s %10s%%${RESET}\n" "TOTALE" "$T_BASE" "$T_ELIM" "$T_DELTA"
     echo ""
-    echo "  $N_SIG kernel su $N_OK con un risparmio maggiore del doppio del proprio errore."
-    echo "  Il resto è sotto la sensibilità della misura, non necessariamente zero."
+    if [ "$TARGET" = "pulp" ]; then
+        echo "  $N_SIG kernel su $N_OK migliorano."
+        echo "  Nessuna barra d'errore: il simulatore è deterministico, quindi ogni"
+        echo "  segno è esatto — ma è un'unica misura, non una media."
+    else
+        echo "  $N_SIG kernel su $N_OK con un risparmio maggiore del doppio del proprio errore."
+        echo "  Il resto è sotto la sensibilità della misura, non necessariamente zero."
+    fi
     echo ""
     echo "  Done — $CSV"
     if is_true "$PLOT"; then render_ab_plot; fi

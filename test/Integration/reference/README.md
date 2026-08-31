@@ -52,19 +52,9 @@ the configuration it was taken under cannot be compared against.
 
 ## Configuration the numbers assume
 
-Spin-waiting on the host runtimes, which materially changes the speedups and is
-worth stating because the paper does not mention it:
 
-```
-OMP_WAIT_POLICY=ACTIVE
-KMP_BLOCKTIME=infinite     # iomp
-GOMP_SPINCOUNT=infinite    # libgomp
-```
 
-Nothing sets these by default. They live in the configs under
-[`../configs/`](../configs/), which is the whole reason those files exist — a
-run not taken under one of them is not repeatable, let alone comparable with
-what is in here. Use them:
+Run them with:
 
 ```sh
 cd ..
@@ -92,5 +82,5 @@ and they are the ones to check a run against when precision matters.
 | …with `--omp-barrier-elim` | **26** | ” |
 | …clang, same kernels | **45** | ” |
 | …gcc, counted at `-O0` | **28** | ” |
-| Run-time saving from the pass on GAP8 | **0.037%** overall; 22 of 30 kernels improve; per-kernel −0.16% … +1.12% (`trisolv`) | `BARRIER_ELIM=both ./run_performance.sh` |
+| Run-time saving from the pass on GAP8 | **0.037%** overall; 22 of 30 kernels improve; per-kernel −0.16% … +1.12% (`trisolv`) | `RUNTIME=pmsis BARRIER_ELIM=both ./run_performance.sh` |
 | CIR unroll-by-two gain | **~3%** average over ten kernels, **~24%** on `floyd-warshall` | Figure 8; the pass lives in the ClangIR fork, not in this repo |

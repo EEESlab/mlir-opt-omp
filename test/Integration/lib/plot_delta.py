@@ -127,11 +127,21 @@ def make_plot(rows, args):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
 
+    # With one measurement per cell every deviation is zero, so no bar can be
+    # greyed out and the figure would look surer of itself than the data is.
+    # Say so on the figure, not only in the console: this is the copy that ends
+    # up in a slide, without the CSV next to it.
+    if all(e == 0 for e in errs):
+        note = ("una sola misura per cella: nessuna barra d'errore, "
+                "i segni sono esatti ma non mediati")
+        colour = "#b03a2e"
+    else:
+        note = "in grigio: risparmio più piccolo del proprio errore"
+        colour = "#6a6a6a"
     ax.text(
-        0.995, 0.01,
-        "in grigio: risparmio più piccolo del proprio errore",
+        0.995, 0.01, note,
         transform=ax.transAxes, ha="right", va="bottom",
-        fontsize=7.5, color="#6a6a6a",
+        fontsize=7.5, color=colour,
     )
 
     fig.tight_layout()
