@@ -91,7 +91,8 @@ runtime; reproducing the PULP/GAP8 numbers needs the GAP SDK with the
     LLVM IR of every build is kept for inspection.
   \item {\bf Experiments: } (i) the regression suite (\texttt{check-omp});
     (ii) \texttt{run\_correctness.sh}; (iii) \texttt{run\_performance.sh};
-    (iv) \texttt{tasks/run\_tasks.sh} for the task construct; each of (ii)--(iv)
+    (iv) \texttt{constructs/run\_constructs.sh} for the constructs and clauses
+    PolyBench never writes; each of (ii)--(iv)
     per runtime.  Driven by environment variables, no manual editing.
     Expected variation: the correctness results are exact and deterministic;
     speedups vary with the machine, run-to-run noise is bounded by the
@@ -271,9 +272,15 @@ POLYBENCH=/path/to/checkout \
 \end{verbatim}
 }
 
-\noindent {\bf E4 --- tasks.}
-\texttt{tasks/run\_tasks.sh libgomp} (and \texttt{iomp}), two end-to-end checks
-against the real runtime library.
+\noindent {\bf E4 --- constructs and clauses.}
+\texttt{constructs/run\_constructs.sh} (with \texttt{RUNTIME=iomp} and
+\texttt{libgomp}): one standalone C program per construct/clause, printing
+\texttt{42} only if the clause took effect.  This is the only end-to-end
+evidence for most of Table~\ref{tab:support}: over the whole PolyBench suite
+only \texttt{parallel}, a bare \texttt{for} and \texttt{private} ever appear,
+so \texttt{firstprivate}, \texttt{num\_threads}, \texttt{proc\_bind},
+\texttt{nowait}, an explicit \texttt{schedule}, \texttt{if}, \texttt{barrier},
+\texttt{task} and \texttt{taskwait} are exercised nowhere else.
 
 \noindent {\bf E5 --- PULP/GAP8 (Figure TODO), only with the GAP SDK
 installed.}

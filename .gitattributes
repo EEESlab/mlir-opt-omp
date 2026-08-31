@@ -1,0 +1,11 @@
+# Shell scripts and the config files they source must keep LF endings whatever
+# the platform they are checked out on. A CRLF checkout on Windows makes bash
+# fail with "syntax error near unexpected token `$'{\r'" the moment one of them
+# is run through WSL or Git Bash — a failure that says nothing about the cause.
+*.sh    text eol=lf
+*.env   text eol=lf
+*.example text eol=lf
+
+# Test inputs are compared byte for byte or matched by FileCheck.
+*.mlir  text eol=lf
+*.dsl   text eol=lf

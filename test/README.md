@@ -207,8 +207,10 @@ runtime. Three drivers share one compile pipeline (`Integration/lib/common.sh`):
   that generated code runs and produces correct results.
 - `run_performance.sh` times our tool against the native compiler (a 2×2
   seq/par × native/opt matrix) and reports per-kernel and geomean speedups.
-- `tasks/run_tasks.sh` smoke-tests the `omp.task` lowering (libgomp): a hand-written
-  MLIR case and a C case, both run and diffed against a reference.
+- `constructs/run_constructs.sh` covers the constructs and clauses PolyBench
+  never writes — which is most of the matrix: across the whole suite it uses
+  only `parallel`, a bare `for` and `private`. One standalone C program per
+  clause, each printing `42` only if the clause actually took effect.
 
 Fully parametrized via env vars / `run.env` — see [`Integration/README.md`](Integration/README.md).
 

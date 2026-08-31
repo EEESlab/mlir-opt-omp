@@ -2,7 +2,7 @@
 # =============================================================================
 # common.sh — shared setup for the Integration test drivers
 # (run_correctness.sh, run_performance.sh, run_barrier_vs_native.sh,
-# tasks/run_tasks.sh).
+# constructs/run_constructs.sh).
 #
 # This file holds the configuration: run.env loading, tool/path resolution
 # and the per-runtime knobs. The rest is sourced from sibling files at the end:
