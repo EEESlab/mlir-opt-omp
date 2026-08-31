@@ -557,8 +557,6 @@ echo ""
 echo "  Done — $CSV"
 
 # --- Optional plots ---------------------------------------------------------
-# (an `if`, not `&&`: as the last command, a false PLOT must not turn into a
-# non-zero exit code for the whole script)
 if is_true "$PLOT"; then
     render_plot
     # Only the PULP path writes the size_* columns, and only there is the
@@ -566,3 +564,24 @@ if is_true "$PLOT"; then
     # the binding constraint on the target, so it gets its own figure.
     if [ "$TARGET" = "pulp" ]; then render_plot size; fi
 fi
+
+# --- What the run says about the paper's claims ------------------------------
+# Printed by default: a CSV read on its own answers nothing, and the checks that
+# survive a change of machine are not the ones a reader would reach for first.
+# COMPARE=false turns it off. Best-effort like the plots — a missing python is a
+# skipped summary, not a failed run.
+#
+# (an `if`, not `&&`: as the last command, a false flag must not turn into a
+# non-zero exit code for the whole script)
+# Its own interpreter lookup rather than plot_python: that one also requires
+# matplotlib and warns about plots, neither of which applies here — the
+# comparison is pure stdlib, so it must still run on a machine that cannot draw.
+if is_true "${COMPARE:-true}" && [ "$BARRIER_ELIM" != "both" ]; then
+    compare_py="${PLOT_PYTHON:-}"
+    [ -n "$compare_py" ] || compare_py="$(command -v python3 || command -v python)" || compare_py=""
+    if [ -n "$compare_py" ]; then
+        "$compare_py" "$SCRIPT_DIR/lib/compare_to_reference.py" \
+            "$CSV" --runtime "$RUNTIME" || true
+    fi
+fi
+exit 0

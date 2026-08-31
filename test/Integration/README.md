@@ -164,9 +164,41 @@ already pinned to `MINI` by the GAP8 memory budget.
 A name that matches no file is a hard error listing what exists, rather than a
 silent fall-back to the defaults.
 
-To compare a result against the paper rather than read it in isolation, see
-[`reference/`](reference/) — provisional expected speedups, and the numbers the
-paper states exactly.
+### Reading the result against the paper
+
+`run_performance.sh` ends by printing this itself; `COMPARE=false` turns it off,
+and it can be re-run on any CSV already on disk:
+
+```sh
+python3 lib/compare_to_reference.py results/libgomp/results_performance.csv \
+  --runtime libgomp
+```
+
+The four checks are ordered by how well they survive a change of machine, which
+is the whole difficulty: a reviewer runs on a different CPU, so an absolute
+speedup is not comparable at all.
+
+| # | check | compares against | transfers? |
+|---|---|---|---|
+| 1 | **parity** — `speedup_opt / speedup_native` per kernel | the run itself | **yes** — a property of the compiler, and the paper's central claim |
+| 2 | **doitgen** ahead of GCC (libgomp only) | §4.2, which singles it out | yes, it is qualitative |
+| 3 | **size** increase below 0.7% (pmsis only) | §4.3, an exact number | yes, decided by the compiler |
+| 4 | **absolute** speedups | [`reference/`](reference/) | **no** — orientation only |
+
+Check 1 needs no reference file: it is computed from the CSV that has just been
+written, and it is the strongest of the four because `preserves performance
+across all benchmarks` is a statement about the two bars, not about their
+height. Check 4 is printed as a single summary line rather than per kernel,
+because its reference values were read off the published charts by eye *and*
+measured on other hardware — a difference there is two kinds of noise before it
+is ever a finding.
+
+`--strict` makes the two hard checks (3, and 2 on libgomp) exit non-zero.
+Parity and the absolute comparison never fail a run: they are readings, not
+assertions.
+
+For the reference values themselves, and the numbers the paper states exactly,
+see [`reference/`](reference/).
 
 `run_performance.sh` builds a 2×2 matrix per kernel and times each cell with
 PolyBench's cycle-accurate TSC timer:
