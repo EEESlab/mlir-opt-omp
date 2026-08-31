@@ -13,25 +13,24 @@ kernels and the same `run.env`:
   without `--omp-barrier-elim`, against clang's and gcc's count on the same
   kernels (see [Barrier elimination](#barrier-elimination)).
 
-A third, lighter driver covers the task construct (it lives in
-[`tasks/`](tasks/) together with its test cases):
+A third driver covers the constructs and clauses PolyBench never writes — which
+is most of them (see [`constructs/`](constructs/)):
 
-- **`tasks/run_tasks.sh`** — end-to-end smoke test for `omp.task` (libgomp or
-  iomp, selected by the first argument or `RUNTIME`), two checks, both run
-  against the real runtime library and expecting `42`:
-  - **[1] MLIR** — a hand-written `parallel { task { *p = 42 } }` module
-    ([`tasks/task_nested.mlir`](tasks/task_nested.mlir)) lowered through
-    `mlir-opt-omp` + the MLIR/LLVM tools and linked against the runtime
-    (libgomp or libomp). Starts from MLIR, so it does not need the CIR
-    front-end to emit `omp.task`.
-  - **[2] C** — [`tasks/task_smoke.c`](tasks/task_smoke.c) compiled both with
-    the stock OpenMP compiler (ref: gcc for libgomp, clang for iomp) and
-    through the full CIR / `mlir-opt-omp` pipeline (opt); outputs must match.
-    This path depends on ClangIR emitting `omp.task`; if your `clang-cir`
-    lacks task support, [2] fails at the front-end while [1] still passes.
+- **`constructs/run_constructs.sh`** — one standalone C program per
+  construct/clause, each printing `42` only if the clause actually did its job.
+  Across the whole 30-kernel suite PolyBench uses `parallel`, a bare `for` and
+  `private`, and nothing else: no `firstprivate`, `num_threads`, `proc_bind`,
+  `nowait`, explicit `schedule`, `if`, `barrier`, `task` or `taskwait`. Without
+  these files those cells have no end-to-end coverage at all.
 
-  Run: `tasks/run_tasks.sh [libgomp|iomp]` (results land in
-  `results/<runtime>/tasks/` regardless of the working directory).
+  The oracle is the printed value, not a diff against the reference compiler: a
+  clause both compilers ignored would agree and pass. Each program observes the
+  effect itself — the team really has the requested size, the copy really was
+  taken at entry, every iteration really ran once. Two of them (`nowait`,
+  `proc_bind`) cannot observe their own clause portably and say so in their
+  headers; their deterministic evidence is in `../Regression/`.
+
+  Run: `constructs/run_constructs.sh` (or one test by name, `... num_threads`).
 
 In both, the two compilers are:
 
@@ -325,6 +324,33 @@ compared with the compiler people actually use:
 ```sh
 ./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.csv
 ```
+
+`RUNTIME` is pinned to `iomp` here rather than read from `run.env`: the three
+LLVM columns compare only because they speak one ABI. A `run.env` or `RUN_ENV`
+config left on another runtime is therefore ignored, not refused — everything
+else those files carry (`POLYBENCH`, the tool paths, `DATASET`, `KERNELS`,
+`OUTDIR`) still applies, and that is what this driver reads them for. An inline
+`RUNTIME=libgomp ./run_barrier_vs_native.sh` *is* refused: that asks for a
+comparison this script cannot make.
+
+Every file a number was counted in is kept, one directory per kernel, so the
+table can be rechecked instead of taken on trust:
+
+```
+results/iomp/barrier_vs_native/gemm-omp/
+  clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s
+```
+
+Each count is one grep over one of those files, and the run prints both forms
+when it finishes:
+
+```sh
+grep -o 'call void @__kmpc_barrier' ours-elim-O3.ll | wc -l
+grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O0.s
+```
+
+The directory is wiped at the start of each run, so what is in it always
+belongs to the CSV beside it.
 
 Both sides are counted in LLVM IR after `-O3`, so neither is measured at a
 kinder stage than the other. On PolyBench the totals are clang 45, our pipeline

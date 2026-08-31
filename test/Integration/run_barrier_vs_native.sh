@@ -48,6 +48,20 @@
 # spelling; where gcc misses it is a region holding a declaration, which puts
 # the loop inside a block and out of reach of its check.
 #
+# Every file a number was counted in is kept, one directory per kernel, so the
+# table can be checked instead of taken on trust:
+#
+#   results/iomp/barrier_vs_native/<kernel>/clang-O3.ll
+#                                           ours-baseline-O3.ll
+#                                           ours-elim-O3.ll
+#                                           gcc-O0.s
+#
+# The counts are two greps over those files, printed at the end of the run.
+#
+# RUNTIME is pinned to iomp (see above) rather than read from run.env; the rest
+# of the configuration — POLYBENCH, the tool paths, DATASET, KERNELS, OUTDIR —
+# comes from there as usual.
+#
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
 #   ./run_barrier_vs_native.sh path/to/kernel-omp.c  # a single kernel
@@ -59,13 +73,24 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Nothing is executed and nothing is built for the target.
 SKIP_PULP_SDK=1
-# shellcheck source=lib/common.sh
-. "$SCRIPT_DIR/lib/common.sh"
 
-if [ "$RUNTIME" != "iomp" ]; then
-    echo "ERROR: this comparison only runs with RUNTIME=iomp — see the header." >&2
+# RUNTIME is not a knob here — the three LLVM columns compare only because they
+# speak one ABI — so it is pinned before common.sh reads the config files. A
+# run.env or RUN_ENV config sitting on another runtime is then ignored rather
+# than turned into an error to work around: everything else those files carry
+# (POLYBENCH, the tool paths, DATASET, KERNELS, OUTDIR) still applies, and that
+# is what this script reads them for.
+#
+# An inline RUNTIME= is the one case worth refusing: that is someone asking for
+# a comparison this script cannot make, so say so rather than quietly making a
+# different one.
+if [ -n "${RUNTIME:-}" ] && [ "$RUNTIME" != "iomp" ]; then
+    echo "ERROR: RUNTIME=$RUNTIME — this comparison only runs on iomp, see the header." >&2
     exit 2
 fi
+RUNTIME=iomp
+# shellcheck source=lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
 
 # No dumps and no timer: nothing here is run, and both sides must see the same
 # defines or they would not be compiling the same program.
@@ -74,6 +99,12 @@ POLYBENCH_CFLAGS="$POLYBENCH_ROOT_CFLAGS"
 OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_barrier_vs_native.csv"
+# The counted files are kept, not only the totals: a table of barrier counts is
+# worth what recounting it is worth. Cleared first, so nothing a failed kernel
+# left behind last time can be read as part of this run.
+ARTDIR="$OUTDIR/barrier_vs_native"
+rm -rf "$ARTDIR"
+mkdir -p "$ARTDIR"
 
 ERRSINK="/dev/null"
 [ -n "${VERBOSE:-}" ] && ERRSINK="/dev/stderr"
@@ -150,14 +181,17 @@ else
 fi
 
 echo "=== TEAM BARRIERS: OURS vs CLANG (both after -O3) ==="
-echo "runtime:   $RUNTIME    dataset: $DATASET"
+echo "runtime:   $RUNTIME (fixed)    dataset: $DATASET"
 echo "polybench: $POLYBENCH"
 echo "kernels:   ${#KERNEL_LIST[@]}"
+echo "files:     $ARTDIR"
 echo
 
 echo "kernel,pragma_form,clang,gcc_o0,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
 printf '  %-22s %-9s %6s %6s %8s %8s %8s\n' kernel form clang gcc base elim 'vs clang'
 
+# Intermediates only (.cir and the MLIR stages); the counted files go straight
+# to $ARTDIR and stay there.
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -168,30 +202,34 @@ for k in "${KERNEL_LIST[@]}"; do
     src="$(resolve_src "$k")" || { echo "  SKIP (not found): $k"; continue; }
     name="$(basename "$src" .c)"
     form="$(pragma_form "$src")"
+    kdir="$ARTDIR/$name"
+    mkdir -p "$kdir"
 
     "$CLANG" -fopenmp -O3 -S -emit-llvm $CLANG_STRICT_FP $WARN_SUPPRESS \
         -I"$INC" -I"$(dirname "$src")" -I"$INC_OMP" \
         -D"$DATASET" $POLYBENCH_CFLAGS \
-        "$src" -o "$TMPDIR/$name-clang.ll" 2>"$ERRSINK" \
+        "$src" -o "$kdir/clang-O3.ll" 2>"$ERRSINK" \
         || { echo "  ERROR (clang): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
 
-    build_ours "$src" "$TMPDIR/$name-base.ll" "" \
+    build_ours "$src" "$kdir/ours-baseline-O3.ll" "" \
         || { echo "  ERROR (ours, baseline): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
-    build_ours "$src" "$TMPDIR/$name-elim.ll" "--omp-barrier-elim" \
+    build_ours "$src" "$kdir/ours-elim-O3.ll" "--omp-barrier-elim" \
         || { echo "  ERROR (ours, barrier-elim): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
 
     # gcc is the one column this comparison can do without: it answers a
     # different question at a different stage, so a machine with no usable gcc
     # leaves it blank rather than failing the run.
     g=""
-    if build_gcc "$src" "$TMPDIR/$name-gcc.s"; then
-        g="$(count_gcc_barriers "$TMPDIR/$name-gcc.s")"
+    if build_gcc "$src" "$kdir/gcc-O0.s"; then
+        g="$(count_gcc_barriers "$kdir/gcc-O0.s")"
         T_GCC=$((T_GCC + g))
+    else
+        rm -f "$kdir/gcc-O0.s"
     fi
 
-    c="$(count_barriers "$TMPDIR/$name-clang.ll")"
-    b="$(count_barriers "$TMPDIR/$name-base.ll")"
-    e="$(count_barriers "$TMPDIR/$name-elim.ll")"
+    c="$(count_barriers "$kdir/clang-O3.ll")"
+    b="$(count_barriers "$kdir/ours-baseline-O3.ll")"
+    e="$(count_barriers "$kdir/ours-elim-O3.ll")"
     saved=$((c - e))
 
     T_CLANG=$((T_CLANG + c)); T_BASE=$((T_BASE + b)); T_ELIM=$((T_ELIM + e))
@@ -209,7 +247,26 @@ fi
 # On its own line, and never folded into the percentage above: gcc is the other
 # question — not "do we beat the compiler people use" but "does a compiler that
 # already does this reach the same place". Different stage, different claim.
-[ "$T_GCC" -gt 0 ] && echo "  gcc (before -O3): $T_GCC    ours with the pass: $T_ELIM"
+if [ "$T_GCC" -gt 0 ]; then
+    echo "  gcc (before -O3): $T_GCC    ours with the pass: $T_ELIM"
+    echo "    -O0 is the stage that measures the elision: gcc decides it in the"
+    echo "    front-end, so -O0 already shows it, while from -O1 jump threading"
+    echo "    splits the path where a thread's chunk comes out empty and copies"
+    echo "    the barrier sequence into it (28 -> 43 over the full suite; -O3"
+    echo "    -fno-thread-jumps puts every kernel back on its -O0 number). Say"
+    echo "    which stage when quoting the column."
+fi
+
+# Where the numbers came from. Printed on every run, not just on demand: a
+# table of counts is only as good as the ability to recount it, and a reviewer
+# should not have to read the script to find out how.
+echo
+echo "  Counted in, one directory per kernel under"
+echo "    $ARTDIR/<kernel>/"
+echo "      clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s"
+echo "  Recount any row:"
+echo "    grep -o 'call void @__kmpc_barrier' <file>.ll | wc -l"
+echo "    grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O0.s"
 echo "  Done — $CSV"
 
 [ "$FAILED" -ne 0 ] && { echo "  some kernels failed (VERBOSE=1 for the tool output)"; exit 1; }
