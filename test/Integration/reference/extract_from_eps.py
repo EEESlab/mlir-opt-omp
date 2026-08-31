@@ -185,7 +185,8 @@ def series_values(to_data, bars, baseline):
     return out
 
 
-def build():
+def collect():
+    """Read every figure. Returns the rows; writes nothing."""
     rows = {}
     order = []
     meta = []
@@ -216,6 +217,12 @@ def build():
                 rows[k][f"{prefix}_our"] = ours[i]
         print(f"  {fname}: {n} kernels, {len(cols)} series")
 
+    return rows, order, meta
+
+
+def build():
+    """Read the figures and rewrite reference.csv."""
+    rows, order, meta = collect()
     fields = ["kernel"]
     for _, prefix, kind, _ in FIGURES:
         fields += [f"{prefix}_native", f"{prefix}_our"]
@@ -257,7 +264,10 @@ def check():
         lines = [l for l in f if not l.lstrip().startswith("#")]
     for r in csv.DictReader(lines, delimiter=";"):
         old[r["kernel"]] = r
-    new = build()
+    # collect(), not build(): a check that rewrites the file it is checking
+    # can only ever fail once, and would quietly repair the drift it exists to
+    # report.
+    new, _order, _meta = collect()
     bad = 0
     for k, row in new.items():
         for col, v in row.items():

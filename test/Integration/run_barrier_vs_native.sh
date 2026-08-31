@@ -1,72 +1,17 @@
 #!/bin/bash
-# =============================================================================
-# run_barrier_vs_native.sh — team barrier call sites, ours against the stock
-# compiler, counted at the same stage
+# run_barrier_vs_native.sh — counts team-barrier call sites: ours with and
+# without --omp-barrier-elim, against clang's and gcc's on the same kernels.
 #
-# This answers the question a reader asks: how many barriers are left compared
-# with the compiler people actually use.
-#
-# The comparison is only worth anything if both sides are counted at the same
-# point, so both are taken from LLVM IR *after* -O3:
-#
-#   clang     clang -fopenmp -O3 -S -emit-llvm
-#   ours      the native.sh pipeline through step 6 (opt -S -O3)
-#
-# Same kernel, same -D$DATASET, same strict-FP flags on both. Counting our
-# side in MLIR instead would compare pre-optimisation against post-, and any
-# duplication -O3 performs would show up on one side only.
-#
-# Ours is built twice, with and without --omp-barrier-elim, so the table shows
-# both what the pipeline emits on its own and what the pass takes off.
-#
-# The three LLVM columns are iomp: they speak one ABI (__kmpc_barrier), which
-# is what makes a call count comparable between them.
-#
-# gcc is counted too, but in its own column and **before -O3**:
-#
-#   gcc       gcc -fopenmp -O0 -S, counting GOMP_barrier call sites
-#
-# because from -O1 on gcc spreads the same barriers over more call sites than
-# the program needs. One pass accounts for all of it: jump threading splits the
-# path where a thread's chunk comes out empty, and the split path carries its
-# own copy of the barrier sequence. Over this suite the total goes 28 at -O0 to
-# 43 at -O3, gemver alone 3 -> 7 — and `-O3 -fno-thread-jumps` puts every kernel
-# back on its -O0 number exactly. That is what this stage choice rests on: -O0
-# is not the convenient stage, it is the one that measures the elision instead
-# of the CFG shape.
-#
-# (Not loop cloning: $GCC_STRICT_FP already turns the vectoriser off, so no
-# kernel here gets a vector and a scalar copy.)
-#
-# The elision itself is decided in the front-end, so it is already applied at
-# -O0 — and our own count does not move between stages (the same 59/25 in MLIR
-# and after -O3), so the comparison holds even though the stages differ. State
-# the stage when quoting it.
-#
-# Worth knowing what that column says: gcc performs this elision too, and
-# reaches 27 where the pass reaches 25. Where clang misses it is the *split*
-# spelling; where gcc misses it is a region holding a declaration, which puts
-# the loop inside a block and out of reach of its check.
-#
-# Every file a number was counted in is kept, one directory per kernel, so the
-# table can be checked instead of taken on trust:
-#
-#   results/iomp/barrier_vs_native/<kernel>/clang-O3.ll
-#                                           ours-baseline-O3.ll
-#                                           ours-elim-O3.ll
-#                                           gcc-O0.s
-#
-# The counts are two greps over those files, printed at the end of the run.
-#
-# RUNTIME is pinned to iomp (see above) rather than read from run.env; the rest
-# of the configuration — POLYBENCH, the tool paths, DATASET, KERNELS, OUTDIR —
-# comes from there as usual.
+# The three LLVM columns are iomp and are counted in LLVM IR after -O3, so both
+# sides are measured at the same stage. gcc gets its own column counted at -O0,
+# because from -O1 it spreads the same barriers over more call sites.
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
-#   ./run_barrier_vs_native.sh path/to/kernel-omp.c  # a single kernel
+#   ./run_barrier_vs_native.sh path/to/kernel-omp.c
 #   VERBOSE=1 ./run_barrier_vs_native.sh             # let the tools report why
-# =============================================================================
+#
+# RUNTIME=iomp only. Leaves results_barrier_vs_native.csv.
 
 set -uo pipefail
 
@@ -74,16 +19,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Nothing is executed and nothing is built for the target.
 SKIP_PULP_SDK=1
 
-# RUNTIME is not a knob here — the three LLVM columns compare only because they
-# speak one ABI — so it is pinned before common.sh reads the config files. A
-# run.env or RUN_ENV config sitting on another runtime is then ignored rather
-# than turned into an error to work around: everything else those files carry
-# (POLYBENCH, the tool paths, DATASET, KERNELS, OUTDIR) still applies, and that
-# is what this script reads them for.
-#
-# An inline RUNTIME= is the one case worth refusing: that is someone asking for
-# a comparison this script cannot make, so say so rather than quietly making a
-# different one.
 if [ -n "${RUNTIME:-}" ] && [ "$RUNTIME" != "iomp" ]; then
     echo "ERROR: RUNTIME=$RUNTIME — this comparison only runs on iomp, see the header." >&2
     exit 2
@@ -99,9 +34,6 @@ POLYBENCH_CFLAGS="$POLYBENCH_ROOT_CFLAGS"
 OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_barrier_vs_native.csv"
-# The counted files are kept, not only the totals: a table of barrier counts is
-# worth what recounting it is worth. Cleared first, so nothing a failed kernel
-# left behind last time can be read as part of this run.
 ARTDIR="$OUTDIR/barrier_vs_native"
 rm -rf "$ARTDIR"
 mkdir -p "$ARTDIR"
@@ -109,9 +41,6 @@ mkdir -p "$ARTDIR"
 ERRSINK="/dev/null"
 [ -n "${VERBOSE:-}" ] && ERRSINK="/dev/stderr"
 
-# Our pipeline, native.sh steps 1-6: front-end through opt -O3. Stops before
-# llc and the link, which the count does not need.
-# $1 = source, $2 = output .ll, $3 = extra mlir-opt-omp flag or ""
 build_ours() {
     local src="$1" out="$2" flag="$3"
     local name; name="$(basename "${src%.c}")"
@@ -146,9 +75,6 @@ count_barriers() {   # $1 = .ll file
     grep -o 'call void @__kmpc_barrier' "$1" | wc -l
 }
 
-# The gcc side, at -O0 and in assembly — see the header for why that stage.
-# Anchoring on the call instruction keeps a .type or .globl line for the symbol
-# out of the count.
 build_gcc() {   # $1 = source, $2 = output .s
     "$GCC" -fopenmp -O0 -S $GCC_STRICT_FP \
         -I"$INC" -I"$(dirname "$1")" \
@@ -156,10 +82,6 @@ build_gcc() {   # $1 = source, $2 = output .s
         "$1" -o "$2" 2>"$ERRSINK"
 }
 
-# Tail calls count: from -O2 gcc emits the last barrier of a region as
-# `jmp GOMP_barrier`, which an anchor on `call` alone drops. At -O0, the stage
-# this column is taken at, there are none — but the regex has to be right for
-# anyone who reruns it at another level.
 count_gcc_barriers() {   # $1 = .s file
     grep -cE '\b(call|jmp)\b.*GOMP_barrier' "$1" || true
 }
@@ -216,9 +138,6 @@ for k in "${KERNEL_LIST[@]}"; do
     build_ours "$src" "$kdir/ours-elim-O3.ll" "--omp-barrier-elim" \
         || { echo "  ERROR (ours, barrier-elim): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
 
-    # gcc is the one column this comparison can do without: it answers a
-    # different question at a different stage, so a machine with no usable gcc
-    # leaves it blank rather than failing the run.
     g=""
     if build_gcc "$src" "$kdir/gcc-O0.s"; then
         g="$(count_gcc_barriers "$kdir/gcc-O0.s")"
@@ -244,9 +163,6 @@ if [ "$T_CLANG" -gt 0 ]; then
     awk -v c="$T_CLANG" -v e="$T_ELIM" \
         'BEGIN { printf "  %d fewer than clang (%.1f%%)\n", c - e, 100 * (c - e) / c }'
 fi
-# On its own line, and never folded into the percentage above: gcc is the other
-# question — not "do we beat the compiler people use" but "does a compiler that
-# already does this reach the same place". Different stage, different claim.
 if [ "$T_GCC" -gt 0 ]; then
     echo "  gcc (before -O3): $T_GCC    ours with the pass: $T_ELIM"
     echo "    -O0 is the stage that measures the elision: gcc decides it in the"
@@ -257,9 +173,6 @@ if [ "$T_GCC" -gt 0 ]; then
     echo "    which stage when quoting the column."
 fi
 
-# Where the numbers came from. Printed on every run, not just on demand: a
-# table of counts is only as good as the ability to recount it, and a reviewer
-# should not have to read the script to find out how.
 echo
 echo "  Counted in, one directory per kernel under"
 echo "    $ARTDIR/<kernel>/"

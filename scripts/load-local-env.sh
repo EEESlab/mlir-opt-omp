@@ -1,33 +1,19 @@
 #!/bin/bash
-# =============================================================================
-# load-local-env.sh — resolve the per-machine tool paths.
-#
-# Sourced by everything that drives the compiler pipeline (the test/Integration
-# drivers) so they all find the tools the same way. Not meant to be executed on
-# its own.
+# load-local-env.sh — resolve the per-machine tool paths. Sourced, not run.
 #
 #   OMP_REPO_ROOT=/path/to/repo
 #   . "$OMP_REPO_ROOT/scripts/load-local-env.sh" [extra-config-file ...]
 #
-# Loads <repo>/local.env, then any extra config files passed as arguments,
-# in that order. Anything already set in the environment wins over all of them,
-# so `RUNTIME=libgomp ./run_correctness.sh` still overrides the files.
-#
-# Callers may set OMP_DEFAULT_TOOL_BIN before sourcing: it applies only when
-# neither the environment nor the config files provide OMP_TOOL_BIN.
-#
-# On return: LLVM_BIN/OMP_TOOL_BIN are on PATH, every tool variable holds a
-# usable command, and anything obviously wrong has been reported on stderr.
-# =============================================================================
+# Loads <repo>/local.env, then any file given as an argument. Anything already
+# in the environment wins over both, so `RUNTIME=libgomp ./run_correctness.sh`
+# still overrides them. On return the tools are on PATH, every tool variable
+# holds a usable command, and anything obviously wrong has been reported.
 
 if [ -z "${OMP_REPO_ROOT:-}" ]; then
     echo "load-local-env.sh: OMP_REPO_ROOT must be set before sourcing" >&2
     return 1 2>/dev/null || exit 1
 fi
 
-# Every variable the config files may set. The snapshot below walks this list to
-# give the environment priority over the files, so a new knob only needs adding
-# here to become overridable inline.
 OMP_CONFIG_VARS="LLVM_BIN OMP_TOOL_BIN CLANG GCC OPT LLC CIR_OPT MLIR_OPT
 MLIR_TRANSLATE MLIR_OPT_OMP POLYBENCH POLYBENCH_UTIL RULES INC_OMP OUTDIR
 RUNTIME DATASET THREADS KERNELS BARRIER_ELIM REPS VARIANCE_ACCEPTED
@@ -71,9 +57,6 @@ if [ -n "$__omp_preset" ]; then
     eval "$__omp_preset"        # inline/shell overrides reclaim priority
 fi
 
-# --- Tool locations ----------------------------------------------------------
-# LLVM_BIN / OMP_TOOL_BIN, if set, go on PATH so the bare tool names below
-# resolve to the right build.
 LLVM_BIN="${LLVM_BIN:-}"
 OMP_TOOL_BIN="${OMP_TOOL_BIN:-${OMP_DEFAULT_TOOL_BIN:-}}"
 if [ -n "$LLVM_BIN" ];     then PATH="$LLVM_BIN:$PATH"; fi

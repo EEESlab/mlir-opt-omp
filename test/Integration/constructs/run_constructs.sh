@@ -1,39 +1,13 @@
 #!/bin/bash
-# =============================================================================
-# run_constructs.sh — end-to-end functional tests for the constructs and
-# clauses PolyBench never writes.
+# run_constructs.sh — end-to-end tests for the constructs and clauses PolyBench
+# never writes. Across the whole suite it uses only `parallel`, a bare `for` and
+# `private`, so everything else has no coverage without these.
 #
-# WHY THIS EXISTS. Across the whole 30-kernel PolyBench/OMP suite there are
-# exactly three things: `#pragma omp parallel`, a bare `#pragma omp for`, and
-# `private`. No firstprivate, no num_threads, no proc_bind, no nowait, no
-# explicit schedule, no if, no barrier, no task, no taskwait. So of the
-# construct/clause matrix the tool claims to support, the performance suite
-# exercises four cells — and two of those only implicitly, through the default
-# schedule of a bare `for` and the barrier that closes it. Everything else has
-# no end-to-end coverage at all without these files.
-#
-# THE ORACLE. Every test is a standalone C program that prints one integer, and
-# prints 42 only if the construct did its job. Not a comparison against a
-# reference compiler: if a clause were silently ignored by BOTH compilers, a
-# ref-vs-opt diff agrees and the test passes while nothing works. Each program
-# instead observes the effect itself — the team really has the requested size,
-# the copy really was taken at entry, every iteration really ran once — so a
-# dropped clause prints something else, and prints what it saw rather than just
-# failing.
-#
-# Each is run twice, once through the stock OpenMP compiler and once through
-# the CIR / mlir-opt-omp pipeline. The reference run is not the oracle; it
-# catches the other failure, a test that is simply wrong.
-#
-# TWO OF THEM CANNOT OBSERVE THEIR OWN CLAUSE, and say so in their headers
-# rather than pretending: `nowait` is the absence of a barrier and `proc_bind`
-# is a placement, neither of which a portable program can see without racing or
-# measuring the machine. Their deterministic evidence is at IR level, in
-# ../../Regression/. Here they assert the weaker but still useful property that
-# the clause does not break the code around it.
-#
-# ADDING A TEST is adding a .c file to this directory. Nothing here enumerates
-# them.
+# Each test is a standalone C program that prints 42 only if the clause did its
+# job — not a diff against the reference compiler, which would agree and pass if
+# both compilers ignored the clause. `nowait` and `proc_bind` cannot observe
+# their own clause portably and say so in their headers; their evidence is in
+# ../../Regression/.
 #
 # Usage:
 #   ./run_constructs.sh                 # every test, $RUNTIME (default iomp)
@@ -43,15 +17,10 @@
 #   KEEP=0 ./run_constructs.sh          # verdicts only, discard the IR
 #   VERBOSE=1 ./run_constructs.sh       # let the tools say why one failed
 #
-# The IR of every stage is kept by default, under results/<runtime>/constructs/
-# <test>/. It is the point of these tests as much as the verdict is: a passing
-# line says the clause works, 02-lowered.mlir says what it turned into.
-#
-# FRONTEND=0 is the one to reach for on a machine whose ClangIR is older than
-# the clauses these tests use: the .c files stop compiling long before the
-# lowering is reached, and the pre-generated modules under mlir/ let the part
-# this repository actually owns be tested anyway.
-# =============================================================================
+# Every stage of the lowering is kept under results/<runtime>/constructs/<test>/;
+# 02-lowered.mlir is the one to read. FRONTEND=0 is for a machine whose ClangIR
+# is older than the clauses: the .c stops compiling before the lowering is
+# reached, and mlir/ holds a copy of each module taken after the front-end.
 
 set -uo pipefail
 
@@ -90,26 +59,6 @@ build_ref() {   # $1 = source, $2 = output binary
         "$1" -o "$2" 2>"$ERRSINK"
 }
 
-# The opt pipeline, in two halves so the first one can be skipped.
-#
-#   frontend_to_mlir   C -> ClangIR -> the llvm dialect
-#   mlir_to_bin        that -> mlir-opt-omp -> LLVM IR -> object -> link
-#
-# Split because the front-end is the part that dates fastest. ClangIR's OpenMP
-# clause support lives in a fork and arrives clause by clause, so a machine
-# whose LLVM predates one of them cannot compile the .c at all — and would
-# report a failure that says nothing about the lowering, which is what these
-# tests are actually for. A pre-generated copy of each module is checked in
-# under mlir/, and FRONTEND selects between them:
-#
-#   auto (default)  compile the .c; if the front-end refuses, fall back to the
-#                   checked-in IR and SAY SO in the verdict
-#   0               skip the front-end entirely, start from mlir/
-#   1               front-end only; a front-end that cannot compile it fails
-#
-# The distinction is kept in the output rather than smoothed over: a run that
-# fell back has tested the lowering but not the front-end, and a reviewer must
-# be able to see which of the two they got.
 frontend_to_mlir() {   # $1 = source, $2 = output .mlir, $3 = work dir
     local src="$1" out="$2" d="$3"
     "$CLANG" -S $CLANG_STRICT_FP $WARN_SUPPRESS \
@@ -175,11 +124,6 @@ printf '  %-24s %-10s %-10s %s\n' test ref opt verdict
 echo "kernel;ref;opt;verdict" > "$CSV"
 
 PASS=0; FAIL=0
-# The IR is kept by default, like the other drivers keep theirs. These tests
-# exist to show how a construct is lowered, and a green line does not show it:
-# what does is 02-lowered.mlir, where the clause has become runtime calls and
-# nothing generic has run over them yet. KEEP=0 works in a temp directory
-# instead, for a run that only wants the verdicts.
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT

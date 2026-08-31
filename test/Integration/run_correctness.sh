@@ -1,35 +1,19 @@
 #!/bin/bash
-# =============================================================================
-# run_correctness.sh — MLIR OpenMP end-to-end correctness check
-#
-# Compiles each PolyBench kernel two ways and diffs the dumped arrays:
-#   ref  — traditional OpenMP compiler (clang for iomp, gcc for libgomp; for
-#          pmsis the PULP-SDK gcc via 'make OMP_NATIVE=1')
-#   opt  — the CIR/MLIR pipeline through mlir-opt-omp (selected runtime)
-#
-# For RUNTIME=pmsis both sides are built and executed on the gvsoc simulator
-# through the PolyBench-PULP harness Makefile (PULP_APP_DIR), and the array
-# dumps are extracted from the gvsoc console log. Only runs on machines with
-# the GAP SDK + gvsoc installed — see the PULP section of README.md.
-#
-# A kernel PASSes when the two array dumps are bit-identical. Strict FP flags
-# (-ffp-contract=off + no auto-vectorisation, set in common.sh) are required for
-# that: without them FMA contraction and reordered reductions make iterative
-# kernels (fdtd-2d, jacobi-2d, ...) diverge even though both binaries are
-# IEEE-correct.
-#
-# All shared setup (config, tools, kernel lists, the compile pipeline) lives in
-# common.sh. Everything is configurable via environment variables / run.env
-# (see README.md, "Configuration reference"). 
+# run_correctness.sh — compiles each PolyBench kernel with a stock OpenMP
+# compiler and with the mlir-opt-omp pipeline, runs both, and PASSes when the
+# two array dumps are bit-identical.
 #
 # Usage:
 #   ./run_correctness.sh                 # all kernels, defaults
-#   RUNTIME=libgomp ./run_correctness.sh # pick the runtime
-#   RUNTIME=pmsis ./run_correctness.sh   # PULP/gvsoc (needs GAP SDK + PULP_APP_DIR)
-#   ./run_correctness.sh path/to/kernel-omp.c   # a single kernel
+#   RUNTIME=libgomp ./run_correctness.sh # iomp | libgomp | pmsis
+#   ./run_correctness.sh path/to/kernel-omp.c
 #   DATASET=SMALL_DATASET THREADS=8 ./run_correctness.sh
-#   BARRIER_ELIM=1 ./run_correctness.sh  # with --omp-barrier-elim in the pipeline
-# =============================================================================
+#   BARRIER_ELIM=1 ./run_correctness.sh  # with --omp-barrier-elim
+#   KEEP=1 ./run_correctness.sh          # keep the binaries and IR too
+#
+# Leaves results_correctness.csv and, per kernel, <name>_ref.dump and
+# <name>_opt.dump — the two files whose being identical is the result.
+# Configuration: README.md, "Configuration reference".
 
 set -uo pipefail
 
@@ -40,13 +24,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Correctness-specific config -------------------------------------------
 THREADS="${THREADS:-16}"
 export OMP_NUM_THREADS="$THREADS"
-# Results are split per runtime and by BARRIER_ELIM — results/<runtime>/ and
-# results/<runtime>-barrier-elim/ — so a run only ever replaces one of its own
-# kind, and a baseline survives the optimised run it is compared against.
 OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_DIR_TAG"
 
 # Correctness dumps the arrays and diffs them.
 POLYBENCH_CFLAGS="-DPOLYBENCH_DUMP_ARRAYS $POLYBENCH_ROOT_CFLAGS"
+
+prune_kernel() {   # $1 = the kernel's output directory
+    [ -n "${KEEP:-}" ] && return 0
+    rm -rf "$1/ref" "$1/opt"
+}
 
 # compare_dumps <name> <ref_dump> <opt_dump> — PASS iff bit-identical.
 compare_dumps() {
@@ -78,16 +64,18 @@ run_kernel_pulp() {
     fi
 
     echo "  [3/4] extracting array dumps..."
-    pulp_extract_dump "$ref_dir/run.log" > "$ref_dir/dump.txt"
-    pulp_extract_dump "$opt_dir/run.log" > "$opt_dir/dump.txt"
-    if [ ! -s "$ref_dir/dump.txt" ] || [ ! -s "$opt_dir/dump.txt" ]; then
+    local base; base="$(dirname "$ref_dir")"
+    pulp_extract_dump "$ref_dir/run.log" > "$base/${name}_ref.dump"
+    pulp_extract_dump "$opt_dir/run.log" > "$base/${name}_opt.dump"
+    if [ ! -s "$base/${name}_ref.dump" ] || [ ! -s "$base/${name}_opt.dump" ]; then
         echo "  ERROR: no ==BEGIN DUMP_ARRAYS== section in the gvsoc log —"
         echo "         is -DPOLYBENCH_DUMP_ARRAYS set in the harness Makefile?"
         echo "$name;ERROR" >> "$CSV"; return
     fi
 
     echo "  [4/4] comparing..."
-    compare_dumps "$name" "$ref_dir/dump.txt" "$opt_dir/dump.txt"
+    compare_dumps "$name" "$base/${name}_ref.dump" "$base/${name}_opt.dump"
+    prune_kernel "$base"
     echo ""
 }
 
@@ -118,11 +106,12 @@ run_kernel() {
     fi
 
     echo "  [3/4] running..."
-    "$ref_dir/${name}_ref" 2> "$ref_dir/dump.txt" > /dev/null || true
-    "$opt_dir/${name}_opt" 2> "$opt_dir/dump.txt" > /dev/null || true
+    "$ref_dir/${name}_ref" 2> "$base/${name}_ref.dump" > /dev/null || true
+    "$opt_dir/${name}_opt" 2> "$base/${name}_opt.dump" > /dev/null || true
 
     echo "  [4/4] comparing..."
-    compare_dumps "$name" "$ref_dir/dump.txt" "$opt_dir/dump.txt"
+    compare_dumps "$name" "$base/${name}_ref.dump" "$base/${name}_opt.dump"
+    prune_kernel "$base"
     echo ""
 }
 

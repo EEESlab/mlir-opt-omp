@@ -141,9 +141,21 @@ optimised run beside the baseline it is compared with:
 results/
   iomp/                           # (same layout under libgomp/ and pmsis/)
     results_correctness.csv       # kernel;PASS|FAIL|ERROR
-    <kernel>-omp/ref/{<bin>,dump.txt}
-    <kernel>-omp/opt/{<bin>,<bin>.ll,dump.txt}   # final LLVM IR kept for debugging
+    <kernel>-omp/<kernel>-omp_ref.dump
+    <kernel>-omp/<kernel>-omp_opt.dump
 ```
+
+The two dumps are the evidence and the only thing kept: the result *is* that
+they are identical, so a reader can run the diff themselves instead of taking
+the verdict on trust. The binaries and the IR beside them are build products,
+rebuilt by re-running, and `KEEP=1` holds on to them when a FAIL has to be
+chased. `run_performance.sh` prunes the same way and keeps only its CSV — the
+cycle counts are the result, and the mean and deviation the per-repetition logs
+produced are in that CSV already.
+
+`constructs/` deliberately does the opposite and keeps every stage: there the
+question is *how* a clause is lowered and the IR is the answer, where here the
+question is whether two programs agree and the dumps are.
 
 The script exits non-zero if any kernel is not PASS, so it can gate CI.
 

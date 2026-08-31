@@ -1,24 +1,13 @@
 #!/bin/bash
-# =============================================================================
-# common.sh — shared setup for the Integration test drivers
-# (run_correctness.sh, run_performance.sh, run_barrier_vs_native.sh,
-# constructs/run_constructs.sh).
+# common.sh — shared setup for the Integration drivers. Sourced, not run.
 #
-# This file holds the configuration: run.env loading, tool/path resolution
-# and the per-runtime knobs. The rest is sourced from sibling files at the end:
-#   kernels.sh  kernel lists + selection helpers
-#   native.sh   compile_opt()/compile_ref() — the host pipelines
-#   pulp.sh     the PULP/gvsoc target (only when TARGET=pulp)
+# Loads the config (local.env, then run.env or $RUN_ENV), resolves the tools and
+# the per-runtime knobs, then pulls in kernels.sh, native.sh and — on pmsis —
+# pulp.sh. RUNTIME picks the target: iomp/libgomp run on the host, pmsis
+# cross-compiles for PULP/GAP8 and runs on gvsoc.
 #
-# Two execution targets, selected by RUNTIME:
-#   iomp | libgomp -> TARGET=native  compile+run on the host
-#   pmsis          -> TARGET=pulp    cross-compile riscv32, build+run through
-#                     the PULP-SDK
-# =============================================================================
+# Every variable and its default: README.md, "Configuration reference".
 
-# COMMON_DIR is this lib/ directory; INTEGRATION_DIR is the test/Integration
-# root (run.env, configs/ and the drivers live there);
-# REPO_ROOT holds local.env and rules.dsl.
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTEGRATION_DIR="$(cd "$COMMON_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$INTEGRATION_DIR/../.." && pwd)"
@@ -31,26 +20,6 @@ else
     GREEN=''; RED=''; CYAN=''; YELLOW=''; BOLD=''; RESET=''
 fi
 
-# --- Config ------------------------------------------------------------------
-# Two files, both optional and both git-ignored:
-#   <repo>/local.env      where the tools are
-#   Integration/run.env   what to run
-# The shared loader handles both, plus the tool defaults, PATH and the sanity
-# checks. run.env wins over local.env, and anything already in the environment
-# wins over both, so `RUNTIME=libgomp ./run_correctness.sh` still overrides them.
-#
-# RUN_ENV names a config file to read *instead of* run.env — the named ones in
-# configs/ reproduce a figure of the paper. Instead of, not as well as: a stale
-# personal run.env silently contaminating a reproduction run is exactly the
-# failure this is meant to prevent, and the command line then says which
-# configuration produced the numbers rather than leaving it to whichever file
-# happened to be on disk.
-#
-# A relative RUN_ENV is resolved against this directory as well as the cwd, so
-# `RUN_ENV=configs/paper-iomp.env` works from either. A name that matches
-# nothing is a hard error: the loader skips files it cannot find, which for
-# run.env is right (it is optional) and for RUN_ENV would be the worst
-# outcome — a reproduction run silently taken under the defaults.
 OMP_RUN_ENV_FILE="$INTEGRATION_DIR/run.env"
 if [ -n "${RUN_ENV:-}" ]; then
     if [ -f "$RUN_ENV" ]; then
@@ -71,11 +40,6 @@ OMP_REPO_ROOT="$REPO_ROOT"
 # shellcheck source=../../../scripts/load-local-env.sh
 . "$REPO_ROOT/scripts/load-local-env.sh" "$OMP_RUN_ENV_FILE"
 
-# --- Paths -----------------------------------------------------------------
-# POLYBENCH must name a PolyBench/OMP checkout: no kernels are vendored here.
-# Checked rather than assumed, because the failure otherwise is every kernel
-# being skipped as "not found" — a run that reports nothing wrong and measures
-# nothing at all.
 POLYBENCH="${POLYBENCH:-}"
 if [ -z "$POLYBENCH" ] || [ ! -d "$POLYBENCH" ]; then
     echo "ERROR: POLYBENCH must point at a PolyBench/OMP checkout." >&2
@@ -91,9 +55,6 @@ INC="${POLYBENCH_UTIL:-$POLYBENCH/utilities}"
 # Serial OpenMP stubs, linked into the sequential builds (see compile_*).
 OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
 
-# --- Run parameters --------------------------------------------------------
-# DATASET_DEFAULT lets a driver pick its own default (e.g. LARGE for perf)
-# while still letting the user/run.env override via DATASET.
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp | pmsis (pulp/gvsoc)
 # Redundant team-barrier elimination (--omp-barrier-elim). Off by default so a
 # plain run is the baseline to compare against.
@@ -105,18 +66,6 @@ case "$BARRIER_ELIM" in
         exit 1
         ;;
 esac
-# FLAG is spliced into the mlir-opt-omp command line by native.sh and pulp.sh.
-# DIR_TAG is appended to the drivers' output directory, so an optimised run
-# lands next to its baseline instead of on top of it. FILE_TAG does the same
-# for the result files of run_performance.sh: those get copied out of that
-# directory — into a paper, a slide deck — where the two configurations would
-# otherwise be two files with one name. All three empty when the pass is off,
-# so the baseline command line and paths stay exactly as they were.
-#
-# `both` is a mode rather than a setting, and only run_performance.sh knows
-# what to do with it: build the kernel both ways and time the two against each
-# other inside one run. FLAG stays empty here — that driver needs one build of
-# each, so it sets the flag around each compile itself.
 BARRIER_ELIM_FLAG=""
 BARRIER_ELIM_DIR_TAG=""
 BARRIER_ELIM_FILE_TAG=""
@@ -151,10 +100,6 @@ esac
 #export OMP_PLACES="${OMP_PLACES:-cores}"
 #export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 
-# --- Root / FIFO scheduler handling ----------------------------------------
-# Running as root lets PolyBench use the FIFO scheduler for lower variance, but
-# it needs the define + an explicit libc link. Exposed as POLYBENCH_ROOT_CFLAGS
-# so each driver can fold it into its own POLYBENCH_CFLAGS.
 POLYBENCH_ROOT_CFLAGS=""
 POLYBENCH_LFLAGS="${POLYBENCH_LFLAGS:-}"
 if [ "$(id -u)" -eq 0 ]; then
@@ -162,15 +107,9 @@ if [ "$(id -u)" -eq 0 ]; then
     POLYBENCH_LFLAGS="$POLYBENCH_LFLAGS -lc"
 fi
 
-# --- Strict FP flags — keep ref and opt in sync ----------------------------
-# Without these, FMA contraction and reordered reductions make iterative
-# kernels diverge even though both binaries are IEEE-correct.
 CLANG_STRICT_FP="${CLANG_STRICT_FP:--ffp-contract=off -fno-vectorize -fno-slp-vectorize}"
 GCC_STRICT_FP="${GCC_STRICT_FP:--ffp-contract=off -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize}"
 
-# Silence the noisy (harmless) warnings clang emits when it parses GCC's omp.h
-# (the __malloc__ attribute signature it does not implement). Both clang and
-# gcc accept -Wno-ignored-attributes.
 WARN_SUPPRESS="${WARN_SUPPRESS:--Wno-ignored-attributes}"
 
 # --- Per-runtime knobs -----------------------------------------------------
@@ -217,10 +156,6 @@ is_true() {
     esac
 }
 
-# Print the python a chart should be rendered with, or return non-zero after
-# saying why. Order: $PLOT_PYTHON, the local venv, then python3 on PATH.
-# Every caller treats the failure as a skipped plot rather than a failed run —
-# the CSV is the result, the figure is a convenience.
 plot_python() {
     local py
     if [ -n "${PLOT_PYTHON:-}" ]; then
@@ -243,18 +178,10 @@ plot_python() {
     printf '%s' "$py"
 }
 
-# --- Load the pieces ---------------------------------------------------------
-# kernels.sh  kernel lists + select_kernels/resolve_src
-# native.sh   compile_opt/compile_ref (host pipelines)
-# pulp.sh     everything TARGET=pulp specific (PULP_* knobs, SDK env,
-#             pulp_cell and the riscv32 kernel.o pipeline)
-# shellcheck source=kernels.sh
 . "$COMMON_DIR/kernels.sh"
 # shellcheck source=native.sh
 . "$COMMON_DIR/native.sh"
 # SKIP_PULP_SDK is for a driver that only goes as far as MLIR
-# (run_barrier_vs_native.sh): RUNTIME=pmsis then needs the lowering rules but
-# neither the GAP SDK nor PULP_APP_DIR, which pulp.sh insists on.
 if [ "$TARGET" = "pulp" ] && [ -z "${SKIP_PULP_SDK:-}" ]; then
     # shellcheck source=pulp.sh
     . "$COMMON_DIR/pulp.sh"

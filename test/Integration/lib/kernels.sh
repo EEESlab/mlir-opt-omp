@@ -1,13 +1,8 @@
 #!/bin/bash
-# =============================================================================
-# kernels.sh — the PolyBench kernel lists and kernel-selection helpers.
-#
-# Sourced by common.sh; not meant to be sourced directly.
-# Add/remove kernels here. Paths are relative to $POLYBENCH.
-# =============================================================================
+# kernels.sh — the PolyBench kernel list and the selection helpers. Sourced by
+# common.sh. Paths are relative to $POLYBENCH, which must name a checkout: this
+# repo vendors no kernels.
 
-# The PolyBench/OMP suite, resolved against $POLYBENCH — which must point at a
-# checkout: this repo vendors no kernels of its own.
 ALL_KERNELS=(
     "datamining/covariance/covariance-omp.c"
     "datamining/correlation/correlation-omp.c"
