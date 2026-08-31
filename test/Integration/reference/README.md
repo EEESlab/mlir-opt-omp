@@ -39,9 +39,9 @@ branch built, and keep the CSVs this time:
 
 ```sh
 cd test/Integration
-RUNTIME=libgomp SUITE=full DATASET=LARGE_DATASET PLOT=true ./run_performance.sh   # Fig 4
-RUNTIME=iomp    SUITE=full DATASET=LARGE_DATASET PLOT=true ./run_performance.sh   # Fig 5
-RUNTIME=pmsis   SUITE=full                       PLOT=true ./run_performance.sh   # Fig 6 + 7
+RUN_ENV=configs/paper-libgomp.env PLOT=true ./run_performance.sh   # Fig 4
+RUN_ENV=configs/paper-iomp.env    PLOT=true ./run_performance.sh   # Fig 5
+RUN_ENV=configs/paper-pmsis.env   PLOT=true ./run_performance.sh   # Fig 6 + 7
 ```
 
 Copy each `results/<runtime>/results_performance.csv` in here, and regenerate

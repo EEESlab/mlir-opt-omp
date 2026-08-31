@@ -255,7 +255,7 @@ and a per-machine config:
 ```sh
 cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN, INC_OMP
 cd test/Integration
-./run_correctness.sh                     # bundled kernels, iomp
+./run_correctness.sh                     # whole PolyBench suite, iomp
 RUNTIME=libgomp ./run_performance.sh
 ```
 

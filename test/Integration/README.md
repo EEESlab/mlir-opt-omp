@@ -48,17 +48,6 @@ This is the slow, whole-pipeline layer (needs clang-cir, cir-opt, mlir tools,
 an OpenMP runtime and a PolyBench checkout). For fast per-pass IR checks see
 `../Regression/` (lit + FileCheck).
 
-## Bundled kernels
-
-A couple of PolyBench kernels are vendored under [`kernels/`](kernels) so the
-test runs **self-contained**, without an external checkout:
-
-- `linear-algebra/blas/gemm/` — dense matrix multiply
-- `linear-algebra/kernels/atax/` — matrix-vector product
-- `utilities/` — `polybench.c` / `polybench.h` support code
-
-By default `POLYBENCH` points here and only these kernels run (`SUITE=bundled`).
-
 ## Setup
 
 Nothing is hard-coded to a machine. Configuration is split in two, by how often
@@ -77,10 +66,10 @@ cp local.env.example local.env
 $EDITOR local.env        # LLVM_BIN, OMP_TOOL_BIN, INC_OMP
 ```
 
-Those three are enough for the bundled kernels: your ClangIR build, your
-`mlir-opt-omp` build, and the OpenMP headers of your GCC. The drivers check all
-three at startup and tell you which one is wrong rather than failing later
-inside a compile.
+Four values: your ClangIR build, your `mlir-opt-omp` build, the OpenMP headers
+of your GCC, and `POLYBENCH` — a checkout of PolyBench/OMP, since this repo
+vendors no kernels of its own. The drivers check all four at startup and say
+which one is wrong rather than failing later inside a compile.
 
 Add `run.env` only when you want different defaults from run to run:
 
@@ -97,19 +86,19 @@ yours.
 ## Run
 
 ```sh
-./run_correctness.sh                          # bundled kernels, defaults
+./run_correctness.sh                          # whole suite, defaults
 RUNTIME=libgomp ./run_correctness.sh          # switch runtime
 DATASET=SMALL_DATASET THREADS=8 ./run_correctness.sh
 ./run_correctness.sh linear-algebra/blas/gemm/gemm-omp.c   # single kernel
 ```
 
-Run the **full** PolyBench suite against an external checkout:
+`POLYBENCH` normally lives in `local.env`, but can be given per run:
 
 ```sh
-SUITE=full POLYBENCH=/path/to/PolyBenchC-4.2.1-OpenMP ./run_correctness.sh
+POLYBENCH=/path/to/PolyBenchC-4.2.1-OpenMP ./run_correctness.sh
 ```
 
-Or pass an explicit list:
+Or pass an explicit list of kernels:
 
 ```sh
 KERNELS="linear-algebra/blas/gemm/gemm-omp.c stencils/adi/adi-omp.c" \
@@ -243,11 +232,11 @@ The suite summary uses the **geometric mean** of each ratio across all kernels
 (the standard way to average benchmark speedups).
 
 ```sh
-./run_performance.sh                                   # bundled kernels
+./run_performance.sh                                   # whole suite
 RUNTIME=libgomp DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 ./run_performance.sh linear-algebra/blas/gemm/gemm-omp.c   # single kernel
-SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
-PLOT=true SUITE=full ./run_performance.sh              # + speedup chart
+POLYBENCH=/path/to/checkout ./run_performance.sh
+PLOT=true ./run_performance.sh              # + speedup chart
 ```
 
 ### Speedup chart
@@ -255,11 +244,11 @@ PLOT=true SUITE=full ./run_performance.sh              # + speedup chart
 Set `PLOT=true` (run.env or inline) to render a bar chart of the
 **self-relative parallel speedup** per kernel once the run finishes — native
 (`ref_seq/ref_par`) vs our tool (`opt_seq/opt_par`), i.e. the `speedup_native`
-and `speedup_opt` columns. It covers whatever ran (`bundled`, `full`, or an
+and `speedup_opt` columns. It covers whatever ran (the whole suite, or an
 explicit `KERNELS` list) and lands at `results/<runtime>/results_performance_<sel>.png`,
-where `<sel>` names the selection — the suite (`full`/`bundled`) or, for an
+where `<sel>` names the selection — `suite` for the whole set or, for an
 explicit `KERNELS` list, the kernel basename(s) — plus the dataset size, e.g.
-`_full_large` or `_gemm-omp_mini`. The
+`_suite_large` or `_gemm-omp_mini`. The
 native bar is labelled by runtime — *Clang frontend* (`iomp`), *GCC frontend*
 (`libgomp`) or *PULP-SDK GCC* (`pmsis`).
 
@@ -304,14 +293,14 @@ results/
   <runtime>/                         # iomp/, libgomp/ or pmsis/
     results_performance.csv          # per-kernel rows + a GEOMEAN summary row
     results_performance_<sel>.png    # speedup chart (when PLOT=true); <sel> =
-                                     # suite (full/bundled) or kernel name(s),
-                                     # + dataset size (e.g. _full_large)
+                                     # "suite" or the kernel name(s),
+                                     # + dataset size (e.g. _suite_large)
     <kernel>-omp/performance/        # the four binaries, their .ll, and *.log timings
 ```
 
 Under `BARRIER_ELIM=1` those two names take a `_barrier-elim` suffix as well —
 `results_performance_barrier-elim.csv`,
-`results_performance_full_large_barrier-elim.png`. The folder already says
+`results_performance_suite_large_barrier-elim.png`. The folder already says
 which run they belong to, but these are the files that leave it, and a figure
 in a paper directory has no folder left to tell it by.
 
@@ -334,7 +323,7 @@ removed from the program text, not barrier executions saved.
 compared with the compiler people actually use:
 
 ```sh
-SUITE=full ./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.csv
+./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.csv
 ```
 
 Both sides are counted in LLVM IR after `-O3`, so neither is measured at a
@@ -411,9 +400,9 @@ parallel region on the spelling clang's front-end skips.
 measure its effect. Run each configuration twice, changing only this variable:
 
 ```sh
-BARRIER_ELIM=0 SUITE=full ./run_performance.sh    # baseline
-BARRIER_ELIM=1 SUITE=full ./run_performance.sh    # with the optimisation
-BARRIER_ELIM=1 SUITE=full ./run_correctness.sh    # still bit-identical?
+BARRIER_ELIM=0 ./run_performance.sh    # baseline
+BARRIER_ELIM=1 ./run_performance.sh    # with the optimisation
+BARRIER_ELIM=1 ./run_correctness.sh    # still bit-identical?
 ```
 
 The two configurations write into separate trees — `results/<runtime>/` for the
@@ -458,7 +447,7 @@ for.
 one run instead:
 
 ```sh
-BARRIER_ELIM=both SUITE=full ./run_performance.sh
+BARRIER_ELIM=both ./run_performance.sh
 ```
 
 Per kernel it builds `opt_par` twice, with and without the pass, then times
@@ -474,7 +463,7 @@ two full runs the split flow needs.
 §4.5, which is a claim about the PULP target:
 
 ```sh
-RUNTIME=pmsis BARRIER_ELIM=both SUITE=full PLOT=true ./run_performance.sh
+RUNTIME=pmsis BARRIER_ELIM=both PLOT=true ./run_performance.sh
 ```
 
 Two things do not carry over there, both of them simplifications. There is no
@@ -588,7 +577,7 @@ a warning and fall back to `PATH`.
 | Variable         | Default | Meaning                                      |
 |------------------|---------|----------------------------------------------|
 | `INC_OMP`        | `/usr/lib/gcc/x86_64-linux-gnu/13/include` | OpenMP headers for the clang→CIR front-end; must match the local GCC |
-| `POLYBENCH`      | `kernels/` (vendored) | PolyBench-OpenMP checkout root, required for `SUITE=full` |
+| `POLYBENCH`      | *none — required* | PolyBench-OpenMP checkout root; the drivers refuse to start without it |
 | `POLYBENCH_UTIL` | `$POLYBENCH/utilities` | PolyBench support headers           |
 | `RULES`          | the repo's `rules.dsl` | DSL file passed to `mlir-opt-omp`   |
 | `OUTDIR`         | `$PWD/results` | binaries, dumps and CSVs land in `$OUTDIR/<runtime>`, plus a `-barrier-elim` suffix when `BARRIER_ELIM=1` |
@@ -598,8 +587,7 @@ a warning and fall back to `PATH`.
 | Variable  | Default | Meaning                                             |
 |-----------|---------|-----------------------------------------------------|
 | `RUNTIME` | `iomp`  | `iomp`, `libgomp` or `pmsis` (PULP/gvsoc)           |
-| `SUITE`   | `bundled` | `bundled` (vendored kernels) or `full`            |
-| `KERNELS` | *empty* | explicit space-separated kernel list; overrides `SUITE`, paths resolved against `$POLYBENCH` |
+| `KERNELS` | *empty* | explicit space-separated kernel list; empty runs the whole suite, paths resolved against `$POLYBENCH` |
 | `DATASET` | `MINI_DATASET` for correctness, `LARGE_DATASET` for performance, always `MINI_DATASET` on `pmsis` unless set | PolyBench dataset size macro |
 | `THREADS` | `16`    | thread count for the parallel runs; ignored on `pmsis` |
 | `BARRIER_ELIM` | `0` | `1` adds `--omp-barrier-elim` to the pipeline and writes to `results/<runtime>-barrier-elim/`. Off by default so a plain run is the baseline to compare against. `both` (perf driver, host only) builds the kernel each way and times the two against each other — see [Measuring the effect](#measuring-the-effect) |

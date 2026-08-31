@@ -17,7 +17,7 @@
 # =============================================================================
 
 # COMMON_DIR is this lib/ directory; INTEGRATION_DIR is the test/Integration
-# root (run.env, the vendored kernels/ and the drivers live there);
+# root (run.env, configs/ and the drivers live there);
 # REPO_ROOT holds local.env and rules.dsl.
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTEGRATION_DIR="$(cd "$COMMON_DIR/.." && pwd)"
@@ -72,10 +72,21 @@ OMP_REPO_ROOT="$REPO_ROOT"
 . "$REPO_ROOT/scripts/load-local-env.sh" "$OMP_RUN_ENV_FILE"
 
 # --- Paths -----------------------------------------------------------------
-# Defaults to the kernels vendored in this repo, so the tests are
-# self-contained. Point POLYBENCH at a full PolyBench/OMP checkout (and use
-# SUITE=full) to run the whole benchmark set.
-POLYBENCH="${POLYBENCH:-$INTEGRATION_DIR/kernels}"
+# POLYBENCH must name a PolyBench/OMP checkout: no kernels are vendored here.
+# Checked rather than assumed, because the failure otherwise is every kernel
+# being skipped as "not found" — a run that reports nothing wrong and measures
+# nothing at all.
+POLYBENCH="${POLYBENCH:-}"
+if [ -z "$POLYBENCH" ] || [ ! -d "$POLYBENCH" ]; then
+    echo "ERROR: POLYBENCH must point at a PolyBench/OMP checkout." >&2
+    if [ -n "$POLYBENCH" ]; then
+        echo "       POLYBENCH='$POLYBENCH' is not a directory." >&2
+    else
+        echo "       It is not set. Put it in <repo>/local.env:" >&2
+        echo "         POLYBENCH=\"/path/to/PolyBenchC-4.2.1-OpenMP\"" >&2
+    fi
+    exit 2
+fi
 INC="${POLYBENCH_UTIL:-$POLYBENCH/utilities}"
 # Serial OpenMP stubs, linked into the sequential builds (see compile_*).
 OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
@@ -122,7 +133,6 @@ case "$BARRIER_ELIM" in
 esac
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
-SUITE="${SUITE:-bundled}"            # bundled | full
 
 # PolyBench silently maps an unknown name to LARGE_DATASET — on GAP8 that dies
 # in pi_l2_malloc — and setting DATASET at all disables the pmsis guard below.

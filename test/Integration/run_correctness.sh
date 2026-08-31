@@ -132,14 +132,14 @@ CSV="$OUTDIR/results_correctness.csv"
 
 echo "=== MLIR OpenMP CORRECTNESS CHECK ==="
 if [ "$TARGET" = "pulp" ]; then
-    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET    suite: $SUITE"
+    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET"
     echo "app dir: $PULP_APP_DIR"
     echo "ref: pulp-sdk gcc ('make OMP_NATIVE=1')    opt: CIR/MLIR kernel.o ('make OMP_OPT=1')"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
     echo "dumps: extracted from the gvsoc console log (POLYBENCH_DUMP_ARRAYS)"
 else
-    echo "runtime: $RUNTIME    dataset: $DATASET    threads: $THREADS    suite: $SUITE"
+    echo "runtime: $RUNTIME    dataset: $DATASET    threads: $THREADS"
     echo "ref cc : $REF_CC"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"

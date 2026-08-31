@@ -37,8 +37,8 @@
 #   RUNTIME=pmsis ./run_performance.sh                # PULP/gvsoc (needs GAP SDK)
 #   DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
 #   ./run_performance.sh path/to/kernel-omp.c         # a single kernel
-#   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
-#   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
+#   POLYBENCH=/path/to/checkout ./run_performance.sh
+#   PLOT=true ./run_performance.sh                     # also render the chart
 #   BARRIER_ELIM=1 ./run_performance.sh                # with --omp-barrier-elim
 #   BARRIER_ELIM=both ./run_performance.sh             # A/B: our two builds,
 #                                                      # timed against each other
@@ -55,9 +55,9 @@
 #                                  chart, ..._size.png, plots the binary size
 #                                  change from the size_* columns.
 #                                  <sel> = the kernel
-#                                  selection (the SUITE, full/bundled, or the
+#                                  selection ("suite", or the
 #                                  explicit kernel name(s)) + the dataset size,
-#                                  e.g. _full_large or _gemm-omp_mini.
+#                                  e.g. _suite_large or _gemm-omp_mini.
 #
 # The CSV and the chart carry a _barrier-elim suffix of their own under
 # BARRIER_ELIM=1. The folder already says which run they came from, but these
@@ -439,7 +439,7 @@ emit_na() {
 }
 
 # Suffix naming what this run covered, appended to the plot filename:
-# the kernel selection — the SUITE name (full/bundled), or, when an explicit
+# the kernel selection — "suite" for the whole set, or, when an explicit
 # KERNELS list (or a single-kernel argument) was given, the kernel basenames
 # (the part after the last '/', without the .c extension) joined by '_' —
 # followed by the dataset size (LARGE_DATASET -> large).
@@ -453,7 +453,7 @@ plot_suffix() {
         done
         sel=$(IFS=_; printf '%s' "${parts[*]}")
     else
-        sel="$SUITE"
+        sel="suite"
     fi
     local ds="${DATASET%_DATASET}"
     printf '%s_%s' "$sel" "${ds,,}"
@@ -511,7 +511,7 @@ fi
 echo "=== MLIR OpenMP PERFORMANCE COMPARISON ==="
 if [ "$BARRIER_ELIM" = "both" ]; then
     echo "mode: A/B barrier elimination — our two builds against each other"
-    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
+    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS"
     if [ "$TARGET" = "pulp" ]; then
         echo "timer: 'Cycles =' from the gvsoc log — 1 run per build, no alternation"
         echo "       (the simulator is deterministic: REPS would return the same number)"
@@ -522,14 +522,14 @@ if [ "$BARRIER_ELIM" = "both" ]; then
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
 elif [ "$TARGET" = "pulp" ]; then
-    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET    suite: $SUITE"
+    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET"
     echo "app dir: $PULP_APP_DIR"
     echo "ref: pulp-sdk gcc (make / OMP_NATIVE=1)    opt: CIR/MLIR kernel.o (OMP_OPT=1)"
     echo "timer: 'Cycles =' from the gvsoc log — 1 run/cell (simulator is deterministic)"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
 else
-    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
+    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS"
     echo "ref cc : $REF_CC    reps: $REPS    timer: cycle-accurate TSC"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
@@ -541,7 +541,7 @@ echo "$CSV_HEADER" > "$CSV"
 select_kernels
 
 if [ $# -ge 1 ]; then
-    KERNELS="$1"   # so plot_suffix names the kernel, not the unused SUITE
+    KERNELS="$1"   # so plot_suffix names the kernel rather than the suite
     run_kernel "$1"
 else
     for k in "${KERNEL_LIST[@]}"; do

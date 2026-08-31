@@ -50,7 +50,6 @@
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
-#   SUITE=full ./run_barrier_vs_native.sh            # the external PolyBench set
 #   ./run_barrier_vs_native.sh path/to/kernel-omp.c  # a single kernel
 #   VERBOSE=1 ./run_barrier_vs_native.sh             # let the tools report why
 # =============================================================================

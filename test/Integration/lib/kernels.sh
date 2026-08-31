@@ -6,14 +6,8 @@
 # Add/remove kernels here. Paths are relative to $POLYBENCH.
 # =============================================================================
 
-# Bundled in this repo (paths relative to $POLYBENCH).
-BUNDLED_KERNELS=(
-    "linear-algebra/blas/gemm/gemm-omp.c"
-    "linear-algebra/kernels/atax/atax-omp.c"
-)
-
-# The full PolyBench/OMP suite (paths relative to $POLYBENCH). Used with
-# SUITE=full against an external checkout.
+# The PolyBench/OMP suite, resolved against $POLYBENCH — which must point at a
+# checkout: this repo vendors no kernels of its own.
 ALL_KERNELS=(
     "datamining/covariance/covariance-omp.c"
     "datamining/correlation/correlation-omp.c"
@@ -47,15 +41,13 @@ ALL_KERNELS=(
     "stencils/seidel-2d/seidel-2d-omp.c"
 )
 
-# Pick the kernel list: an explicit KERNELS override wins, then SUITE selects
-# the bundled set or the full suite. Result lands in the KERNEL_LIST array.
+# Pick the kernel list: an explicit KERNELS override wins, otherwise the whole
+# suite runs. Result lands in the KERNEL_LIST array.
 select_kernels() {
     if [ -n "${KERNELS:-}" ]; then
         read -ra KERNEL_LIST <<< "$KERNELS"
-    elif [ "$SUITE" = "full" ]; then
-        KERNEL_LIST=("${ALL_KERNELS[@]}")
     else
-        KERNEL_LIST=("${BUNDLED_KERNELS[@]}")
+        KERNEL_LIST=("${ALL_KERNELS[@]}")
     fi
 }
 
