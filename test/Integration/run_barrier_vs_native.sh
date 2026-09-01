@@ -126,8 +126,9 @@ echo "form:      combined = '#pragma omp parallel for'"
 echo "           split    = '#pragma omp parallel' + '#pragma omp for'"
 echo
 
-echo "kernel,pragma_form,clang,gcc_o0,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
-printf '  %-22s %-9s %6s %6s %8s %8s %8s\n' kernel form clang gcc base elim 'vs clang'
+echo "kernel,pragma_form,clang,gcc_o0,ours_baseline,ours_barrier_elim" > "$CSV"
+printf '  %-22s %-9s %6s %6s %8s %13s\n' \
+    kernel form clang gcc base barrier_elim
 
 # Intermediates only (.cir and the MLIR stages); the counted files go straight
 # to $OUTDIR and stay there.
@@ -148,12 +149,12 @@ for k in "${KERNEL_LIST[@]}"; do
         -I"$INC" -I"$(dirname "$src")" -I"$INC_OMP" \
         -D"$DATASET" $POLYBENCH_CFLAGS \
         "$src" -o "$kdir/clang-O3.ll" 2>"$ERRSINK" \
-        || { echo "  ERROR (clang): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
+        || { echo "  ERROR (clang): $name"; echo "$name,$form,,,," >> "$CSV"; FAILED=1; continue; }
 
     build_ours "$src" "$kdir/ours-baseline-O3.ll" "" \
-        || { echo "  ERROR (ours, baseline): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
+        || { echo "  ERROR (ours, baseline): $name"; echo "$name,$form,,,," >> "$CSV"; FAILED=1; continue; }
     build_ours "$src" "$kdir/ours-elim-O3.ll" "--omp-barrier-elim" \
-        || { echo "  ERROR (ours, barrier-elim): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
+        || { echo "  ERROR (ours, barrier-elim): $name"; echo "$name,$form,,,," >> "$CSV"; FAILED=1; continue; }
 
     g=""
     if build_gcc "$src" "$kdir/gcc-O0.s"; then
@@ -166,12 +167,11 @@ for k in "${KERNEL_LIST[@]}"; do
     c="$(count_barriers "$kdir/clang-O3.ll")"
     b="$(count_barriers "$kdir/ours-baseline-O3.ll")"
     e="$(count_barriers "$kdir/ours-elim-O3.ll")"
-    saved=$((c - e))
 
     T_CLANG=$((T_CLANG + c)); T_BASE=$((T_BASE + b)); T_ELIM=$((T_ELIM + e))
-    printf '  %-22s %-9s %6s %6s %8s %8s %8s\n' \
-        "$name" "$form" "$c" "${g:--}" "$b" "$e" "$saved"
-    echo "$name,$form,$c,$g,$b,$e,$saved" >> "$CSV"
+    printf '  %-22s %-9s %6s %6s %8s %13s\n' \
+        "$name" "$form" "$c" "${g:--}" "$b" "$e"
+    echo "$name,$form,$c,$g,$b,$e" >> "$CSV"
 done
 
 echo
@@ -182,9 +182,9 @@ echo "$TOTALS"
 
 if [ "$T_GCC" -gt 0 ]; then
     echo "    Counted at -O0: gcc already elides the barrier in its front end."
-    echo "    From -O1 the passes that duplicate a path to remove a branch --"
-    echo "    copy the block the barrier sits in"
-    echo "    along with it: more call sites, no execution gaining a barrier."
+    echo "    From -O1 the passes that duplicate a path to remove a branch"
+    echo "    copy the block the barrier sits in along with it: more call"
+    echo "    sites, no execution gaining a barrier."
 fi
 
 # --- against the paper -------------------------------------------------------

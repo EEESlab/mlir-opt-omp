@@ -181,7 +181,7 @@ run_kernel_ab() {
 
     echo -e "${BOLD}── $name${RESET}" >&2
 
-    echo "  [1/2] base (senza la pass)..." >&2
+    echo "  [1/2] base (without the pass)..." >&2
     BARRIER_ELIM_FLAG=""
     compile_opt "$src" "$d" "${name}_ab_base" on >&2 \
         || { echo "  ERROR base compile" >&2; emit_na "$name"; return; }
@@ -209,7 +209,7 @@ run_kernel_ab() {
         echo ""
         printf "  %-24s %18s\n" "base (${THREADS}T) cycles" "$C_BASE"
         printf "  %-24s %18s\n" "elim (${THREADS}T) cycles" "$C_ELIM"
-        printf "  %-24s %17s%%\n" "risparmio" "${DELTA} ± ${DELTA_SD}"
+        printf "  %-24s %17s%%\n" "saving" "${DELTA} ± ${DELTA_SD}"
         echo ""
     } >&2
 
@@ -227,7 +227,7 @@ run_kernel_pulp_ab() {
     # pulp.sh splices $BARRIER_ELIM_FLAG into the mlir-opt-omp command, exactly
     # as native.sh does, so the flag is set around each build and cleared after.
     local base elim
-    echo "  [1/2] base (senza la pass)..." >&2
+    echo "  [1/2] base (without the pass)..." >&2
     : > "$d/ab_base.log"
     BARRIER_ELIM_FLAG=""
     if ! base="$(pulp_cell "$src" opt_par "$d" "$d/ab_base.log")"; then
@@ -258,7 +258,7 @@ run_kernel_pulp_ab() {
         echo ""
         printf "  %-24s %18s\n" "base cycles" "$C_BASE"
         printf "  %-24s %18s\n" "elim cycles" "$C_ELIM"
-        printf "  %-24s %17s%%\n" "risparmio" "$DELTA"
+        printf "  %-24s %17s%%\n" "saving" "$DELTA"
         echo ""
     } >&2
 
@@ -486,7 +486,7 @@ compare_ab_to_claims() {
         return 0
     fi
     echo ""
-    echo "  best: $best_k    worst: $worst_k    (section 4.5 names trisolv)"
+    echo "  best: $best_k    worst: $worst_k"
 }
 
 if [ "$BARRIER_ELIM" = "both" ]; then
@@ -506,7 +506,7 @@ if [ "$BARRIER_ELIM" = "both" ]; then
 
     echo ""
     echo -e "${BOLD}=== SUMMARY A/B (${DATASET}, ${THREADS}T, runtime=${RUNTIME}) ===${RESET}"
-    printf "${BOLD}  %-20s %16s %16s %12s${RESET}\n" "kernel" "base" "elim" "risparmio"
+    printf "${BOLD}  %-20s %16s %16s %12s${RESET}\n" "kernel" "base" "elim" "saving"
     if [ "$TARGET" = "pulp" ]; then
         awk -F';' 'NR > 1 && $1 != "TOTAL" && $2 != "NA" {
             printf "  %-20s %16.0f %16.0f %10s%%\n", $1, $2, $4, $6
@@ -517,15 +517,13 @@ if [ "$BARRIER_ELIM" = "both" ]; then
         }' "$CSV"
     fi
     echo "  --------------------------------------------------------------------"
-    printf "${BOLD}  %-20s %16s %16s %10s%%${RESET}\n" "TOTALE" "$T_BASE" "$T_ELIM" "$T_DELTA"
+    printf "${BOLD}  %-20s %16s %16s %10s%%${RESET}\n" "TOTAL" "$T_BASE" "$T_ELIM" "$T_DELTA"
     echo ""
     if [ "$TARGET" = "pulp" ]; then
-        echo "  $N_SIG kernel su $N_OK migliorano."
-        echo "  Nessuna barra d'errore: il simulatore è deterministico, quindi ogni"
-        echo "  segno è esatto — ma è un'unica misura, non una media."
+        echo "  $N_SIG of $N_OK kernels improve."
     else
-        echo "  $N_SIG kernel su $N_OK con un risparmio maggiore del doppio del proprio errore."
-        echo "  Il resto è sotto la sensibilità della misura, non necessariamente zero."
+        echo "  $N_SIG of $N_OK kernels save more than twice their own error."
+        echo "  The rest are below the sensitivity of the measurement, not necessarily zero."
     fi
 
     # --- against the paper ---------------------------------------------------
