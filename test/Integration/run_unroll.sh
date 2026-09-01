@@ -211,32 +211,6 @@ summarise() {
         END { printf "%d %.4f %s", n, (n ? s / n : 0), (fw == "" ? "NA" : fw) }
     ' "$CSV")
 
-    echo
-    echo "  === SECTION 4.5 (reference/claims.csv) ==="
-    printf '  %-26s %10s %10s %10s\n' quantity measured paper diff
-
-    local rows=0 value
-    show_one() {   # $1 metric  $2 subject  $3 label  $4 measured
-        value=""
-        read -r value _ < <(claim_row "$1" "$2")
-        [ -z "${value:-}" ] && return 0
-        [ "$4" = "NA" ] && return 0
-        rows=$((rows + 1))
-        printf '  %-26s %10s %10s %10s\n' "$3" "$4" "$value"  \
-            "$(awk -v m="$4" -v p="$value" 'BEGIN { printf "%.4f", m - p }')"
-    }
-    show_one unroll_pct ten-apps       "mean, excl. floyd-w. %" "$mean"
-    show_one unroll_pct floyd-warshall "floyd-warshall %"       "$fw"
-    unset -f show_one
-
-    if [ "$rows" -eq 0 ]; then
-        echo "  no unroll_pct rows in $CLAIMS"
-    else
-        echo
-        echo "  The mean covers the $n kernels other than floyd-warshall, which"
-        echo "  the paper gives a number of its own."
-    fi
-
     # Per kernel against the figure itself: the published values are exact, and
     # were taken on a simulator anyone can rerun, so the comparison is worth
     # making kernel by kernel rather than in aggregate.
