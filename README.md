@@ -345,3 +345,8 @@ C++ work in `lib/Transforms/OmpOutliningPass.cpp`.
 Every new feature should come with a regression test under `test/Regression/`;
 [`test/README.md`](test/README.md) documents the format and the available lit
 substitutions.
+
+## License
+
+Apache License v2.0 with LLVM Exceptions, the license of the LLVM project this
+tool builds on. See [`LICENSE`](LICENSE).
