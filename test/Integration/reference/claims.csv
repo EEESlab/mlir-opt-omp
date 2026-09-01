@@ -9,10 +9,15 @@
 #                   backs it.
 #
 # Where the two disagree the paper has a problem, and that is the point of
-# keeping them apart: section 4.3 claims the size increase stays below 0.7%,
-# while fig7_size_our reaches 0.7296 on nussinov. The row below still says
-# 0.7, because a check that quietly relaxed to 0.75 would stop checking the
-# paper.
+# keeping them apart: section 4.5 describes Figure 8 as about 3% over ten
+# applications, while the ten bars in fig8_unroll_pct average 2.28. The row
+# below still says 3, because a check that quietly relaxed to 2.3 would stop
+# checking the paper.
+#
+# The size bound was the example here until the figures were re-read. It looked
+# broken -- nussinov at 0.7296 against a stated 0.7 -- but that was a constant
+# offset in the extractor, not the paper. It now reads 0.6826 and the sentence
+# holds. Worth remembering when the next row looks broken by a hair.
 #
 # Columns
 #   claim       stable id, so a driver can name one row
@@ -56,7 +61,7 @@ size-bound;4.3;pmsis;size_increase_pct;all;max;0.7;;compare_to_reference.py
 barriers-ours-baseline;4.5;iomp;team_barriers;ours_baseline;equals;59;0;run_barrier_vs_native.sh
 barriers-ours-elim;4.5;iomp;team_barriers;ours_elim;equals;26;0;run_barrier_vs_native.sh
 barriers-clang;4.5;iomp;team_barriers;clang;equals;45;0;run_barrier_vs_native.sh
-barriers-gcc;4.5;iomp;team_barriers;gcc_o0;equals;28;0;run_barrier_vs_native.sh
+barriers-gcc;4.5;iomp;team_barriers;gcc_o3_ntj;equals;28;0;run_barrier_vs_native.sh
 barrier-elim-saving;4.5;pmsis;barrier_saving_pct;suite;equals;0.037;0.02;run_performance.sh
 barrier-elim-improved;4.5;pmsis;kernels_improving;suite;equals;22;2;run_performance.sh
 barrier-elim-best;4.5;pmsis;barrier_delta_pct;best;equals;1.12;0.30;run_performance.sh

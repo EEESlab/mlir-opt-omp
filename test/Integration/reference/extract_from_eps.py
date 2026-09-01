@@ -9,9 +9,11 @@ not estimate them from a picture.
 How it works. Text is emitted as `/glyphname glyphshow` inside a translated
 gsave, so a label is the concatenation of its glyph names and its position is
 the translate. Numeric labels stacked at one x, to the left of the axes, are the
-y ticks: two of them fix the affine map from device units to data units. Bars
-are filled axis-aligned rectangles standing on the baseline; the modal bottom
-edge identifies the baseline and so separates the bars from the legend swatches.
+y tick values; their POSITIONS come from the tick marks, which the file draws
+separately -- a label is centred on its tick and so sits below it, and taking
+the origin from the label instead shifts every value by one constant. Bars are
+filled axis-aligned rectangles standing on the baseline; the modal bottom edge
+identifies the baseline and so separates the bars from the legend swatches.
 Series are told apart by fill colour, and paired to kernels by x order.
 
 Usage:
@@ -101,6 +103,35 @@ def rects(src):
     return out
 
 
+def tick_marks(src):
+    """Device positions of the axis tick marks.
+
+    matplotlib emits a tick as a one-line procedure -- `/o { ... 0 0 m 0 3.5 l
+    ... } bind def` -- called once per tick as `<x> <y> o`. Those coordinates
+    are the tick itself, which is what the values have to be read against.
+
+    The label anchors are NOT a substitute. A tick label is centred vertically
+    on its tick, so in the file it sits half a text height BELOW it: a constant
+    0.3415 em, the same at the top of the axis as at the bottom. That offset
+    leaves the ticks collinear and the scale correct, and shifts every value
+    read off the axis by one constant -- which is exactly the kind of error a
+    plot cannot show you.
+
+    The y ticks are the calls that share one x; each x tick has an x of its own.
+    """
+    calls = [(float(a), float(b))
+             for a, b in re.findall(rf"^({NUM})\s+({NUM})\s+o$", src, re.M)]
+    if not calls:
+        return []
+    shared = {}
+    for x, _y in calls:
+        shared[x] = shared.get(x, 0) + 1
+    axis_x = max(shared, key=lambda k: shared[k])
+    if shared[axis_x] < 2:
+        return []
+    return sorted(y for x, y in calls if abs(x - axis_x) < 0.01)
+
+
 def mode(values, tol=0.01):
     best, count = None, 0
     for v in values:
@@ -121,14 +152,22 @@ def read_figure(path):
         raise SystemExit(f"{path}: no bars found")
     axes_left = min(r[0] for r in coloured)
 
-    # y ticks: every numeric label left of the bars. Not grouped by exact x --
-    # tick labels are right-aligned, so "10" begins further left than "0" and
-    # an exact-x match splits one axis into two.
-    ticks = sorted((y, float(t.rstrip("%")))
-                   for x, y, t, _w in txt
-                   if x < axes_left and re.fullmatch(r"-?\d+(?:\.\d+)?%?", t))
-    if len(ticks) < 2:
-        raise SystemExit(f"{path}: need two y ticks, found {len(ticks)}")
+    # y ticks: the label text supplies the VALUES, the tick marks supply the
+    # POSITIONS. Reading both off the labels shifts every result by half a text
+    # height -- see tick_marks(). The labels are gathered by "numeric and left
+    # of the bars" rather than by exact x, because they are right-aligned and
+    # "10" begins further left than "0".
+    values = sorted((y, float(t.rstrip("%")))
+                    for x, y, t, _w in txt
+                    if x < axes_left and re.fullmatch(r"-?\d+(?:\.\d+)?%?", t))
+    if len(values) < 2:
+        raise SystemExit(f"{path}: need two y ticks, found {len(values)}")
+    marks = tick_marks(src)
+    if len(marks) != len(values):
+        raise SystemExit(
+            f"{path}: {len(marks)} y tick marks but {len(values)} labels -- "
+            f"the pairing would be guesswork")
+    ticks = [(m, v) for m, (_y, v) in zip(marks, values)]
     (y0, v0), (y1, v1) = ticks[0], ticks[-1]
     scale = (v1 - v0) / (y1 - y0)
     to_data = lambda dev: v0 + (dev - y0) * scale
@@ -150,6 +189,16 @@ def read_figure(path):
     baseline = mode([r[1] for r in candidates])
     bars = [r for r in candidates if abs(r[1] - baseline) <= 0.01
             or abs(r[3] - baseline) <= 0.01]
+
+    # A bar chart stands its bars on zero, so the baseline must READ as zero.
+    # It is the one place where the axis transform can be checked against
+    # something the figure did not tell us, and it is what catches an origin
+    # taken from the wrong feature -- with the label anchors it came out at
+    # 0.4174 on figure 4 and 0.6619 on figure 8 instead of 0.
+    if abs(to_data(baseline)) > 1e-4 * span:
+        raise SystemExit(
+            f"{path}: bars stand on {to_data(baseline):.6f}, not on zero -- "
+            f"the origin of the axis transform is wrong")
 
     # Two series, told apart by colour, each in x order.
     by_colour = {}

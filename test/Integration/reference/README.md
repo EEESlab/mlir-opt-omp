@@ -11,7 +11,7 @@ The two CSVs here divide the work strictly, and the split is the point:
 | [`claims.csv`](claims.csv) | what the text **says** | typed in from the paper, one row per sentence |
 
 Where the two disagree the paper has a problem, and keeping them apart is what
-makes that visible instead of averaging it away — the 0.7% bound under *What it
+makes that visible instead of averaging it away — the 3% mean under *What it
 reproduces* is the case in point.
 
 ## What is here
@@ -31,10 +31,19 @@ reproduces* is the case in point.
 
 `reference.csv` is not a transcription and not an estimate. The figures are
 matplotlib EPS, which is vector: every bar is a rectangle with real
-coordinates, and every axis tick carries both its position and its label. The
-extractor fits the device-to-data transform from the ticks and reads each bar
-back through it, so what lands in the CSV is what the figure plots, to four
-decimal places.
+coordinates, and every axis tick is drawn at its own position with its own
+label beside it. The extractor fits the device-to-data transform from the
+ticks and reads each bar back through it, so what lands in the CSV is what the
+figure plots, to four decimal places.
+
+The tick's position comes from the tick *mark*, not from the label next to it.
+A tick label is centred on its tick, so in the file it sits half a text height
+lower -- a constant 0.3415 em, identical at the top of the axis and at the
+bottom. Taking the origin from the label leaves the ticks perfectly collinear
+and the scale exactly right, and shifts every value by that one constant:
++0.42 on figure 4, +0.66 on figure 8. Nothing about the resulting numbers looks
+wrong, which is why the reading is now anchored to the marks and checked
+against the baseline.
 
 Regenerate it, or check it still matches, with:
 
@@ -43,31 +52,41 @@ python3 extract_from_eps.py            # rewrite reference.csv
 python3 extract_from_eps.py --check    # exit non-zero if it drifted
 ```
 
-Three things are asserted while reading rather than assumed, because each would
+Five things are asserted while reading rather than assumed, because each would
 silently corrupt the result: that the y ticks are collinear (a log axis read as
-linear gives plausible nonsense), that every figure has exactly as many labels
-as bar groups (otherwise the pairing is guesswork), and that a bar below the
-baseline becomes a negative value rather than a positive one.
+linear gives plausible nonsense), that there are as many tick marks as tick
+labels (otherwise the values are paired to the wrong positions), that **the
+bars read as standing on zero** (a bar chart's baseline is zero, so this is the
+one thing the transform can be checked against that the figure did not itself
+supply -- it is what catches an origin taken from the wrong feature), that
+every figure has exactly as many labels as bar groups (otherwise the pairing is
+guesswork), and that a bar below the baseline becomes a negative value rather
+than a positive one.
 
 ## What it reproduces
 
-The extracted values agree with everything the paper states in prose, which is
-the check that the extraction is right:
+The extracted values agree with what the paper states in prose, which is the
+check that the extraction is right — with one exception, noted below:
 
 | the paper says | the CSV says |
 |---|---|
-| §4.2 `doitgen` is faster with our flow on libgomp | 8.91 native, **10.52** ours |
-| §4.3 `floyd-warshall`, `deriche`, `nussinov` are behind on PULP | 7.45/6.56, 7.39/6.27, 6.76/5.84 — all three |
-| Fig. 8 about 3% on average over ten applications | **2.95%**, excluding `floyd-warshall` |
-| Fig. 8 about 24% on `floyd-warshall` | **24.24%** |
+| §4.2 `doitgen` is faster with our flow on libgomp | 8.49 native, **10.11** ours |
+| §4.3 `floyd-warshall`, `deriche`, `nussinov` are behind on PULP | 7.22/6.33, 7.16/6.04, 6.52/5.61 — all three |
+| §4.3 the size increase stays below 0.7% | highest is `nussinov` at **0.6826%** |
+| Fig. 8 about 24% on `floyd-warshall` | **23.57%** |
 
-The kernel order recovered from the figures is identical to `ALL_KERNELS` in
-`../lib/kernels.sh`, which is a second, independent check that the bars were
-paired to the right names.
+Two further checks come free, and neither was put there on purpose. `seidel-2d`
+is the one kernel PolyBench leaves serial, and it reads **1.0000** on figure 4
+and 0.9986/1.0003 on figure 5 — a speedup of exactly one, recovered rather than
+assumed. And the kernel order recovered from the figures is identical to
+`ALL_KERNELS` in `../lib/kernels.sh`, which is an independent check that the
+bars were paired to the right names.
 
-One claim does not survive. §4.3 says the binary size increase "remains below
-0.7% in all instances"; the figure it refers to has `nussinov` at **0.7296%**
-and `jacobi-2d` at **0.7096%**. The bound is real, but it is 0.75%, not 0.7%.
+One claim does not survive, and it is not the one that used to fail here. Fig. 8
+is described as about 3% on average over ten applications; the ten bars average
+**2.28%**. The 0.7% size bound in §4.3 *does* hold — an earlier version of this
+file reported it broken, at 0.7296% on `nussinov`, which was the constant offset
+described above and not the paper.
 
 ## Which claims have a checker
 

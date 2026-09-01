@@ -2,9 +2,11 @@
 # run_barrier_vs_native.sh — counts team-barrier call sites: ours with and
 # without --omp-barrier-elim, against clang's and gcc's on the same kernels.
 #
-# The three LLVM columns are iomp and are counted in LLVM IR after -O3, so both
-# sides are measured at the same stage. gcc gets its own column counted at -O0,
-# because from -O1 it spreads the same barriers over more call sites.
+# All four columns are counted after -O3. The three LLVM ones are iomp, so they
+# speak one ABI; gcc's carries -fno-thread-jumps, which switches off the one
+# pass that duplicates barrier call sites without adding barriers. With it gcc
+# is back on the count it has at -O0, so the column measures the elision and
+# not the shape of the CFG. The run prints the reasoning in full.
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
@@ -78,13 +80,20 @@ count_barriers() {   # $1 = .ll file
     grep -o 'call void @__kmpc_barrier' "$1" | wc -l
 }
 
+# -O3 to match the LLVM columns, -fno-thread-jumps so the count is of
+# barriers and not of the paths gcc copied them into. Without the flag the
+# suite goes 28 -> 43 and gemver alone 3 -> 7, with no execution gaining a
+# barrier; with it every kernel sits on its -O0 number.
 build_gcc() {   # $1 = source, $2 = output .s
-    "$GCC" -fopenmp -O0 -S $GCC_STRICT_FP \
+    "$GCC" -fopenmp -O3 -fno-thread-jumps -S $GCC_STRICT_FP \
         -I"$INC" -I"$(dirname "$1")" \
         -D"$DATASET" $POLYBENCH_CFLAGS \
         "$1" -o "$2" 2>"$ERRSINK"
 }
 
+# From -O2 gcc emits the last barrier of a region as a tail call, which prints
+# as jmp: anchoring on `call` alone would silently drop 6 of them over the
+# suite. At -O0 that did not arise, which is why the pattern matters more now.
 count_gcc_barriers() {   # $1 = .s file
     grep -cE '\b(call|jmp)\b.*GOMP_barrier' "$1" || true
 }
@@ -118,7 +127,7 @@ echo "kernels:   ${#KERNEL_LIST[@]}"
 echo "files:     $ARTDIR"
 echo
 
-echo "kernel,pragma_form,clang,gcc_o0,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
+echo "kernel,pragma_form,clang,gcc_o3_ntj,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
 printf '  %-22s %-9s %6s %6s %8s %8s %8s\n' kernel form clang gcc base elim 'vs clang'
 
 # Intermediates only (.cir and the MLIR stages); the counted files go straight
@@ -148,11 +157,11 @@ for k in "${KERNEL_LIST[@]}"; do
         || { echo "  ERROR (ours, barrier-elim): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
 
     g=""
-    if build_gcc "$src" "$kdir/gcc-O0.s"; then
-        g="$(count_gcc_barriers "$kdir/gcc-O0.s")"
+    if build_gcc "$src" "$kdir/gcc-O3-ntj.s"; then
+        g="$(count_gcc_barriers "$kdir/gcc-O3-ntj.s")"
         T_GCC=$((T_GCC + g))
     else
-        rm -f "$kdir/gcc-O0.s"
+        rm -f "$kdir/gcc-O3-ntj.s"
     fi
 
     c="$(count_barriers "$kdir/clang-O3.ll")"
@@ -173,13 +182,17 @@ if [ "$T_CLANG" -gt 0 ]; then
         'BEGIN { printf "  %d fewer than clang (%.1f%%)\n", c - e, 100 * (c - e) / c }'
 fi
 if [ "$T_GCC" -gt 0 ]; then
-    echo "  gcc (before -O3): $T_GCC    ours with the pass: $T_ELIM"
-    echo "    -O0 is the stage that measures the elision: gcc decides it in the"
-    echo "    front-end, so -O0 already shows it, while from -O1 jump threading"
-    echo "    splits the path where a thread's chunk comes out empty and copies"
-    echo "    the barrier sequence into it (28 -> 43 over the full suite; -O3"
-    echo "    -fno-thread-jumps puts every kernel back on its -O0 number). Say"
-    echo "    which stage when quoting the column."
+    echo "  gcc (-O3 -fno-thread-jumps): $T_GCC    ours with the pass: $T_ELIM"
+    echo "    Why that flag, and not plain -O3: from -O1 jump threading splits"
+    echo "    the path where a thread's chunk comes out empty, and the split"
+    echo "    path carries its own copy of the barrier sequence. Over the suite"
+    echo "    that is 28 -> 43, gemver alone 3 -> 7, and no execution gains a"
+    echo "    barrier — the extra call sites are the shape of the CFG, not"
+    echo "    synchronisation. The flag turns off that one pass and nothing"
+    echo "    else: with it every kernel is back on the number it has at -O0,"
+    echo "    28 at every optimisation level, which was checked at -O0/1/2/3"
+    echo "    with and without it. So this column can be read against the LLVM"
+    echo "    ones, which are counted after -O3, where plain -O3 could not."
 fi
 
 # --- against the paper -------------------------------------------------------
@@ -193,7 +206,7 @@ compare_to_claims() {
     printf '  %-16s %9s %9s   %s\n' subject measured paper verdict
     local pair subject measured value tol verdict
     for pair in "ours_baseline:$T_BASE" "ours_elim:$T_ELIM" \
-                "clang:$T_CLANG" "gcc_o0:$T_GCC"; do
+                "clang:$T_CLANG" "gcc_o3_ntj:$T_GCC"; do
         subject="${pair%%:*}"; measured="${pair#*:}"
         # cleared first: read leaves them untouched when claim_row finds no
         # row, and the previous subject's numbers would be compared again.
@@ -202,7 +215,7 @@ compare_to_claims() {
         [ -z "${value:-}" ] && continue
         # gcc absent leaves its total at 0, which is a missing column rather
         # than a count of zero.
-        if [ "$subject" = "gcc_o0" ] && [ "$measured" -eq 0 ]; then
+        if [ "$subject" = "gcc_o3_ntj" ] && [ "$measured" -eq 0 ]; then
             printf '  %-16s %9s %9s   not built here\n' \
                 "$subject" "-" "$value"
             continue
@@ -243,10 +256,10 @@ fi
 echo
 echo "  Counted in, one directory per kernel under"
 echo "    $ARTDIR/<kernel>/"
-echo "      clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s"
+echo "      clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O3-ntj.s"
 echo "  Recount any row:"
 echo "    grep -o 'call void @__kmpc_barrier' <file>.ll | wc -l"
-echo "    grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O0.s"
+echo "    grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O3-ntj.s"
 echo "  Done — $CSV"
 
 [ "$FAILED" -ne 0 ] && { echo "  some kernels failed (VERBOSE=1 for the tool output)"; exit 1; }

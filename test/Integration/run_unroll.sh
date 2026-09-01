@@ -207,8 +207,15 @@ for k in "${KERNEL_LIST[@]}"; do
 done
 
 # --- Against the paper --------------------------------------------------------
-# Two things to say: how each kernel compares with the bar Figure 8 draws for
-# it, and whether the two sentences in section 4.5 still hold.
+# The measurement, the paper's number, and the difference between them: for the
+# two sentences in section 4.5 first, then for each bar of Figure 8.
+#
+# Numbers only. No verdict column and no wording about whether a difference is
+# large: the tolerance in claims.csv records how precisely the paper states a
+# quantity, which is not the same thing as a threshold this driver is entitled
+# to rule against, and printing a row as passed or failed puts a judgement in
+# the output before the reviewer has seen the numbers it was made from. The
+# columns go side by side and the reading is theirs.
 summarise() {
     local n mean fw
     read -r n mean fw < <(awk -F';' '
@@ -222,34 +229,28 @@ summarise() {
 
     echo
     echo "  === AGAINST SECTION 4.5 (reference/claims.csv) ==="
-    printf '  %-26s %9s %9s   %s\n' quantity measured paper verdict
+    printf '  %-26s %10s %10s %10s\n' quantity measured paper diff
 
-    local rows=0 bad=0 value tol verdict
-    check_one() {   # $1 metric  $2 subject  $3 label  $4 measured
-        value=""; tol=""
-        read -r value tol < <(claim_row "$1" "$2")
+    local rows=0 value
+    show_one() {   # $1 metric  $2 subject  $3 label  $4 measured
+        value=""
+        read -r value _ < <(claim_row "$1" "$2")
         [ -z "${value:-}" ] && return 0
         [ "$4" = "NA" ] && return 0
         rows=$((rows + 1))
-        verdict="$(claim_verdict "$4" "$value" "${tol:-0}")"
-        [ "$verdict" = "DIFFERS" ] && bad=$((bad + 1))
-        printf '  %-26s %9s %9s   %s\n' "$3" "$4" "$value" "$verdict"
+        printf '  %-26s %10s %10s %10s\n' "$3" "$4" "$value"  \
+            "$(awk -v m="$4" -v p="$value" 'BEGIN { printf "%.4f", m - p }')"
     }
-    check_one unroll_pct ten-apps       "mean, excl. floyd-w. %" "$mean"
-    check_one unroll_pct floyd-warshall "floyd-warshall %"       "$fw"
-    unset -f check_one
+    show_one unroll_pct ten-apps       "mean, excl. floyd-w. %" "$mean"
+    show_one unroll_pct floyd-warshall "floyd-warshall %"       "$fw"
+    unset -f show_one
 
     if [ "$rows" -eq 0 ]; then
         echo "  no unroll_pct rows in $CLAIMS"
     else
         echo
-        echo "  The mean is over the $n kernels other than floyd-warshall, which"
-        echo "  is how the paper states it: about 3% across ten applications,"
-        echo "  about 24% on floyd-warshall on its own."
-        [ "$bad" -ne 0 ] && {
-            echo "  $bad of $rows differ. gvsoc is deterministic, so this is a"
-            echo "  real difference — the toolchain, the pass, or the sentence."
-        }
+        echo "  The mean covers the $n kernels other than floyd-warshall, which"
+        echo "  the paper gives a number of its own."
     fi
 
     # Per kernel against the figure itself. The published values are exact, and

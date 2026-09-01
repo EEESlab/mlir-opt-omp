@@ -253,9 +253,9 @@ that driver, so the list doubles as the coverage inventory.
 The two files under `reference/` divide the work strictly: `claims.csv` is what
 the paper *says*, typed in from the text; `reference.csv` is what its figures
 *plot*, read back out of the vector files. Where they disagree the paper has a
-problem — §4.3 claims the size increase stays below 0.7% and `fig7_size_our`
-reaches 0.7296 on `nussinov` — and keeping them apart is what makes that
-visible instead of averaged away.
+problem — §4.5 describes Figure 8 as about 3% over ten applications and the ten
+bars average 2.28% — and keeping them apart is what makes that visible instead
+of averaged away.
 
 Nothing here exits non-zero. `--strict` is the one opt-in exception, for a
 caller that wants a gate: it exits 1 when a claim with a `max` relation is
@@ -403,7 +403,7 @@ else those files carry (`POLYBENCH`, the tool paths, `DATASET`, `KERNELS`,
 comparison this script cannot make.
 
 On a full-suite run the four totals are checked against §4.5, which states all
-of them (59 without the pass, 26 with it, 45 for Clang, 28 for GCC at `-O0`);
+of them (59 without the pass, 26 with it, 45 for Clang, 28 for GCC);
 the expected values come from [`reference/claims.csv`](reference/claims.csv).
 A subset run, or one where a kernel failed to build, says why it is not
 comparing rather than comparing a short sum. A total that differs is not
@@ -415,7 +415,7 @@ table can be rechecked instead of taken on trust:
 
 ```
 results/iomp/barrier_vs_native/gemm-omp/
-  clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s
+  clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O3-ntj.s
 ```
 
 Each count is one grep over one of those files, and the run prints both forms
@@ -423,7 +423,7 @@ when it finishes:
 
 ```sh
 grep -o 'call void @__kmpc_barrier' ours-elim-O3.ll | wc -l
-grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O0.s
+grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O3-ntj.s
 ```
 
 The directory is wiped at the start of each run, so what is in it always
@@ -442,33 +442,43 @@ matches clang kernel for kernel while the pass removes one per region. The pass
 reasons about structure on the `omp` dialect rather than about which directive
 was written, so it covers both spellings.
 
-The three LLVM columns are iomp, so they speak one ABI. **gcc gets a column of
-its own, counted before `-O3`** (`gcc -fopenmp -O0 -S`, counting `GOMP_barrier`
-call sites), because from `-O1` on gcc spreads the same barriers over more call
-sites than the program needs: over this suite 28 at `-O0` becomes 43 at `-O3`,
-gemver alone 3 becomes 7. That number would measure duplication as much as
-synchronisation. gcc decides the elision in the front-end, so it is already
-applied at `-O0`; our own count does not move between stages — the same 59/25
-in MLIR and after `-O3` — so the comparison holds, but say which stage when you
-quote it.
+The three LLVM columns are iomp, so they speak one ABI. **All four columns are
+counted after `-O3`**, and gcc's carries one extra flag:
 
-That stage choice was checked, not assumed. Counting gcc's barriers at `-O0`,
-`-O1`, `-O2` and `-O3`, then again at each level with `-fno-thread-jumps`, puts
-every one of the 30 kernels back on its `-O0` number exactly: 28 at every level.
-So one pass accounts for the whole 28 → 43 — jump threading splits the path
-where a thread's chunk comes out empty, and the split path carries its own copy
-of the barrier sequence. No execution gains a barrier. That makes `-O0` not the
-convenient stage but the only one that measures the elision instead of the CFG
-shape.
+```sh
+gcc -fopenmp -O3 -fno-thread-jumps -S      # counting GOMP_barrier call sites
+```
 
-It is *not* loop cloning: `GCC_STRICT_FP` already turns the vectoriser off, so
-no kernel gets a vector and a scalar copy. Four `omp for` in one region are
-enough to see the effect on its own — 3 call sites at `-O0`, 6 from `-O1`, 3
-again with `-fno-thread-jumps`.
+`-fno-thread-jumps` is the whole reason the column is readable. From `-O1` on,
+jump threading splits the path where a thread's chunk comes out empty, and the
+split path carries its own copy of the barrier sequence: over this suite 28
+becomes 43, gemver alone 3 becomes 7, and **no execution gains a barrier**. A
+count at plain `-O3` would be measuring the shape of the CFG as much as
+synchronisation, which is not what the other three columns measure.
+
+The flag turns off that one pass and nothing else, and that was checked rather
+than assumed. Counting gcc's barriers at `-O0`, `-O1`, `-O2` and `-O3`, then
+again at each level with `-fno-thread-jumps`, puts every one of the 30 kernels
+back on its `-O0` number exactly: 28 at every level. So one pass accounts for
+the whole 28 → 43.
+
+That is why the column moved to `-O3 -fno-thread-jumps` and away from `-O0`,
+which gives the same 28: the number is the same either way, but at `-O3` it is
+taken at the stage the LLVM columns are taken at, so the table no longer asks
+the reader to hold two stages in mind. gcc decides the elision in the
+front-end, so it is applied at every level; our own count does not move between
+stages either — the same 59/25 in MLIR and after `-O3`.
+
+The duplication is *not* loop cloning: `GCC_STRICT_FP` already turns the
+vectoriser off, so no kernel gets a vector and a scalar copy. Four `omp for` in
+one region are enough to see the effect on its own — 3 call sites at `-O0`, 6
+from `-O1`, 3 again with `-fno-thread-jumps`.
 
 Count `GOMP_barrier`, not `call GOMP_barrier`: from `-O2` gcc emits the last
 barrier of a region as a tail call, which prints as `jmp` and which an anchor
-on `call` silently drops — 6 of the 43 at `-O3`, and none at `-O0`.
+on `call` silently drops — 6 of the 43 at plain `-O3`, and none at `-O0`. That
+subtlety used to be a footnote and is now load-bearing, since the column is
+counted at `-O3`; the driver's pattern matches both mnemonics.
 
 What that column says is worth knowing before quoting the clang one: **gcc
 performs this elision too**, and lands at 28 where the pass lands at 26, kernel
@@ -639,6 +649,12 @@ the ten applications, about 24% on `floyd-warshall`) from
 the bar Figure 8 draws for it. The second is worth doing per kernel rather than
 in aggregate — unlike a host speedup, these were measured on a simulator anyone
 can rerun, so a divergence is a real difference and not the hardware.
+
+Both are printed as numbers only: measured, published, and the difference. No
+verdict column. The tolerance in `claims.csv` says how precisely the paper
+states a quantity, which is not a threshold this driver is entitled to rule
+against, and a row marked passed or failed would put a judgement in front of
+the reviewer before the numbers it came from.
 
 What it measures is the change in **parallel run time**, not in the
 parallel-speedup ratio. §4.5 calls it a "speedup increment", which admits both
