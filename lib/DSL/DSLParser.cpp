@@ -1,6 +1,4 @@
-// DSLParser.cpp
-//
-// C++ port of the lexer and parser from parser.py.
+// Lexer and parser for the rules DSL.
 
 #include "OmpLowering/DSL/DSLParser.h"
 
@@ -18,16 +16,13 @@ using llvm::make_error;
 using llvm::StringError;
 using llvm::inconvertibleErrorCode;
 
-// ===========================================================================
-// Token
-// ===========================================================================
+// --- Token ---
 
 enum class TK {
   // Keywords
   // pre/invoke/post are deliberately NOT keywords: a block is any identifier
-  // followed by '{', which is what lets a construct declare first_chunk /
-  // next_chunk without a token of their own.  The evaluator is what rejects a
-  // name it has no meaning for.
+  // followed by '{', which lets a construct declare first_chunk / next_chunk
+  // without a token of their own.  The evaluator rejects a name it cannot use.
   RUNTIME, CONSTRUCT, WHEN, OTHERWISE,
   LET, CALL, EMIT, HAS, AND, OR, NOT, TRUE, FALSE, BRANCH,
   // Punctuation
@@ -45,9 +40,7 @@ struct Token {
   int line, col;
 };
 
-// ===========================================================================
-// Lexer
-// ===========================================================================
+// --- Lexer ---
 
 class Lexer {
   std::string src;
@@ -187,9 +180,7 @@ public:
   }
 };
 
-// ===========================================================================
-// Parser
-// ===========================================================================
+// --- Parser ---
 
 class Parser {
   std::vector<Token> toks;
@@ -197,8 +188,8 @@ class Parser {
 
   const Token &cur() const { return toks[pos]; }
   bool at(TK k) const { return cur().kind == k; }
-  // One-token lookahead, for the places where the token after the current one
-  // decides how to read it (an identifier opening a block vs a property).
+  // One-token lookahead, for where the next token decides how to read this one
+  // (an identifier opening a block vs a property).
   bool at(TK k, size_t off) const {
     return pos + off < toks.size() && toks[pos + off].kind == k;
   }
@@ -361,7 +352,6 @@ class Parser {
   Expected<Action> parseAction() {
     if (at(TK::CALL)) {
       advance();
-      // callee: IDENT or STRING
       Expr callee;
       if (at(TK::IDENT))        callee = IdentExpr{advance().value};
       else if (at(TK::STRING))  callee = StringExpr{advance().value};
@@ -400,9 +390,6 @@ class Parser {
   // ---- Statement ----------------------------------------------------------
 
   // One arm of a `branch`: a single statement, or a braced sequence of them.
-  //   true  => call "f"();
-  //   false => { call "g"(); call "h"(); }
-  //   true  => { when has(x) => call "f"(x); otherwise => call "f"(0); }
   Expected<std::vector<Statement>> parseBranchArm() {
     std::vector<Statement> stmts;
     if (at(TK::LBRACE)) {
@@ -512,8 +499,8 @@ class Parser {
   // ---- Construct items ----------------------------------------------------
 
   // `<name> { <statements> }`.  Any identifier will do — the name says *when*
-  // the statements run (before the construct, before each chunk, after it), and
-  // which names have a meaning is the evaluator's business, not the parser's.
+  // the statements run, and which names mean something is the evaluator's
+  // business, not the parser's.
   Expected<BlockDecl> parseBlock() {
     std::string name = cur().value;
     if (auto e = expect(TK::IDENT); !e) return e.takeError();
@@ -571,8 +558,8 @@ class Parser {
         if (!ld) return ld.takeError();
         items.push_back(std::move(*ld));
       } else if (at(TK::IDENT)) {
-        // The token after the name is what tells the two apart: '{' opens a
-        // block, '=' a property.
+        // The token after the name tells the two apart: '{' opens a block,
+        // '=' a property.
         if (at(TK::LBRACE, 1)) {
           auto bd = parseBlock();
           if (!bd) return bd.takeError();
@@ -609,7 +596,6 @@ class Parser {
         if (!cd) return cd.takeError();
         items.push_back(std::move(*cd));
       } else if (at(TK::IDENT)) {
-        // Runtime-level property, e.g. `global_tid_function = "...";`.
         auto pd = parsePropertyDecl();
         if (!pd) return pd.takeError();
         items.push_back(std::move(*pd));
@@ -637,9 +623,7 @@ public:
   }
 };
 
-// ===========================================================================
-// Entry point
-// ===========================================================================
+// --- Entry point ---
 
 namespace dsl {
 

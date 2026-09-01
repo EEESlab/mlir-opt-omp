@@ -5,7 +5,7 @@
 # Not a runtime comparison to configure: each side is counted in the form it
 # emits. The three LLVM columns are counted in LLVM IR after -O3 (__kmpc_barrier),
 # gcc in its assembly at -O0 (GOMP_barrier), because from -O1 jump threading
-# and friends duplicate paths and each copy carries the barrier call site.
+# duplicate paths and each copy carries the barrier call site.
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
@@ -15,17 +15,14 @@
 # Leaves results_barrier_vs_native.csv.
 #
 # On a full-suite run the four totals are printed next to what section 4.5
-# states, from reference/claims.csv. Side by side and nothing more: what the
-# difference means is the reader's call.
+# states, from reference/claims.csv. 
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Nothing is executed and nothing is built for the target.
 SKIP_PULP_SDK=1
 
-# Fixed, and not something to select: our side is counted against the iomp ABI
-# because that is what the LLVM columns speak, gcc against its own.
+# Fixed, and not something to select
 RUNTIME=iomp
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
@@ -176,7 +173,6 @@ done
 
 echo
 TOTALS="  clang: $T_CLANG ; ours without the pass: $T_BASE ; ours with the pass: $T_ELIM"
-# gcc missing leaves its total at 0: drop the item rather than print a zero.
 [ "$T_GCC" -gt 0 ] && TOTALS="$TOTALS ; gcc: $T_GCC"
 echo "$TOTALS"
 

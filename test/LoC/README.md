@@ -9,7 +9,6 @@ GCC and of Clang a *minimal* lowering of `parallel`, `for` with
 | [`gcc_omp_loc.py`](gcc_omp_loc.py) | supplementary Table 1 | 21,761 of 82,400 lines, 15 files |
 | [`clang_omp_loc.py`](clang_omp_loc.py) | supplementary Table 2 | 7,617 of 50,754 lines, 4 files |
 
-Not tests: `lit` ignores them and `check-omp` does not run them.
 
 ## Running them
 
@@ -69,7 +68,3 @@ Full rationale in Section 1 of the supplementary material. In short:
 - Each entity spans its leading comment to its closing brace, blank lines and
   internal comments included, uniformly on both sides. The scripts check that
   no line is attributed twice.
-
-Table 3, the 5,040 lines of this repository, is a plain `wc -l` over the tree
-at the camera-ready commit; today it reads higher, the tool having gained the
-barrier-elimination pass since.

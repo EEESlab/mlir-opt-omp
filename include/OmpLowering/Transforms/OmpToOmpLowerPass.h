@@ -1,11 +1,5 @@
-// OmpToOmpLowerPass.h
-//
-// Pass that reads a DSL file at runtime, walks omp.* ops, evaluates the
-// lowering plan for each, and emits omp_lower.construct ops.
-// Run BEFORE PlanLoweringPass.
-//
-// Uses the --omp-lower-dsl and --omp-lower-runtime flags (extracted in
-// mlir-opt-omp.cpp and passed to the factory lambda).
+// Reads the DSL, walks omp.* ops, evaluates the lowering plan for each and
+// emits omp_lower.construct ops.  Runs before PlanLoweringPass.
 
 #pragma once
 

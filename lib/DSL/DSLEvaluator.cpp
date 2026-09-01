@@ -1,6 +1,4 @@
-// DSLEvaluator.cpp
-//
-// C++ port of evaluator.py.
+// Evaluates a parsed Program into a LoweringPlan.
 
 #include "OmpLowering/DSL/DSLEvaluator.h"
 #include "OmpLowering/DSL/DSLParser.h"
@@ -18,9 +16,7 @@ using llvm::make_error;
 using llvm::StringError;
 using llvm::inconvertibleErrorCode;
 
-// ===========================================================================
-// Value helpers
-// ===========================================================================
+// --- Value helpers ---
 
 bool dsl::isTruthy(const Value &v) {
   return std::visit(llvm::makeVisitor(
@@ -51,7 +47,6 @@ std::string dsl::valueToString(const Value &v) {
   ), v);
 }
 
-// Equality comparison for Value
 static bool valuesEqual(const Value &a, const Value &b) {
   if (a.index() != b.index()) return false;
   return std::visit(llvm::makeVisitor(
@@ -64,11 +59,7 @@ static bool valuesEqual(const Value &a, const Value &b) {
   ), a, b);
 }
 
-// ===========================================================================
-// Scope implementation (child creation)
-// ===========================================================================
-// We implement Scope as a flat map with parent pointer.
-// The makeChild helper creates a new Scope whose parent is the given scope.
+// --- Scope: a flat map with a parent pointer ---
 
 class ScopeImpl {
 public:
@@ -93,7 +84,6 @@ public:
   void set(StringRef name, Value v) { bindings[name] = std::move(v); }
 };
 
-// Helper to build a root scope from a context map
 static ScopeImpl buildRootScope(const llvm::StringMap<Value> &ctx) {
   ScopeImpl s;
   for (auto &kv : ctx)
@@ -101,11 +91,8 @@ static ScopeImpl buildRootScope(const llvm::StringMap<Value> &ctx) {
   return s;
 }
 
-// ===========================================================================
-// Evaluator internals
-// ===========================================================================
+// --- Evaluator internals ---
 
-// Forward declare the actual implementation using ScopeImpl
 namespace {
 
 Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope);
@@ -121,10 +108,9 @@ Expected<Value> evalBuiltin(const std::string &name, std::vector<Value> args) {
       return make_error<StringError>(name + "() expects 1 arg", inconvertibleErrorCode());
     if (auto *l = std::get_if<ListVal>(&args[0]))
       return makeInt((int)l->items.size());
-    // A symbolic list — one whose contents only exist later, like `captures`,
-    // which the outlining pass collects long after the rules are evaluated.
-    // Counting it now is impossible, so the count stays a token too and the
-    // emitting pass resolves it against the same binding as the list itself.
+    // A symbolic list — one whose contents only exist later, like captures,
+    // which the outlining pass collects long after evaluation.  The count stays
+    // a token too, resolved against the same binding as the list.
     if (auto *s = std::get_if<StrVal>(&args[0]))
       if (!s->value.empty() && s->value.front() == '%')
         return makeStr("%argc:" + s->value.substr(1));
@@ -169,7 +155,6 @@ Expected<Value> evalBuiltin(const std::string &name, std::vector<Value> args) {
     r += ")";
     return makeStr(r);
   }
-  // Symbolic fallback
   std::string r = name + "(";
   for (size_t i = 0; i < args.size(); i++) {
     if (i) r += ", ";
@@ -185,8 +170,7 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
   return std::visit(llvm::makeVisitor(
     [&](const IdentExpr &e) -> Expected<Value> {
       // `null` is a literal, not a scope variable (the lexer has no NULL
-      // keyword, so it arrives as an identifier).  Used e.g. as a GOMP_task
-      // call argument; lowers to a null pointer.
+      // keyword, so it arrives as an identifier); lowers to a null pointer.
       if (e.name == "null") return makeNull();
       return scope.get(e.name);
     },
@@ -209,10 +193,9 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
       return Value{l};
     },
     [&](const CallExpr &e) -> Expected<Value> {
-      // ident(<flag>): the flag is a bare token (e.g. work_loop), not a scope
-      // variable. Emit the symbolic ident reference "%ident:<flag>"; the pass
-      // maps the flag to the ident_t.flags bitmask. Bare `ident` (an IdentExpr,
-      // handled elsewhere) stays "%ident" / default flags.
+      // ident(<flag>): the flag is a bare token, not a scope variable.  Emit
+      // "%ident:<flag>"; the pass maps it to the ident_t.flags bitmask.  Bare
+      // `ident` stays "%ident" / default flags.
       if (e.name == "ident") {
         std::string flag;
         if (e.args.size() == 1) {
@@ -222,10 +205,9 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
         }
         return makeStr(flag.empty() ? "%ident" : "%ident:" + flag);
       }
-      // struct(t0, t1, ...): an ABI type layout.  The args are bare type names
-      // (e.g. ptr, i32), not scope variables, so read them with evalExprOrBare
-      // like a predicate rhs.  Serialise to the symbolic token
-      // "%struct:t0,t1,..." which the pass re-expands into an LLVM struct type.
+      // struct(t0, t1, ...): an ABI layout.  The args are bare type names, so
+      // read them with evalExprOrBare; serialised to "%struct:t0,t1,..." which
+      // the pass re-expands into an LLVM struct type.
       if (e.name == "struct") {
         std::string layout;
         for (auto &a : e.args) {
@@ -247,8 +229,8 @@ Expected<Value> evalExpr(const Expr &expr, ScopeImpl &scope) {
   ), expr);
 }
 
-// Like evalExpr but if expr is an IdentExpr not in scope, return the name
-// as a bare string (for patterns like `schedule == static`).
+// Like evalExpr, but an IdentExpr not in scope becomes its own name as a bare
+// string (for patterns like `schedule == static`).
 Expected<Value> evalExprOrBare(const Expr &expr, ScopeImpl &scope) {
   if (auto *id = std::get_if<IdentExpr>(&expr)) {
     if (!scope.has(id->name))
@@ -322,7 +304,7 @@ Expected<PlanAction> evalAction(const Action &action, ScopeImpl &scope) {
     [&](const EmitAction &a) -> Expected<PlanAction> {
       Value val;
       if (a.arg) {
-        // `emit name(arg)`: the argument value rides the emit's value slot.
+        // `emit name(arg)`: the argument rides the emit's value slot.
         auto v = evalExpr(*a.arg, scope);
         if (!v) return v.takeError();
         val = std::move(*v);
@@ -349,11 +331,11 @@ Expected<PlanAction> evalAction(const Action &action, ScopeImpl &scope) {
   ), action);
 }
 
-// ---- Block (with when/otherwise chain semantics) --------------------------
+// ---- Block ----------------------------------------------------------------
 
-// Evaluate a statement list.  Shared by a construct's pre/invoke/post blocks
-// and by the arms of a `branch`, so the two kinds of choice nest: a when chain
-// inside an arm is settled here and collapses, the branch around it does not.
+// Evaluate a statement list.  Shared by a construct's pre/invoke/post and by
+// the arms of a branch, so the two kinds of choice nest: a when chain inside an
+// arm is settled here and collapses, the branch around it does not.
 Expected<std::vector<PlanAction>> evalStatements(
     const std::vector<Statement> &statements, ScopeImpl &parentScope) {
   ScopeImpl scope(&parentScope);
@@ -372,9 +354,8 @@ Expected<std::vector<PlanAction>> evalStatements(
     }
 
     if (auto *lc = std::get_if<LetCallStmt>(&stmt)) {
-      // Emit the call and bind <name> to a symbolic placeholder ("%name") so
-      // later argument expressions referencing it resolve to that token; the
-      // pass maps the token back to the call's SSA result.
+      // Bind <name> to a symbolic placeholder ("%name") so later arguments
+      // resolve to that token; the pass maps it back to the call's SSA result.
       auto a = evalAction(Action{lc->call}, scope);
       if (!a) return a.takeError();
       auto &pc = std::get<PlanCall>(*a);
@@ -395,16 +376,13 @@ Expected<std::vector<PlanAction>> evalStatements(
 
     if (auto *bs = std::get_if<BranchStmt>(&stmt)) {
       // The condition is NOT decided here: it is evaluated only far enough to
-      // yield the token naming the runtime value, and both arms are kept.  That
-      // is the whole difference from when/otherwise, which pick an arm now and
-      // leave a flat sequence behind.
+      // yield the token naming the runtime value, and both arms are kept.
       auto cond = evalExpr(bs->condition, scope);
       if (!cond) return cond.takeError();
 
-      // A null condition means the clause is simply absent — there is no
-      // runtime value to test, so there is nothing to branch on.  Emit the true
-      // arm inline, which is what "the guard does not apply" means for every
-      // clause modelled this way (an omitted `if` runs the region unconditionally).
+      // A null condition means the clause is absent, so there is nothing to
+      // branch on: emit the true arm inline (an omitted `if` runs the region
+      // unconditionally).
       if (std::holds_alternative<NullVal>(*cond)) {
         auto inlined = evalStatements(bs->ifTrue, scope);
         if (!inlined) return inlined.takeError();
@@ -436,7 +414,6 @@ Expected<std::vector<PlanAction>> evalStatements(
     }
 
     if (std::holds_alternative<WhenStmt>(stmt)) {
-      // Collect the when/otherwise chain
       bool taken = false;
       while (i < n) {
         const auto &cur = statements[i];
@@ -501,7 +478,6 @@ Expected<const ConstructDecl *> selectConstruct(
       "construct '" + constructName.str() + "' not found in runtime '" +
       runtime.name + "'", inconvertibleErrorCode());
 
-  // Evaluate guards
   std::vector<const ConstructDecl *> matched;
   for (auto *c : candidates) {
     if (!c->guard) {
@@ -533,9 +509,7 @@ Expected<const ConstructDecl *> selectConstruct(
 
 } // anonymous namespace
 
-// ===========================================================================
-// Evaluator::buildPlan
-// ===========================================================================
+// --- Evaluator::buildPlan ---
 
 const RuntimeDecl *Evaluator::findRuntime(StringRef name) const {
   for (auto &rt : program.runtimes)
@@ -554,10 +528,8 @@ Expected<LoweringPlan> Evaluator::buildPlan(
       "runtime '" + runtimeName.str() + "' not found",
       inconvertibleErrorCode());
 
-  // Root scope from context
   ScopeImpl root = buildRootScope(context);
 
-  // Evaluate runtime-level lets
   for (auto &item : runtime->items) {
     if (auto *ld = std::get_if<LetDecl>(&item)) {
       auto v = evalExpr(ld->expr, root);
@@ -566,7 +538,6 @@ Expected<LoweringPlan> Evaluator::buildPlan(
     }
   }
 
-  // Select construct
   auto cdResult = selectConstruct(*runtime, constructName, root);
   if (!cdResult) return cdResult.takeError();
   const ConstructDecl *cd = *cdResult;
@@ -575,21 +546,18 @@ Expected<LoweringPlan> Evaluator::buildPlan(
   plan.runtime   = runtime->name;
   plan.construct = cd->name;
 
-  // Evaluate runtime-level properties into the plan. They are shared by every
-  // construct of the runtime; a construct-level property of the same name
-  // overrides (the construct loop below runs afterwards).
+  // Runtime-level properties are shared by every construct; a construct-level
+  // property of the same name overrides (that loop runs afterwards).
   for (auto &item : runtime->items) {
     if (auto *pd = std::get_if<PropertyDecl>(&item)) {
-      // evalExprOrBare (not evalExpr): a bare-identifier property value such as
-      // `capture_strategy = packed;` is an enum token, not a scope variable, so
-      // an unknown ident resolves to its own string instead of erroring.
+      // evalExprOrBare, not evalExpr: a bare-identifier value such as
+      // `capture_strategy = packed;` is an enum token, not a scope variable.
       auto v = evalExprOrBare(pd->expr, root);
       if (!v) return v.takeError();
       plan.properties[pd->name] = std::move(*v);
     }
   }
 
-  // Construct scope inherits runtime scope
   ScopeImpl cscope(&root);
 
   for (auto &item : cd->items) {
@@ -599,8 +567,7 @@ Expected<LoweringPlan> Evaluator::buildPlan(
       cscope.set(ld->name, std::move(*v));
 
     } else if (auto *pd = std::get_if<PropertyDecl>(&item)) {
-      // evalExprOrBare: see the runtime-level property loop above — bare-ident
-      // enum values (e.g. `capture_strategy = by_pointer;`) resolve to strings.
+      // evalExprOrBare: see the runtime-level loop above.
       auto v = evalExprOrBare(pd->expr, cscope);
       if (!v) return v.takeError();
       plan.properties[pd->name] = std::move(*v);

@@ -1,9 +1,4 @@
-// DSLEvaluator.h
-//
-// C++ port of evaluator.py.
-// Given a parsed dsl::Program, a runtime name, a construct name, and a
-// context map, produces a LoweringPlan describing the sequence of runtime
-// calls to emit.
+// Turns a parsed Program plus a runtime/construct/context into a LoweringPlan.
 
 #pragma once
 
@@ -22,12 +17,8 @@
 
 namespace dsl {
 
-// ===========================================================================
-// Value type used at evaluation time
-// ===========================================================================
-// We use shared_ptr<ValueBox> in ListVal to break the circular dependency
-// that would arise if ListVal held std::vector<Value> directly, since Value
-// is a variant that includes ListVal.
+// --- Values ---
+// ListVal boxes its items because Value is a variant that includes ListVal.
 
 struct ValueBox;  // forward declaration
 
@@ -41,7 +32,6 @@ using Value = std::variant<NullVal, IntVal, BoolVal, StrVal, ListVal>;
 
 struct ValueBox { Value v; };
 
-// Helpers
 inline Value makeNull() { return NullVal{}; }
 inline Value makeInt(int v) { return IntVal{v}; }
 inline Value makeBool(bool v) { return BoolVal{v}; }
@@ -54,7 +44,6 @@ inline Value makeList(std::vector<Value> items) {
   return l;
 }
 
-// Unwrap a ListVal into a plain std::vector<Value> for evaluation.
 inline std::vector<Value> listItems(const ListVal &l) {
   std::vector<Value> out;
   out.reserve(l.items.size());
@@ -65,9 +54,7 @@ inline std::vector<Value> listItems(const ListVal &l) {
 bool isTruthy(const Value &v);
 std::string valueToString(const Value &v);
 
-// ===========================================================================
-// Plan model  (mirrors Python PlanAction / LoweringPlan)
-// ===========================================================================
+// --- Plan model ---
 
 struct PlanEmit {
   std::string name;
@@ -75,22 +62,17 @@ struct PlanEmit {
 };
 
 struct PlanCall {
-  std::string callee;   // resolved to a string (function name)
+  std::string callee;
   std::vector<Value> args;
-  std::string resultName;  // non-empty if the call's SSA result is bound (let = call)
+  std::string resultName;  // non-empty if bound by `let = call`
 };
 
-// A branch on a value only known at run time — `branch <cond> { true => ...
-// false => ... }` in the DSL.  This is what `when`/`otherwise` cannot express:
-// those are decided here, while evaluating, and collapse to a flat sequence.
-// A PlanBranch survives into the plan and becomes real control flow.
-//
-// Actions are boxed for the same reason ListVal boxes its items: PlanAction is
-// a variant that includes PlanBranch, so the recursion needs indirection.
+// A branch on a run-time value.  `when`/`otherwise` are decided during
+// evaluation and collapse; a PlanBranch survives into real control flow.
 struct PlanActionBox;
 
 struct PlanBranch {
-  Value cond;   // resolves to the SSA value to branch on
+  Value cond;
   std::vector<std::shared_ptr<PlanActionBox>> ifTrue;
   std::vector<std::shared_ptr<PlanActionBox>> ifFalse;
 };
@@ -106,22 +88,16 @@ struct LoweringPlan {
   std::vector<PlanAction> pre;
   std::vector<PlanAction> invoke;
   std::vector<PlanAction> post;
-  // A work-sharing loop whose iterations the runtime hands out a chunk at a
-  // time asks for them with these.  `nextChunk` runs before each turn of the
-  // outer loop and fills the loop's bound slots; a falsy result ends it.
-  // `firstChunk` is for the runtimes whose opening call differs from the rest
-  // (libgomp's start vs next); where it is empty, `nextChunk` opens the loop
-  // too (iomp, whose init is a separate void call in `pre`).
-  //
-  // The presence of `nextChunk` is what makes a construct a chunked loop — the
-  // passes never look at the schedule kind, that stays a decision of the rules.
+  // Chunked work-sharing loops: `nextChunk` runs before each turn and fills
+  // the bound slots, a falsy result ends the loop; `firstChunk` is for
+  // runtimes whose opening call differs (libgomp), empty where it does not
+  // (iomp).  A non-empty `nextChunk` is what marks a loop as chunked — the
+  // passes never inspect the schedule kind themselves.
   std::vector<PlanAction> firstChunk;
   std::vector<PlanAction> nextChunk;
 };
 
-// ===========================================================================
-// Evaluator
-// ===========================================================================
+// --- Evaluator ---
 
 class Evaluator {
   const Program &program;

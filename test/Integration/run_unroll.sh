@@ -16,18 +16,10 @@
 #
 # WHAT THIS MEASURES, AND WHY THAT READING
 #
-# Section 4.5 calls Figure 8 a "speedup increment", which can be read two ways:
-# the change in the parallel-speedup ratio, or the change in the parallel
-# run time. This driver measures the second — cycles with the pass against
-# cycles without it, on the parallel build.
-#
-# The reason is that unrolling helps the sequential build too (it is ILP and
-# fewer condition checks, not parallelisation), so in a ratio of two speedups,
-# each taken against its own sequential cell, most of the gain would cancel and
-# 24% on floyd-warshall could not survive. It also puts this driver on the same
-# footing as BARRIER_ELIM=both, which is how the neighbouring claim in the same
-# subsection is measured. If that reading is wrong the numbers here will not
-# line up with Figure 8, which is itself the answer.
+# Section 4.5 calls Figure 8 a "speedup increment": 
+# this driver measured the change in the parallel run time. 
+# Cycles with the pass against cycles without it, on the parallel build.
+
 #
 # THE PASS
 #
@@ -58,9 +50,7 @@ mkdir -p "$ARTDIR"
 REFERENCE="$SCRIPT_DIR/reference/reference.csv"
 
 # --- Which pass ---------------------------------------------------------------
-# An explicit name wins. Otherwise ask cir-opt what it has: exactly one match is
-# the pass, several mean the guess would be arbitrary and the name has to be
-# given. Nothing at all means the pass is not in this build.
+
 resolve_unroll_pass() {
     if [ -n "${CIR_UNROLL_PASS:-}" ]; then
         echo "$CIR_UNROLL_PASS"
@@ -209,13 +199,7 @@ done
 # --- Against the paper --------------------------------------------------------
 # The measurement, the paper's number, and the difference between them: for the
 # two sentences in section 4.5 first, then for each bar of Figure 8.
-#
-# Numbers only. No verdict column and no wording about whether a difference is
-# large: the tolerance in claims.csv records how precisely the paper states a
-# quantity, which is not the same thing as a threshold this driver is entitled
-# to rule against, and printing a row as passed or failed puts a judgement in
-# the output before the reviewer has seen the numbers it was made from. The
-# columns go side by side and the reading is theirs.
+
 summarise() {
     local n mean fw
     read -r n mean fw < <(awk -F';' '

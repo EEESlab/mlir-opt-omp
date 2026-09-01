@@ -1,8 +1,4 @@
-// PlanEmit.cpp
-//
-// Definitions for the shared plan-emission vocabulary.  Moved here verbatim
-// from OmpOutliningPass.cpp, which was their only home while it was also the
-// only pass that could resolve them.
+// Definitions for the shared plan-emission vocabulary declared in PlanEmit.h.
 
 #include "PlanEmit.h"
 
@@ -14,9 +10,7 @@
 using namespace mlir;
 using namespace mlir::omp_lower;
 
-// ---------------------------------------------------------------------------
-// Type helpers
-// ---------------------------------------------------------------------------
+// --- Type helpers ---
 
 Type mlir::omp_lower::ptrTy(MLIRContext *ctx) {
   return LLVM::LLVMPointerType::get(ctx);
@@ -26,12 +20,9 @@ Type mlir::omp_lower::i32Ty(MLIRContext *ctx) {
   return IntegerType::get(ctx, 32);
 }
 
-// ---------------------------------------------------------------------------
-// DSL-owned ABI layouts
-// ---------------------------------------------------------------------------
+// --- DSL-owned ABI layouts ---
 
-// Map a DSL ABI type name (as produced by the `struct(...)` token) to an MLIR
-// type.  Kept small on purpose: extend as new layouts need more field types.
+// Map a DSL ABI type name to an MLIR type.  Kept small on purpose.
 static Type parseAbiType(MLIRContext *ctx, llvm::StringRef t) {
   if (t == "ptr") return ptrTy(ctx);
   if (t == "i32") return i32Ty(ctx);
@@ -54,17 +45,14 @@ LLVM::LLVMStructType mlir::omp_lower::parseStructProp(
   SmallVector<Type> fields;
   for (auto tok : toks) {
     tok = tok.trim();
-    // An unknown field type stays a pointer, as it was before the name parser
-    // grew a "no such type" answer.
+    // An unknown field type stays a pointer.
     if (!tok.empty()) fields.push_back(parseAbiTypeProp(ctx, tok, ptrTy(ctx)));
   }
   if (fields.empty()) return fallback;
   return LLVM::LLVMStructType::getLiteral(ctx, fields);
 }
 
-// ---------------------------------------------------------------------------
-// Runtime declarations
-// ---------------------------------------------------------------------------
+// --- Runtime declarations ---
 
 func::FuncOp mlir::omp_lower::getOrInsertDecl(ModuleOp module,
                                               llvm::StringRef name,
@@ -102,9 +90,7 @@ func::FuncOp mlir::omp_lower::getOrInsertDeclWithReturn(ModuleOp module,
   return decl;
 }
 
-// ---------------------------------------------------------------------------
-// ident_t
-// ---------------------------------------------------------------------------
+// --- ident_t ---
 
 uint32_t mlir::omp_lower::identFlagBits(llvm::StringRef tok) {
   uint32_t kmpc = kIdentKmpc;
@@ -139,7 +125,7 @@ Value mlir::omp_lower::getOrCreateIdent(ModuleOp module, OpBuilder &builder,
   auto ptr  = ptrTy(ctx);
 
   // Shared default source-location string, NUL-terminated like
-  // ConstantDataArray::getString. reserved_3 stores the length without NUL.
+  // ConstantDataArray::getString.  reserved_3 stores the length without NUL.
   llvm::StringRef srcName = "__omp_src_loc_default";
   const std::string srcText = ";unknown;unknown;0;0;;";
   if (!module.lookupSymbol(srcName)) {
@@ -196,21 +182,15 @@ Value mlir::omp_lower::resolveIdentToken(uint32_t flags, ModuleOp module,
              : getOrCreateIdent(module, builder, loc, ctx, flags);
 }
 
-// ---------------------------------------------------------------------------
-// proc_bind
-// ---------------------------------------------------------------------------
+// --- proc_bind ---
 
 // The runtimes agree on the numbering: iomp's kmp_proc_bind_t and libgomp's
 // omp_proc_bind_t are the same enum (false=0, true=1, master=2, close=3,
-// spread=4), and GCC passes those very values in GOMP_parallel's flags word.
-// One table therefore serves every runtime that names the clause.
+// spread=4), and GCC passes those values in GOMP_parallel's flags word.
 //
-// The MLIR enum is *not* that numbering — its ordinals are primary=0, master=1,
-// close=2, spread=3 — so the mapping goes through the kind's spelling.  Passing
-// the ordinal through would turn close into master, silently.  Kept here beside
-// identFlagBits, which is the same kind of table: a runtime ABI constant the
-// rules never spell out.
-//
+// The MLIR enum is *not* that numbering — primary=0, master=1, close=2,
+// spread=3 — so the mapping goes through the kind's spelling.  Passing the
+// ordinal through would turn close into master, silently.
 // primary and master are the 5.1 rename of one concept and share a value.
 std::optional<uint32_t> mlir::omp_lower::procBindEnumValue(llvm::StringRef kind) {
   if (kind == "primary" || kind == "master") return 2u;
@@ -226,9 +206,7 @@ Value mlir::omp_lower::clauseToI1(OpBuilder &builder, Location loc, Value v) {
   return LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne, v, zero);
 }
 
-// ---------------------------------------------------------------------------
-// Symbolic token resolution
-// ---------------------------------------------------------------------------
+// --- Symbolic token resolution ---
 
 Value mlir::omp_lower::resolveSymbolToken(
     llvm::StringRef s, OpBuilder &builder, Location loc,

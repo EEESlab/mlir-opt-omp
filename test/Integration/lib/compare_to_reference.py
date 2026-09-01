@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 # =============================================================================
-# compare_to_reference.py -- put a finished run next to the paper's numbers.
+# compare_to_reference.py -- comapre a run next to the paper's numbers.
 #
 #     python3 compare_to_reference.py <results_performance.csv> --runtime <r>
-#
-# The columns are printed side by side; the script does not judge them. The
-# expected values come from one file, named in the output:
 #
 #   reference/reference.csv   what the paper's figures plot.
 #
 # A run made in a different configuration than the figure is reported as not
-# comparable. The driver passes --dataset, --threads and --barrier-elim; by
-# hand they are optional, and what is not given is not checked.
+# comparable.
 # =============================================================================
 
 import argparse

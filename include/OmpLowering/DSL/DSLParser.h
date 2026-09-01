@@ -1,13 +1,4 @@
-// DSLParser.h
-//
-// C++ port of parser.py.
-// Provides:
-//   - AST node types (Program, RuntimeDecl, ConstructDecl, …)
-//   - Lexer / Parser: parse a DSL source string into a Program AST
-//
-// Usage:
-//   auto program = dsl::parse(source);   // returns dsl::Program
-//   // then pass to dsl::Evaluator
+// AST node types and the entry point that parses DSL source into a Program.
 
 #pragma once
 
@@ -22,9 +13,7 @@
 
 namespace dsl {
 
-// ===========================================================================
-// Expr
-// ===========================================================================
+// --- Expr ---
 
 struct IdentExpr;
 struct StringExpr;
@@ -43,9 +32,7 @@ struct BoolExpr   { bool value; };
 struct CallExpr   { std::string name; std::vector<Expr> args; };
 struct ListExpr   { std::vector<Expr> values; };
 
-// ===========================================================================
-// Predicate
-// ===========================================================================
+// --- Predicate ---
 
 struct PredHas;
 struct PredEq;
@@ -69,17 +56,13 @@ struct PredNot   { std::shared_ptr<Predicate> inner; };
 struct PredAnd   { std::shared_ptr<Predicate> left, right; };
 struct PredOr    { std::shared_ptr<Predicate> left, right; };
 
-// ===========================================================================
-// Action
-// ===========================================================================
+// --- Action ---
 
 struct EmitAction { std::string name; std::optional<Expr> arg; };
 struct CallAction { Expr callee; std::vector<Expr> args; };
 using Action = std::variant<EmitAction, CallAction>;
 
-// ===========================================================================
-// Statement
-// ===========================================================================
+// --- Statement ---
 
 struct LetDecl;
 struct ActionStmt;
@@ -98,40 +81,27 @@ using Statement =
 struct ActionStmt    { Action action; };
 struct WhenStmt      { Predicate predicate; Action action; };
 struct OtherwiseStmt { Action action; };
-// `branch <expr> { true => <arm> false => <arm> }`, where an arm is one
-// statement or a braced sequence of them.  Unlike `when`, whose predicate is
-// decided while evaluating the rules, this condition is a value known only at
-// run time, so it survives evaluation and becomes a real branch in the emitted
-// IR.  Either arm may be empty.
-//
-// Arms hold statements, not just actions, so the two kinds of choice can nest:
-// a `when has(num_threads)` inside an arm is still settled during evaluation
-// and collapses, while the branch around it does not.
-//
-// A condition that evaluates to null means the clause is absent, and there is
-// nothing to branch on: the true arm is emitted inline and no branch survives.
+// Unlike `when`, which is settled during evaluation, this condition is a
+// run-time value and becomes a real branch in the emitted IR.  Arms hold
+// statements so the two kinds of choice can nest.  A null condition means the
+// clause is absent: the true arm is emitted inline and no branch survives.
 struct BranchStmt {
   Expr condition;
   std::vector<Statement> ifTrue;
   std::vector<Statement> ifFalse;
 };
 struct LetStmt       { LetDecl decl; };
-// `let <name> = call "<callee>"(<args>);` — binds <name> to the call's SSA
-// result so later statements can reference it.
+// Binds <name> to the call's SSA result for later statements.
 struct LetCallStmt   { std::string name; CallAction call; };
 
-// ===========================================================================
-// Construct items
-// ===========================================================================
+// --- Construct items ---
 
 struct PropertyDecl { std::string name; Expr expr; };
 struct BlockDecl    { std::string name; std::vector<Statement> statements; };
 
 using ConstructItem = std::variant<LetDecl, PropertyDecl, BlockDecl>;
 
-// ===========================================================================
-// Top-level
-// ===========================================================================
+// --- Top-level ---
 
 struct ConstructDecl {
   std::string name;
@@ -150,9 +120,7 @@ struct Program {
   std::vector<RuntimeDecl> runtimes;
 };
 
-// ===========================================================================
-// Entry point
-// ===========================================================================
+// --- Entry point ---
 
 llvm::Expected<Program> parse(llvm::StringRef source);
 

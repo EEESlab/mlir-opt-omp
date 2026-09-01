@@ -1,19 +1,7 @@
-// mlir-opt-omp.cpp
+// mlir-opt with the omp_lower dialect and passes compiled in.
 //
-// Custom mlir-opt with omp_lower dialect and passes compiled in.
-//
-// Our custom flags --omp-lower-dsl and --omp-lower-runtime are extracted
-// from argv BEFORE MlirOptMain sees it, so they don't conflict with its
-// internal argument parser.
-//
-// Usage:
-//   ./mlir-opt-omp \
-//     --allow-unregistered-dialect \
-//     --omp-lower-dsl=rules.dsl \
-//     --omp-lower-runtime=iomp \
-//     --omp-to-omp-lower \
-//     --omp-lower-plan \
-//     -o out.mlir in.mlir
+// --omp-lower-dsl and --omp-lower-runtime are extracted from argv before
+// MlirOptMain sees it, so they do not reach its own argument parser.
 
 #include "OmpLowering/IR/OmpLoweringOps.h"
 #include "OmpLowering/Transforms/OmpBarrierElimPass.h"
@@ -21,10 +9,9 @@
 #include "OmpLowering/Transforms/OmpToOmpLowerPass.h"
 #include "OmpLowering/Transforms/PlanLoweringPass.h"
 
-// CIR is optional: the passes below never look at cir.* operations, the dialect
-// is registered only so modules coming straight from the C front-end still
-// parse. Configure with -DOMP_LOWER_ENABLE_CIR=OFF to build against a stock
-// LLVM/MLIR and feed the tool MLIR that carries no cir.*.
+// CIR is optional: the passes never look at cir.* ops, and the dialect is
+// registered only so modules straight from the C front-end still parse.
+// Configure with -DOMP_LOWER_ENABLE_CIR=OFF to build against a stock LLVM/MLIR.
 #ifdef OMP_LOWER_HAS_CIR
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #endif
@@ -40,10 +27,8 @@
 #include <string>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Pre-parse our custom flags out of argv before MlirOptMain sees them.
-// Returns the extracted values and a new argv without those flags.
-// ---------------------------------------------------------------------------
+// Pre-parse our custom flags out of argv, returning the extracted values and a
+// filtered argv.
 
 static void extractCustomFlags(int &argc, char **&argv,
                                 std::string &dslFile,
@@ -66,8 +51,7 @@ static void extractCustomFlags(int &argc, char **&argv,
     }
   }
 
-  // Replace argv with the filtered version.
-  // We keep the original array alive; just update argc and the pointer.
+  // Keep the original array alive; just update argc and the pointer.
   static std::vector<char *> filteredArgv;
   filteredArgv = std::move(newArgv);
   argc = static_cast<int>(filteredArgv.size());
@@ -75,7 +59,6 @@ static void extractCustomFlags(int &argc, char **&argv,
 }
 
 int main(int argc, char **argv) {
-  // Extract our flags before MlirOptMain parses argv.
   std::string dslFile, runtime;
   extractCustomFlags(argc, argv, dslFile, runtime);
 
@@ -93,8 +76,6 @@ int main(int argc, char **argv) {
 
   mlir::registerTransformsPasses();
 
-  // Register passes. The omp-to-omp-lower pass is created with the DSL file
-  // and runtime we extracted above.
   mlir::registerPass([&]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createOmpToOmpLowerPass(dslFile, runtime);
   });

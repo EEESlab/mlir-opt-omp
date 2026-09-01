@@ -1,12 +1,5 @@
 # Values recovered from the paper's figures.
 #
-# Not estimates: the figures are vector (matplotlib EPS), so
-# every bar is a rectangle with real coordinates and every axis
-# tick carries its own position. extract_from_eps.py reads them
-# back through the axis transform. Regenerate with:
-#     python3 extract_from_eps.py
-# and check they still match the figures with --check.
-#
 #   fig4: speedup    30 kernels   results_gomp_LARGE_FINAL.eps
 #   fig5: speedup    30 kernels   results_iomp_LARGE_FINAL.eps
 #   fig6: speedup    30 kernels   results_pulp.eps

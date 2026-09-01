@@ -1,15 +1,5 @@
-// OmpBarrierElimPass.h
-//
-// Declares the MLIR pass that removes team barriers made redundant by the
-// surrounding OpenMP structure.  It runs on the omp dialect, before a runtime
-// has been chosen.
-//
-// Registration:
-//   #include "OmpLowering/Transforms/OmpBarrierElimPass.h"
-//   mlir::registerOmpBarrierElimPass();
-//
-// Usage in a pass pipeline string:
-//   mlir-opt-omp --omp-barrier-elim input.mlir
+// Removes team barriers made redundant by the surrounding OpenMP structure.
+// Runs on the omp dialect, before a runtime has been chosen.
 
 #pragma once
 

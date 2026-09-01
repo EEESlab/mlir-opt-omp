@@ -1,20 +1,11 @@
-// OmpLoweringOps.td
-//
-// TableGen dialect definition for the omp_lower dialect.
-// mlir-tblgen generates:
-//   OmpLoweringOps.h.inc           – op declarations
-//   OmpLoweringOps.cpp.inc         – op definitions
-//   OmpLoweringOps.dialect.cpp.inc – dialect registration
-//   OmpLoweringAttrs.h.inc         – attribute declarations (via -gen-attrdef-decls)
-//   OmpLoweringAttrs.cpp.inc       – attribute definitions  (via -gen-attrdef-defs)
+// TableGen definition of the omp_lower dialect, its plan attributes and
+// omp_lower.construct.
 
 include "mlir/IR/OpBase.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-// ---------------------------------------------------------------------------
-// Dialect
-// ---------------------------------------------------------------------------
+// --- Dialect ---
 
 def OmpLowering_Dialect : Dialect {
   let name         = "omp_lower";
@@ -23,34 +14,27 @@ def OmpLowering_Dialect : Dialect {
   let useDefaultAttributePrinterParser = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Attribute base class
-// ---------------------------------------------------------------------------
+// --- Attribute base class ---
 
 class OmpLowering_Attr<string attrName, string attrMnemonic, list<Trait> traits = []>
     : AttrDef<OmpLowering_Dialect, attrName, traits> {
   let mnemonic = attrMnemonic;
 }
 
-// ---------------------------------------------------------------------------
-// PlanCallAttr  –  #omp_lower.call<"callee", ["arg0", "arg1"]>
-// ---------------------------------------------------------------------------
+// --- PlanCallAttr  #omp_lower.call<"callee", ["arg0", "arg1"]> ---
 
 def PlanCallAttr : OmpLowering_Attr<"PlanCall", "call"> {
   let summary = "A single planned runtime call";
   let parameters = (ins
     "::mlir::StringAttr":$callee,
     "::mlir::ArrayAttr":$args,
-    // Non-null when the call's SSA result is bound (`let <name> = call ...`);
-    // holds <name> so the outlining pass can thread the result to later calls.
+    // Non-null when the call's SSA result is bound (`let <name> = call ...`).
     OptionalParameter<"::mlir::StringAttr">:$result
   );
   let assemblyFormat = "`<` $callee `,` `[` $args `]` (`,` `result` `=` $result^)? `>`";
 }
 
-// ---------------------------------------------------------------------------
-// PlanBranchAttr  –  #omp_lower.branch<"%cond", [...], [...]>
-// ---------------------------------------------------------------------------
+// --- PlanBranchAttr  #omp_lower.branch<"%cond", [...], [...]> ---
 
 def PlanBranchAttr : OmpLowering_Attr<"PlanBranch", "branch"> {
   let summary = "A planned branch on a run-time value";
@@ -69,9 +53,7 @@ def PlanBranchAttr : OmpLowering_Attr<"PlanBranch", "branch"> {
   let assemblyFormat = "`<` $cond `,` `[` $ifTrue `]` `,` `[` $ifFalse `]` `>`";
 }
 
-// ---------------------------------------------------------------------------
-// PlanEmitAttr  –  #omp_lower.emit<"name", value>
-// ---------------------------------------------------------------------------
+// --- PlanEmitAttr  #omp_lower.emit<"name", value> ---
 
 def PlanEmitAttr : OmpLowering_Attr<"PlanEmit", "emit"> {
   let summary = "A named value to materialise before the construct body";
@@ -82,9 +64,7 @@ def PlanEmitAttr : OmpLowering_Attr<"PlanEmit", "emit"> {
   let assemblyFormat = "`<` $sym_name `,` $value `>`";
 }
 
-// ---------------------------------------------------------------------------
-// omp_lower.construct
-// ---------------------------------------------------------------------------
+// --- omp_lower.construct ---
 
 def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
     [NoMemoryEffect]> {
@@ -92,47 +72,38 @@ def OmpLowering_ConstructOp : Op<OmpLowering_Dialect, "construct",
   let summary = "Encodes a fully-evaluated LoweringPlan as MLIR attributes";
 
   let arguments = (ins
-    // Clause operands. Carried as real SSA operands so the values from the
-    // original omp.* op survive into OmpOutliningPass — looking them up by
-    // symbolic name in the plan would otherwise lose the SSA reference.
-    //
-    // A single variadic list (rather than several Optional operands) avoids
-    // AttrSizedOperandSegments and the segment-size attribute it brings along.
-    // The 1:1 clause_names array below says which clause each operand carries
-    // ("num_threads", "if_clause", ...), so a construct can carry several at
-    // once (e.g. `parallel num_threads(n) if(c)`).
+    // Clause operands, carried as real SSA operands so the values from the
+    // original omp.* op survive into OmpOutliningPass.  One variadic list
+    // rather than several Optional operands avoids AttrSizedOperandSegments;
+    // the 1:1 clause_names array below says which clause each one carries, so a
+    // construct can hold several at once.
     Variadic<AnyType>:$clause_operands,
 
     StrAttr:$runtime,
-    // NOTE: 'construct' is a reserved TableGen keyword so the accessor is
-    // named construct_name here; the assembly format still prints 'construct ='.
+    // 'construct' is a reserved TableGen keyword, hence construct_name; the
+    // assembly format still prints 'construct ='.
     StrAttr:$construct_name,
     DictionaryAttr:$prop_dict,
     ArrayAttr:$pre,
     ArrayAttr:$invoke,
     ArrayAttr:$post,
     // Clause name of each clause_operands entry, same order.  Optional so
-    // constructs without clause operands (barrier, taskwait) stay unchanged.
+    // barrier and taskwait stay unchanged.
     OptionalAttr<StrArrayAttr>:$clause_names,
-    // Names in clause_names that stand for a *list* rather than one value, so
-    // every operand carrying that name belongs to it: `captures` is the case,
-    // spliced into as many call arguments as there are entries.  Recorded
-    // separately because a list can legitimately be empty — a parallel with no
-    // captures has no operand at all, and only this attribute distinguishes
-    // "empty list" from "not a list".
+    // Names in clause_names standing for a *list*, so every operand under that
+    // name belongs to it (captures).  Recorded separately because a list can be
+    // empty, and only this attribute tells "empty list" from "not a list".
     OptionalAttr<StrArrayAttr>:$list_names,
-    // proc_bind is a compile-time enum, not a run-time value, so unlike
-    // num_threads and if_clause it cannot ride in clause_operands: there is no
-    // SSA value to carry.  The kind's spelling ("close", "spread", ...) travels
-    // here, and the outlining pass turns it into the constant the runtime's ABI
-    // wants — which is a different numbering from the MLIR enum's own ordinals.
+    // proc_bind is a compile-time enum, so unlike num_threads and if_clause it
+    // has no SSA value to ride in clause_operands.  The kind's spelling travels
+    // here and the outlining pass turns it into the runtime's own numbering,
+    // which differs from the MLIR enum's ordinals.
     OptionalAttr<StrAttr>:$proc_bind
   );
 
   let results = (outs);
 
-  // Optional region holding the parallel body before outlining.
-  // After OmpOutliningPass runs this region is empty.
+  // Optional region holding the body before outlining; empty afterwards.
   let regions = (region AnyRegion:$body);
 
   let assemblyFormat = [{
