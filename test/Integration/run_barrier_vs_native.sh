@@ -4,8 +4,8 @@
 #
 # Not a runtime comparison to configure: each side is counted in the form it
 # emits. The three LLVM columns are counted in LLVM IR after -O3 (__kmpc_barrier),
-# gcc in its assembly at -O0 (GOMP_barrier), because from -O1 gcc copies the
-# barrier call site into the paths it duplicates.
+# gcc in its assembly at -O0 (GOMP_barrier), because from -O1 jump threading
+# and friends duplicate paths and each copy carries the barrier call site.
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
@@ -78,8 +78,9 @@ count_barriers() {   # $1 = .ll file
 
 # -O0: gcc decides the elision in the front end, so it is already applied
 # there, and no later pass has duplicated a barrier call site yet. From -O1
-# the count rises without any execution gaining a barrier (the suite goes
-# 28 -> 43 at -O3, gemver alone 3 -> 7).
+# jump threading and the other passes that duplicate a path to remove a
+# branch copy the barrier's block with it, so the count rises without any
+# execution gaining a barrier (the suite goes 28 -> 43 at -O3, gemver 3 -> 7).
 build_gcc() {   # $1 = source, $2 = output .s
     "$GCC" -fopenmp -O0 -S $GCC_STRICT_FP \
         -I"$INC" -I"$(dirname "$1")" \
@@ -174,17 +175,16 @@ for k in "${KERNEL_LIST[@]}"; do
 done
 
 echo
-echo "  clang: $T_CLANG    ours without the pass: $T_BASE    ours with it: $T_ELIM"
-if [ "$T_CLANG" -gt 0 ]; then
-    awk -v c="$T_CLANG" -v e="$T_ELIM" \
-        'BEGIN { printf "  %d fewer than clang (%.1f%%)\n", c - e, 100 * (c - e) / c }'
-fi
+TOTALS="  clang: $T_CLANG ; ours without the pass: $T_BASE ; ours with the pass: $T_ELIM"
+# gcc missing leaves its total at 0: drop the item rather than print a zero.
+[ "$T_GCC" -gt 0 ] && TOTALS="$TOTALS ; gcc: $T_GCC"
+echo "$TOTALS"
+
 if [ "$T_GCC" -gt 0 ]; then
-    echo "  gcc (-O0): $T_GCC    ours with the pass: $T_ELIM"
     echo "    Counted at -O0: gcc already elides the barrier in its front end."
-    echo "    From -O1 the count only grows because later passes duplicate the"
-    echo "    code around a barrier and each copy carries its own call site,"
-    echo "    so no execution gains a barrier."
+    echo "    From -O1 the passes that duplicate a path to remove a branch --"
+    echo "    copy the block the barrier sits in"
+    echo "    along with it: more call sites, no execution gaining a barrier."
 fi
 
 # --- against the paper -------------------------------------------------------
