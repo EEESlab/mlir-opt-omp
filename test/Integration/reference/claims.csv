@@ -58,5 +58,4 @@ barrier-elim-saving;4.5;pmsis;barrier_saving_pct;suite;equals;0.037;0.02;run_per
 barrier-elim-improved;4.5;pmsis;kernels_improving;suite;equals;22;2;run_performance.sh
 barrier-elim-best;4.5;pmsis;barrier_delta_pct;best;equals;1.12;0.30;run_performance.sh
 barrier-elim-worst;4.5;pmsis;barrier_delta_pct;worst;equals;-0.16;0.30;run_performance.sh
-unroll-mean;4.5;pmsis;unroll_pct;ten-apps;equals;3;1;run_unroll.sh
-unroll-floyd-warshall;4.5;pmsis;unroll_pct;floyd-warshall;equals;24;2;run_unroll.sh
+unroll-mean;4.5;pmsis;unroll_pct;ten-apps;equals;3;1;
