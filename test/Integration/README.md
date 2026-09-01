@@ -387,16 +387,21 @@ removed from the program text, not barrier executions saved.
 compared with the compiler people actually use:
 
 ```sh
-./run_barrier_vs_native.sh   # -> results/iomp/results_barrier_vs_native.csv
+./run_barrier_vs_native.sh   # -> results/barrier_vs_native/results_barrier_vs_native.csv
 ```
 
-`RUNTIME` is pinned to `iomp` here rather than read from `run.env`: the three
-LLVM columns compare only because they speak one ABI. A `run.env` or `RUN_ENV`
-config left on another runtime is therefore ignored, not refused — everything
-else those files carry (`POLYBENCH`, the tool paths, `DATASET`, `KERNELS`,
-`OUTDIR`) still applies, and that is what this driver reads them for. An inline
-`RUNTIME=libgomp ./run_barrier_vs_native.sh` *is* refused: that asks for a
-comparison this script cannot make.
+There is no runtime to pick: this is a count of barriers in two runtimes at
+once, ours and clang's against the iomp ABI (`__kmpc_barrier`), gcc's against
+its own (`GOMP_barrier`). `RUNTIME` is therefore ignored wherever it is set —
+`run.env`, `RUN_ENV` or the command line — while everything else those files
+carry (`POLYBENCH`, the tool paths, `DATASET`, `KERNELS`, `OUTDIR`) still
+applies, and the results go to one directory of their own rather than under a
+runtime.
+
+The `form` column says how the kernel spells its parallel loop: `combined` for
+`#pragma omp parallel for`, `split` for a `#pragma omp parallel` region with a
+separate `#pragma omp for` inside. Clang elides the trailing barrier only for
+the combined directive, which is where the delta comes from.
 
 On a full-suite run the four totals are printed next to what §4.5 states — 59
 without the pass, 26 with it, 45 for Clang, 28 for GCC at `-O0` — read from
@@ -408,7 +413,7 @@ Every file a number was counted in is kept, one directory per kernel, so the
 table can be rechecked instead of taken on trust:
 
 ```
-results/iomp/barrier_vs_native/gemm-omp/
+results/barrier_vs_native/gemm-omp/
   clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s
 ```
 

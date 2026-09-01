@@ -188,14 +188,6 @@ def table(run, reference, runtime):
     print(foot)
     print()
 
-    par = geomean([num(r.get("opt_vs_native_par")) for r in run.values()])
-    seq = geomean([num(r.get("opt_vs_native_seq")) for r in run.values()])
-    if par or seq:
-        print("opt_vs_native (absolute cycles, geomean)   "
-              "parallel {}   sequential {}".format(
-                  cell(par, width=1).strip(), cell(seq, width=1).strip()))
-        print()
-
 
 def rel(path):
     """The shorter of the relative and absolute path."""
@@ -210,20 +202,16 @@ def rel(path):
 def legend(runtime, args, has_size):
     figure = REFERENCE_COLUMNS[runtime][2]
     print("columns")
-    print("  run_nat/_opt   measured by THIS run: each variant against its"
-          " OWN sequential cell")
+    print("  run_nat/_opt   measured by this run")
     print("  {}_nat/_our  what Figure {} plots, from {}".format(
         figure, figure[-1], rel(args.reference)))
     print("  run_o/n        run_opt / run_nat, this run's own ratio")
     print("  {}_o/n       {}_our / {}_nat, the same ratio in the figure"
           .format(figure, figure, figure))
-    print("  the last two are the comparison: a ratio survives a change of"
-          " machine,")
-    print("  an absolute speedup does not.")
     if has_size:
         print("  size%          size_opt_par / size_opt_seq - 1")
-        print("  fig7%          the same quantity in Figure 7")
-    print("  the four cells behind a row: results/{}/<kernel>-omp/performance/"
+        print("  fig7%          the same value in Figure 7")
+    print("  find run values: results/{}/<kernel>-omp/performance/"
           .format(runtime))
     print()
 

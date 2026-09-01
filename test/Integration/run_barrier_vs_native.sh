@@ -2,18 +2,17 @@
 # run_barrier_vs_native.sh — counts team-barrier call sites: ours with and
 # without --omp-barrier-elim, against clang's and gcc's on the same kernels.
 #
-# The three LLVM columns are iomp and are counted in LLVM IR after -O3, so they
-# speak one ABI and one stage. gcc gets its own column counted at -O0, because
-# from -O1 it copies the barrier sequence into paths it duplicates: the count
-# would be of CFG shape as much as of synchronisation. Say which stage when
-# quoting the column.
+# Not a runtime comparison to configure: each side is counted in the form it
+# emits. The three LLVM columns are counted in LLVM IR after -O3 (__kmpc_barrier),
+# gcc in its assembly at -O0 (GOMP_barrier), because from -O1 gcc copies the
+# barrier call site into the paths it duplicates.
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
 #   ./run_barrier_vs_native.sh path/to/kernel-omp.c
 #   VERBOSE=1 ./run_barrier_vs_native.sh             # let the tools report why
 #
-# RUNTIME=iomp only. Leaves results_barrier_vs_native.csv.
+# Leaves results_barrier_vs_native.csv.
 #
 # On a full-suite run the four totals are printed next to what section 4.5
 # states, from reference/claims.csv. Side by side and nothing more: what the
@@ -25,10 +24,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Nothing is executed and nothing is built for the target.
 SKIP_PULP_SDK=1
 
-if [ -n "${RUNTIME:-}" ] && [ "$RUNTIME" != "iomp" ]; then
-    echo "ERROR: RUNTIME=$RUNTIME — this comparison only runs on iomp, see the header." >&2
-    exit 2
-fi
+# Fixed, and not something to select: our side is counted against the iomp ABI
+# because that is what the LLVM columns speak, gcc against its own.
 RUNTIME=iomp
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
@@ -37,12 +34,10 @@ RUNTIME=iomp
 # defines or they would not be compiling the same program.
 POLYBENCH_CFLAGS="$POLYBENCH_ROOT_CFLAGS"
 
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
+OUTDIR="${OUTDIR:-$PWD/results}/barrier_vs_native"
+rm -rf "$OUTDIR"
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/results_barrier_vs_native.csv"
-ARTDIR="$OUTDIR/barrier_vs_native"
-rm -rf "$ARTDIR"
-mkdir -p "$ARTDIR"
 
 ERRSINK="/dev/null"
 [ -n "${VERBOSE:-}" ] && ERRSINK="/dev/stderr"
@@ -84,8 +79,7 @@ count_barriers() {   # $1 = .ll file
 # -O0: gcc decides the elision in the front end, so it is already applied
 # there, and no later pass has duplicated a barrier call site yet. From -O1
 # the count rises without any execution gaining a barrier (the suite goes
-# 28 -> 43 at -O3, gemver alone 3 -> 7), and -fno-thread-jumps does not put
-# it back on every toolchain, so the stage is what makes the column readable.
+# 28 -> 43 at -O3, gemver alone 3 -> 7).
 build_gcc() {   # $1 = source, $2 = output .s
     "$GCC" -fopenmp -O0 -S $GCC_STRICT_FP \
         -I"$INC" -I"$(dirname "$1")" \
@@ -123,17 +117,19 @@ FULL_SUITE=0
 [ "${#KERNEL_LIST[@]}" -eq "${#ALL_KERNELS[@]}" ] && FULL_SUITE=1
 
 echo "=== TEAM BARRIERS: OURS vs CLANG (both after -O3) ==="
-echo "runtime:   $RUNTIME (fixed)    dataset: $DATASET"
+echo "dataset:   $DATASET"
 echo "polybench: $POLYBENCH"
 echo "kernels:   ${#KERNEL_LIST[@]}"
-echo "files:     $ARTDIR"
+echo "files:     $OUTDIR"
+echo "form:      combined = '#pragma omp parallel for'"
+echo "           split    = '#pragma omp parallel' + '#pragma omp for'"
 echo
 
 echo "kernel,pragma_form,clang,gcc_o0,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
 printf '  %-22s %-9s %6s %6s %8s %8s %8s\n' kernel form clang gcc base elim 'vs clang'
 
 # Intermediates only (.cir and the MLIR stages); the counted files go straight
-# to $ARTDIR and stay there.
+# to $OUTDIR and stay there.
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -144,7 +140,7 @@ for k in "${KERNEL_LIST[@]}"; do
     src="$(resolve_src "$k")" || { echo "  SKIP (not found): $k"; continue; }
     name="$(basename "$src" .c)"
     form="$(pragma_form "$src")"
-    kdir="$ARTDIR/$name"
+    kdir="$OUTDIR/$name"
     mkdir -p "$kdir"
 
     "$CLANG" -fopenmp -O3 -S -emit-llvm $CLANG_STRICT_FP $WARN_SUPPRESS \
@@ -185,12 +181,10 @@ if [ "$T_CLANG" -gt 0 ]; then
 fi
 if [ "$T_GCC" -gt 0 ]; then
     echo "  gcc (-O0): $T_GCC    ours with the pass: $T_ELIM"
-    echo "    -O0 because gcc applies the elision in the front end, and no"
-    echo "    later pass has copied a barrier call site yet. From -O1 the count"
-    echo "    rises with no execution gaining a barrier: duplicated paths carry"
-    echo "    their own copy, and -fno-thread-jumps undoes only part of that,"
-    echo "    by how much depending on the gcc build. The other three columns"
-    echo "    are after -O3, so say which stage when quoting this one."
+    echo "    Counted at -O0: gcc already elides the barrier in its front end."
+    echo "    From -O1 the count only grows because later passes duplicate the"
+    echo "    code around a barrier and each copy carries its own call site,"
+    echo "    so no execution gains a barrier."
 fi
 
 # --- against the paper -------------------------------------------------------
@@ -239,7 +233,7 @@ fi
 
 echo
 echo "  Counted in, one directory per kernel under"
-echo "    $ARTDIR/<kernel>/"
+echo "    $OUTDIR/<kernel>/"
 echo "      clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s"
 echo "  Recount any row:"
 echo "    grep -o 'call void @__kmpc_barrier' <file>.ll | wc -l"
