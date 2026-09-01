@@ -123,3 +123,11 @@ the repeatability it promised.
 
 The PULP figures have no such caveat: gvsoc is deterministic, and none of those
 variables applies to a bare-metal runtime.
+
+`compare_to_reference.py` enforces the dataset half of this rather than
+trusting it: `LARGE_DATASET` on the host, `MINI_DATASET` on `pmsis`, and the
+barrier pass off, since Figures 4–7 were measured without it. A run outside
+that says so and compares nothing — a different dataset is a different problem
+size, and putting its speedups next to these columns would be comparing two
+different programs. The thread count is reported beside the figure's rather
+than enforced.

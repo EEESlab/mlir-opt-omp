@@ -199,6 +199,21 @@ python3 lib/compare_to_reference.py results/libgomp/results_performance.csv \
   --runtime libgomp
 ```
 
+It only runs when this run was made the way the figure was, and it is handed
+the configuration to decide that:
+
+| runtime | compares only at | because |
+|---|---|---|
+| `libgomp`, `iomp` | `LARGE_DATASET` | §4.1; Figures 4 and 5 |
+| `pmsis` | `MINI_DATASET` | §4.1, and `common.sh` forces it anyway |
+| any | `BARRIER_ELIM=0` | Figures 4–7 were measured without the pass |
+
+Anything else prints one line saying which of those it was and stops — a
+different dataset is a different problem size, so the published columns would
+not be about the same program. `THREADS` is **not** a precondition: it changes
+the speedups but not what they are speedups of, so a run at 8 threads is
+compared and the header says `threads 8 (figure: 16)`.
+
 It **reports and does not judge**. No row is labelled close, acceptable, at
 parity or reversed: the columns are put next to each other and what they mean
 is the reader's call. One line per kernel:

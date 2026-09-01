@@ -597,8 +597,13 @@ if is_true "${COMPARE:-true}" && [ "$BARRIER_ELIM" != "both" ]; then
     compare_py="${PLOT_PYTHON:-}"
     [ -n "$compare_py" ] || compare_py="$(command -v python3 || command -v python)" || compare_py=""
     if [ -n "$compare_py" ]; then
+        # The configuration goes with the CSV: the comparison only runs
+        # when this run was made the way the figure was, and it is the one
+        # that knows which configuration that is.
         "$compare_py" "$SCRIPT_DIR/lib/compare_to_reference.py" \
-            "$CSV" --runtime "$RUNTIME" || true
+            "$CSV" --runtime "$RUNTIME" \
+            --dataset "$DATASET" --threads "$THREADS" \
+            --barrier-elim "$BARRIER_ELIM" || true
     fi
 fi
 exit 0

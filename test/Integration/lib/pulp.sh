@@ -110,7 +110,14 @@ compile_pulp_kernel_obj() {
     # 2) CIR -> LLVM dialect MLIR (strip residual cir.* attrs). A CIR-level
     #    pass, when one was asked for, runs here: on the CIR, while it is
     #    still there to work on.
+    #    --mlir-disable-threading: with the thread pool on, the unroll pass
+    #    fails on a different kernel each run, always as a segfault inside
+    #    the parallel verifier. Single-threaded the run is reproducible, and
+    #    a pass that really does produce bad IR then reports it instead of
+    #    crashing. Costs nothing measurable on modules this size, and it
+    #    applies to both cells so the two stay comparable.
     "$CIR_OPT" "$tmpdir/$name.cir" \
+        --mlir-disable-threading \
         ${CIR_UNROLL_FLAG:+$CIR_UNROLL_FLAG} \
         --cir-to-llvm --reconcile-unrealized-casts \
         -o "$tmpdir/$name-s1.mlir" || { pulp_drop_tmp "$tmpdir"; return 1; }

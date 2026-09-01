@@ -94,14 +94,16 @@ def parse_args(argv):
 def not_comparable(args):
     """Why this run cannot be put next to the figure, or None if it can."""
     dataset, _threads = FIGURE_CONFIG[args.runtime]
-    figure = REFERENCE_COLUMNS[args.runtime][2]
+    figure = "Figure " + REFERENCE_COLUMNS[args.runtime][2][-1]
     if args.dataset and args.dataset != dataset:
-        return ("this run used {}, {} was measured at {}. A different dataset\n"
-                "is a different problem size, so the published columns are not\n"
-                "about the same program.".format(args.dataset, figure, dataset))
+        return ["this run used {}, {} was measured at {}.".format(
+                    args.dataset, figure, dataset),
+                "A different dataset is a different problem size, so the",
+                "published columns would not be about the same program."]
     if args.barrier_elim and args.barrier_elim != "0":
-        return ("--omp-barrier-elim was on (BARRIER_ELIM={}), and the figures\n"
-                "were measured without it.".format(args.barrier_elim))
+        return ["BARRIER_ELIM={}, so --omp-barrier-elim was on.".format(
+                    args.barrier_elim),
+                "The figures were measured without it."]
     return None
 
 
@@ -343,7 +345,9 @@ def main(argv):
 
     why = not_comparable(args)
     if why:
-        print("not compared with the paper: " + why)
+        print("not compared with the paper")
+        for line in why:
+            print("  " + line)
         print()
         return
 
