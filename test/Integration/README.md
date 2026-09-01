@@ -199,23 +199,41 @@ python3 lib/compare_to_reference.py results/libgomp/results_performance.csv \
   --runtime libgomp
 ```
 
-The four checks are ordered by how well they survive a change of machine, which
-is the whole difficulty: a reviewer runs on a different CPU, so an absolute
-speedup is not comparable at all.
+It **reports and does not judge**. No row is labelled close, acceptable, at
+parity or reversed: the columns are put next to each other and what they mean
+is the reader's call. One line per kernel:
 
-| # | check | compares against | transfers? |
-|---|---|---|---|
-| 1 | **parity** — `speedup_opt / speedup_native` per kernel | the run itself | **yes** — a property of the compiler, and the paper's central claim |
-| 2 | **named kernels** — `doitgen` ahead on libgomp, `floyd-warshall`/`deriche`/`nussinov` behind on pmsis | [`reference/claims.csv`](reference/claims.csv), §4.2 and §4.3 | yes, they are claims about a mechanism |
-| 3 | **size** increase below 0.7% (pmsis only), and against Figure 7 itself | [`reference/claims.csv`](reference/claims.csv) §4.3, then `fig7_size_our` | yes, decided by the compiler |
-| 4 | **absolute** speedups | [`reference/reference.csv`](reference/reference.csv) | **no** — orientation only |
-| 6 | **claims nothing checks** — an inventory, not a check | [`reference/claims.csv`](reference/claims.csv) | — |
+```
+kernel             native     ours ours/nat fig6_nat fig6_our ours/fig    size%    fig7%
+covariance           4.51     4.46    0.989     4.51     4.46    1.000    0.093    0.093
+```
 
-What checks 2 and 3 expect is not written into the script: it is one row per
-sentence in [`reference/claims.csv`](reference/claims.csv), so the paper and
-the check that guards it stay one edit apart. Section 6 then prints the rows
-for this runtime that **no** driver reads, because a number in the paper with
-nothing behind it is exactly the kind that rots quietly.
+| column | is |
+|---|---|
+| `native`, `ours` | the speedup of each variant against **its own** sequential cell |
+| `ours/nat` | the two beside each other — free of how fast the machine is |
+| `fig<n>_nat`, `fig<n>_our` | what the paper's figure plots for that kernel, from [`reference/reference.csv`](reference/reference.csv) |
+| `ours/fig` | this run against the published bar |
+| `size%`, `fig7%` | `size_opt_par / size_opt_seq - 1`, here and in Figure 7 — `pmsis` only |
+
+Both ratio columns get a geomean, and the absolute `opt_vs_native` geomeans
+follow on one line — parallel and sequential, which is the pair that says
+whether a deficit is uniform.
+
+Then every claim the paper makes about this runtime, with the run's own number
+beside it and nothing else:
+
+```
+section  claim                   expects               measured    source
+4.3      nussinov-behind         below 1 +/-0.1        0.865       nussinov ours/nat
+4.3      size-bound              max 0.7               0.7300      highest: nussinov (30 kernels)
+4.5      unroll-mean             equals 3 +/-1         -           run_unroll.sh
+```
+
+`expects` is the paper's own wording as data, from
+[`reference/claims.csv`](reference/claims.csv) — the script does not invent a
+threshold. A row whose number comes from another driver shows `-` and names
+that driver, so the list doubles as the coverage inventory.
 
 The two files under `reference/` divide the work strictly: `claims.csv` is what
 the paper *says*, typed in from the text; `reference.csv` is what its figures
@@ -224,32 +242,17 @@ problem — §4.3 claims the size increase stays below 0.7% and `fig7_size_our`
 reaches 0.7296 on `nussinov` — and keeping them apart is what makes that
 visible instead of averaged away.
 
-Check 1 needs no reference file: it is computed from the CSV that has just been
-written, and it is the strongest of the four because `preserves performance
-across all benchmarks` is a statement about the two bars, not about their
-height. Check 4 is printed as a single summary line rather than per kernel: its
-reference values are exact — recovered from the figure files themselves, see
-[`reference/`](reference/) — but they were measured on the machine in §4.1, and
-an absolute speedup does not survive a change of CPU.
+Nothing here exits non-zero. `--strict` is the one opt-in exception, for a
+caller that wants a gate: it exits 1 when a claim with a `max` relation is
+exceeded.
 
-Check 1 also prints the absolute `opt_vs_native` figures beside the parity one,
-because the driver's own summary table shows them and the two look like they
-disagree — a backend that emits slower code reads ~0.89 there while parity
-reads ~1.00. Whether that is a contradiction is settled by comparing the
-parallel figure with the sequential one: if they match, the deficit is uniform,
-which makes it code quality rather than parallelisation and is precisely why it
-cancels in the self-relative ratio.
-
-A named kernel that stops reproducing is **not** treated as a failure — it
-usually means the sentence in the paper has aged, which is worth knowing before
-submission. Only check 3 can exit non-zero, and only under `--strict`; the rest
-are readings, not assertions.
-
-A section that does not apply to the runtime says so rather than vanishing, so
-the numbering never has a hole in it.
-
-For the reference values themselves, and the numbers the paper states exactly,
-see [`reference/`](reference/).
+Two things worth knowing while reading the table, neither of which the script
+will decide for you. An absolute speedup does not survive a change of CPU, so
+`ours/fig` moving is expected on a reviewer's machine — `fig<n>_nat` is there
+precisely so the native bar can be checked for the same shift. And a backend
+that emits slower code shows up in `opt_vs_native` while `ours/nat` stays near
+1.000, because each speedup is taken against that compiler's own sequential
+run, so a uniform deficit is in both halves of the fraction.
 
 `run_performance.sh` builds a 2×2 matrix per kernel and times each cell with
 PolyBench's cycle-accurate TSC timer:
@@ -774,6 +777,7 @@ See [PULP / gvsoc](#pulp--gvsoc-runtimepmsis) for what these drive.
 | `PULP_BUILD_BIN` | `BUILD/GAP8_V3/GCC_RISCV_PULPOS/test` | linked ELF relative to `PULP_APP_DIR`, used for the size columns |
 | `PULP_POLYBENCH_DEFS` | `-DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME` | defines baked into the opt `kernel.o`; **must match** the harness Makefile's native builds |
 | `PULP_VERBOSE`   | `0`     | `1` → stream the make/gvsoc output instead of logging it |
+| `PULP_KEEP_TMP`  | `0`     | `1` → keep the intermediate `.cir`/`.mlir` of each cell |
 | `CIR_UNROLL_PASS` | *auto-detected* | `run_unroll.sh` only: the `cir-opt` unrolling pass. Found in `cir-opt --help` when it is there; set this when it is spelled unexpectedly |
 | `ALL`            | `false` | `run_unroll.sh` only: run the whole suite instead of the 11 kernels Figure 8 plots |
 

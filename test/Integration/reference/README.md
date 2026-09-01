@@ -101,13 +101,17 @@ python3 ../lib/compare_to_reference.py \
   ../results/libgomp/results_performance.csv --runtime libgomp
 ```
 
-Note what that comparison can and cannot tell you. These figures were measured
-on the machine in §4.1, and an absolute speedup does not survive a change of
-CPU — a kernel reaching 8x there and 5x on a reviewer's machine means nothing is
-wrong. What does transfer is the relationship between the two bars, which is a
-property of the compiler and is what the paper actually claims. The comparison
-is ordered accordingly: the checks that survive a change of machine come first,
-and the absolute one is reported last and labelled as orientation.
+It prints one line per kernel: the run's own two speedups and their ratio, the
+two the figure plots and the ratio against those, and on `pmsis` the size
+change here and in Figure 7. Then every claim about that runtime with the run's
+number beside it. It labels nothing as close, acceptable or at parity — the
+columns are put side by side and the reading is the reviewer's.
+
+Worth knowing while reading it: these figures were measured on the machine in
+§4.1, and an absolute speedup does not survive a change of CPU — a kernel
+reaching 8x there and 5x on a reviewer's machine means nothing is wrong. That
+is why the native bar is printed too: if it moved by the same factor, the
+machine moved, not the compiler.
 
 ## Configuration the numbers assume
 

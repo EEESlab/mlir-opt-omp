@@ -283,5 +283,10 @@ echo "  so what the pass did is a diff away:"
 echo "    diff <(grep -c . *_omp-on.ll) <(grep -c . *_omp-on_unrolled.ll)"
 echo "  Done — $CSV"
 
-[ "$FAILED" -ne 0 ] && { echo "  some kernels failed (PULP_VERBOSE=1 for the tool output)"; exit 1; }
+[ "$FAILED" -ne 0 ] && {
+    echo "  some kernels failed: the failing tool wrote its message into the"
+    echo "  cell's log above. PULP_KEEP_TMP=1 keeps the intermediate .cir/.mlir"
+    echo "  so the step can be rerun by hand; PULP_VERBOSE=1 streams make/gvsoc."
+    exit 1
+}
 exit 0

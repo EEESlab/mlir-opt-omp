@@ -47,6 +47,9 @@ PULP_LLC_FLAGS="${PULP_LLC_FLAGS:--O3 -mtriple=riscv32-unknown-elf -mattr=+m,+c,
 PULP_BUILD_BIN="${PULP_BUILD_BIN:-BUILD/GAP8_V3/GCC_RISCV_PULPOS/test}"
 PULP_POLYBENCH_DEFS="${PULP_POLYBENCH_DEFS:--DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME -DDATA_TYPE_IS_FLOAT}"
 PULP_VERBOSE="${PULP_VERBOSE:-0}"            # 1: stream make/gvsoc output
+# 1: keep the per-cell scratch directory (the .cir and every .mlir between it
+# and the object) instead of deleting it, so a failing step can be rerun by hand.
+PULP_KEEP_TMP="${PULP_KEEP_TMP:-0}"
 # A cir-opt pass to run on the CIR before --cir-to-llvm. Empty here and set
 # per cell by run_unroll.sh, the same way run_performance.sh sets
 # BARRIER_ELIM_FLAG for the mlir-opt-omp call below.
@@ -75,6 +78,15 @@ pulp_extract_dump() {
     tr -d '\r' < "$1" | sed -n '/==BEGIN DUMP_ARRAYS==/,/==END DUMP_ARRAYS==/p'
 }
 
+# Drop the scratch directory, or say where it is when asked to keep it.
+pulp_drop_tmp() {
+    if [ "$PULP_KEEP_TMP" = "1" ]; then
+        echo "  intermediates kept in $1"
+    else
+        rm -rf "$1"
+    fi
+}
+
 # compile_pulp_kernel_obj <src> <outdir> <omp:on|off>
 compile_pulp_kernel_obj() {
     local src="$1" outdir="$2" omp="${3:-on}"
@@ -93,7 +105,7 @@ compile_pulp_kernel_obj() {
         -Xclang -fclangir -Xclang -emit-cir $omp_cir $WARN_SUPPRESS \
         -I"$INC" -I"$(dirname "$src")" -I"$INC_OMP" \
         -DPULP_TARGET -D"$DATASET" $PULP_POLYBENCH_DEFS \
-        "$src" -o "$tmpdir/$name.cir" || { rm -rf "$tmpdir"; return 1; }
+        "$src" -o "$tmpdir/$name.cir" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 2) CIR -> LLVM dialect MLIR (strip residual cir.* attrs). A CIR-level
     #    pass, when one was asked for, runs here: on the CIR, while it is
@@ -101,7 +113,7 @@ compile_pulp_kernel_obj() {
     "$CIR_OPT" "$tmpdir/$name.cir" \
         ${CIR_UNROLL_FLAG:+$CIR_UNROLL_FLAG} \
         --cir-to-llvm --reconcile-unrealized-casts \
-        -o "$tmpdir/$name-s1.mlir" || { rm -rf "$tmpdir"; return 1; }
+        -o "$tmpdir/$name-s1.mlir" || { pulp_drop_tmp "$tmpdir"; return 1; }
     sed -i -E 's/cir\.[^,}]+,? ?//g' "$tmpdir/$name-s1.mlir"
 
     # 3) custom OMP lowering (pmsis rules)
@@ -112,28 +124,28 @@ compile_pulp_kernel_obj() {
         ${BARRIER_ELIM_FLAG:+$BARRIER_ELIM_FLAG} \
         --omp-to-omp-lower --omp-outline --omp-lower-plan \
         "$tmpdir/$name-s1.mlir" > "$tmpdir/$name-s2.mlir" \
-        || { rm -rf "$tmpdir"; return 1; }
+        || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 4) minimal conversion to the LLVM dialect (no canonicalise/cse pipeline
     #    here — mirrors the proven pulp flow)
     "$MLIR_OPT" "$tmpdir/$name-s2.mlir" \
         --convert-arith-to-llvm --convert-func-to-llvm \
         --reconcile-unrealized-casts \
-        -o "$tmpdir/$name-s3.mlir" || { rm -rf "$tmpdir"; return 1; }
+        -o "$tmpdir/$name-s3.mlir" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 5) MLIR -> LLVM IR
     "$MLIR_TRANSLATE" "$tmpdir/$name-s3.mlir" --mlir-to-llvmir \
-        > "$tmpdir/$name.ll" || { rm -rf "$tmpdir"; return 1; }
+        > "$tmpdir/$name.ll" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 6) opt (riscv-capable install), 7) llc -> riscv32 object for the harness
     "$PULP_OPT" $PULP_OPT_FLAGS -S "$tmpdir/$name.ll" -o "$tmpdir/$name.opt.ll" \
-        || { rm -rf "$tmpdir"; return 1; }
+        || { pulp_drop_tmp "$tmpdir"; return 1; }
     "$PULP_LLC" $PULP_LLC_FLAGS -filetype=obj "$tmpdir/$name.opt.ll" \
-        -o "$PULP_APP_DIR/kernel.o" || { rm -rf "$tmpdir"; return 1; }
+        -o "$PULP_APP_DIR/kernel.o" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     cp "$tmpdir/$name.opt.ll" \
         "$outdir/${name}_omp-${omp}${CIR_UNROLL_FLAG:+_unrolled}.ll"
-    rm -rf "$tmpdir"
+    pulp_drop_tmp "$tmpdir"
     [ -f "$PULP_APP_DIR/kernel.o" ]
 }
 
@@ -148,7 +160,8 @@ pulp_cell() {
         opt_seq|opt_par)
             local omp="off"; [ "$cell" = "opt_par" ] && omp="on"
             compile_pulp_kernel_obj "$src" "$outdir" "$omp" >> "$logfile" 2>&1 \
-                || { echo "  ERROR: kernel.o pipeline failed — see $logfile" >&2; return 1; }
+                || { echo "  ERROR: kernel.o pipeline failed — last lines of $logfile:" >&2
+                     tail -n 8 "$logfile" >&2; return 1; }
             mk+=(OMP_OPT=1)
             ;;
         *) echo "pulp_cell: bad cell '$cell'" >&2; return 1 ;;
