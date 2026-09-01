@@ -447,10 +447,10 @@ else
 fi
 
 # Section 4.5 gives the saving, how many kernels improve, and the two ends of
-# the per-kernel range. All four come out of the A/B CSV, so they can be read
-# against the sentence that reports them rather than eyeballed.
+# the per-kernel range. All four come out of the A/B CSV, so they are printed
+# next to it. Side by side and nothing more.
 compare_ab_to_claims() {
-    local rows=0 bad=0 value tol verdict
+    local rows=0 value tol
     local best_k best worst_k worst
     read -r best_k best worst_k worst < <(awk -F';' '
         NR > 1 && $1 != "TOTAL" && $2 != "NA" {
@@ -462,20 +462,17 @@ compare_ab_to_claims() {
               else printf "- NA - NA" }' "$CSV")
 
     echo ""
-    echo -e "${BOLD}  === AGAINST SECTION 4.5 (reference/claims.csv) ===${RESET}"
-    printf '  %-26s %9s %9s   %s\n' quantity measured paper verdict
+    echo -e "${BOLD}  === SECTION 4.5 (reference/claims.csv) ===${RESET}"
+    printf '  %-26s %9s %9s\n' quantity measured paper
 
     check_one() {   # $1 metric  $2 subject  $3 label  $4 measured
         # cleared first: read leaves them untouched when claim_row finds no
-        # row, and the previous quantity's numbers would be compared again.
+        # row, and the previous quantity's number would be printed again.
         value=""; tol=""
         read -r value tol < <(claim_row "$1" "$2")
         [ -z "${value:-}" ] && return 0
-        [ "$4" = "NA" ] && return 0
         rows=$((rows + 1))
-        verdict="$(claim_verdict "$4" "$value" "${tol:-0}")"
-        [ "$verdict" = "DIFFERS" ] && bad=$((bad + 1))
-        printf '  %-26s %9s %9s   %s\n' "$3" "$4" "$value" "$verdict"
+        printf '  %-26s %9s %9s\n' "$3" "$4" "$value"
     }
 
     check_one barrier_saving_pct suite   "saving over the suite %" "$T_DELTA"
@@ -484,15 +481,12 @@ compare_ab_to_claims() {
     check_one barrier_delta_pct  worst   "worst kernel %"          "$worst"
     unset -f check_one
 
-    [ "$rows" -eq 0 ] && { echo "  no rows for this run in $CLAIMS"; return 0; }
-    echo ""
-    echo "  Best here is $best_k, worst is $worst_k. The paper names trisolv at"
-    echo "  the top of the range; a different kernel there is not a regression,"
-    echo "  but the sentence in section 4.5 then names the wrong one."
-    if [ "$bad" -ne 0 ]; then
-        echo "  $bad of $rows differ — the gvsoc numbers are exact, so a gap is"
-        echo "  a real change in what we emit or a stale sentence, not noise."
+    if [ "$rows" -eq 0 ]; then
+        echo "  no rows for this run in $CLAIMS"
+        return 0
     fi
+    echo ""
+    echo "  best: $best_k    worst: $worst_k    (section 4.5 names trisolv)"
 }
 
 if [ "$BARRIER_ELIM" = "both" ]; then

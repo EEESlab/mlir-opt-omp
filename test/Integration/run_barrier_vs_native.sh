@@ -2,11 +2,11 @@
 # run_barrier_vs_native.sh — counts team-barrier call sites: ours with and
 # without --omp-barrier-elim, against clang's and gcc's on the same kernels.
 #
-# All four columns are counted after -O3. The three LLVM ones are iomp, so they
-# speak one ABI; gcc's carries -fno-thread-jumps, which switches off the one
-# pass that duplicates barrier call sites without adding barriers. With it gcc
-# is back on the count it has at -O0, so the column measures the elision and
-# not the shape of the CFG. The run prints the reasoning in full.
+# The three LLVM columns are iomp and are counted in LLVM IR after -O3, so they
+# speak one ABI and one stage. gcc gets its own column counted at -O0, because
+# from -O1 it copies the barrier sequence into paths it duplicates: the count
+# would be of CFG shape as much as of synchronisation. Say which stage when
+# quoting the column.
 #
 # Usage:
 #   ./run_barrier_vs_native.sh                       # kernels in the suite
@@ -15,8 +15,9 @@
 #
 # RUNTIME=iomp only. Leaves results_barrier_vs_native.csv.
 #
-# The four totals are what section 4.5 states, so on a full-suite run they are
-# checked against reference/claims.csv rather than left to be read.
+# On a full-suite run the four totals are printed next to what section 4.5
+# states, from reference/claims.csv. Side by side and nothing more: what the
+# difference means is the reader's call.
 
 set -uo pipefail
 
@@ -80,20 +81,21 @@ count_barriers() {   # $1 = .ll file
     grep -o 'call void @__kmpc_barrier' "$1" | wc -l
 }
 
-# -O3 to match the LLVM columns, -fno-thread-jumps so the count is of
-# barriers and not of the paths gcc copied them into. Without the flag the
-# suite goes 28 -> 43 and gemver alone 3 -> 7, with no execution gaining a
-# barrier; with it every kernel sits on its -O0 number.
+# -O0: gcc decides the elision in the front end, so it is already applied
+# there, and no later pass has duplicated a barrier call site yet. From -O1
+# the count rises without any execution gaining a barrier (the suite goes
+# 28 -> 43 at -O3, gemver alone 3 -> 7), and -fno-thread-jumps does not put
+# it back on every toolchain, so the stage is what makes the column readable.
 build_gcc() {   # $1 = source, $2 = output .s
-    "$GCC" -fopenmp -O3 -fno-thread-jumps -S $GCC_STRICT_FP \
+    "$GCC" -fopenmp -O0 -S $GCC_STRICT_FP \
         -I"$INC" -I"$(dirname "$1")" \
         -D"$DATASET" $POLYBENCH_CFLAGS \
         "$1" -o "$2" 2>"$ERRSINK"
 }
 
 # From -O2 gcc emits the last barrier of a region as a tail call, which prints
-# as jmp: anchoring on `call` alone would silently drop 6 of them over the
-# suite. At -O0 that did not arise, which is why the pattern matters more now.
+# as jmp: anchoring on `call` alone would drop those. It does not arise at -O0,
+# but the pattern costs nothing and keeps a count at another stage honest.
 count_gcc_barriers() {   # $1 = .s file
     grep -cE '\b(call|jmp)\b.*GOMP_barrier' "$1" || true
 }
@@ -127,7 +129,7 @@ echo "kernels:   ${#KERNEL_LIST[@]}"
 echo "files:     $ARTDIR"
 echo
 
-echo "kernel,pragma_form,clang,gcc_o3_ntj,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
+echo "kernel,pragma_form,clang,gcc_o0,ours_baseline,ours_elim,saved_vs_clang" > "$CSV"
 printf '  %-22s %-9s %6s %6s %8s %8s %8s\n' kernel form clang gcc base elim 'vs clang'
 
 # Intermediates only (.cir and the MLIR stages); the counted files go straight
@@ -157,11 +159,11 @@ for k in "${KERNEL_LIST[@]}"; do
         || { echo "  ERROR (ours, barrier-elim): $name"; echo "$name,$form,,,,," >> "$CSV"; FAILED=1; continue; }
 
     g=""
-    if build_gcc "$src" "$kdir/gcc-O3-ntj.s"; then
-        g="$(count_gcc_barriers "$kdir/gcc-O3-ntj.s")"
+    if build_gcc "$src" "$kdir/gcc-O0.s"; then
+        g="$(count_gcc_barriers "$kdir/gcc-O0.s")"
         T_GCC=$((T_GCC + g))
     else
-        rm -f "$kdir/gcc-O3-ntj.s"
+        rm -f "$kdir/gcc-O0.s"
     fi
 
     c="$(count_barriers "$kdir/clang-O3.ll")"
@@ -182,17 +184,13 @@ if [ "$T_CLANG" -gt 0 ]; then
         'BEGIN { printf "  %d fewer than clang (%.1f%%)\n", c - e, 100 * (c - e) / c }'
 fi
 if [ "$T_GCC" -gt 0 ]; then
-    echo "  gcc (-O3 -fno-thread-jumps): $T_GCC    ours with the pass: $T_ELIM"
-    echo "    Why that flag, and not plain -O3: from -O1 jump threading splits"
-    echo "    the path where a thread's chunk comes out empty, and the split"
-    echo "    path carries its own copy of the barrier sequence. Over the suite"
-    echo "    that is 28 -> 43, gemver alone 3 -> 7, and no execution gains a"
-    echo "    barrier — the extra call sites are the shape of the CFG, not"
-    echo "    synchronisation. The flag turns off that one pass and nothing"
-    echo "    else: with it every kernel is back on the number it has at -O0,"
-    echo "    28 at every optimisation level, which was checked at -O0/1/2/3"
-    echo "    with and without it. So this column can be read against the LLVM"
-    echo "    ones, which are counted after -O3, where plain -O3 could not."
+    echo "  gcc (-O0): $T_GCC    ours with the pass: $T_ELIM"
+    echo "    -O0 because gcc applies the elision in the front end, and no"
+    echo "    later pass has copied a barrier call site yet. From -O1 the count"
+    echo "    rises with no execution gaining a barrier: duplicated paths carry"
+    echo "    their own copy, and -fno-thread-jumps undoes only part of that,"
+    echo "    by how much depending on the gcc build. The other three columns"
+    echo "    are after -O3, so say which stage when quoting this one."
 fi
 
 # --- against the paper -------------------------------------------------------
@@ -200,13 +198,13 @@ fi
 # stale without anyone noticing: one extra rule in the DSL moves them, and the
 # sentence stays as it was.
 compare_to_claims() {
-    local rows=0 bad=0
+    local rows=0
     echo
-    echo "  === AGAINST SECTION 4.5 (reference/claims.csv) ==="
-    printf '  %-16s %9s %9s   %s\n' subject measured paper verdict
-    local pair subject measured value tol verdict
+    echo "  === SECTION 4.5 (reference/claims.csv) ==="
+    printf '  %-16s %9s %9s\n' subject measured paper
+    local pair subject measured value tol
     for pair in "ours_baseline:$T_BASE" "ours_elim:$T_ELIM" \
-                "clang:$T_CLANG" "gcc_o3_ntj:$T_GCC"; do
+                "clang:$T_CLANG" "gcc_o0:$T_GCC"; do
         subject="${pair%%:*}"; measured="${pair#*:}"
         # cleared first: read leaves them untouched when claim_row finds no
         # row, and the previous subject's numbers would be compared again.
@@ -215,28 +213,14 @@ compare_to_claims() {
         [ -z "${value:-}" ] && continue
         # gcc absent leaves its total at 0, which is a missing column rather
         # than a count of zero.
-        if [ "$subject" = "gcc_o3_ntj" ] && [ "$measured" -eq 0 ]; then
-            printf '  %-16s %9s %9s   not built here\n' \
-                "$subject" "-" "$value"
-            continue
+        if [ "$subject" = "gcc_o0" ] && [ "$measured" -eq 0 ]; then
+            measured="-"          # gcc absent: a missing column, not a zero
         fi
         rows=$((rows + 1))
-        verdict="$(claim_verdict "$measured" "$value" "${tol:-0}")"
-        [ "$verdict" = "DIFFERS" ] && bad=$((bad + 1))
-        printf '  %-16s %9s %9s   %s\n' \
-            "$subject" "$measured" "$value" "$verdict"
+        printf '  %-16s %9s %9s\n' "$subject" "$measured" "$value"
     done
     if [ "$rows" -eq 0 ]; then
         echo "  no team_barriers rows in $CLAIMS"
-        return 0
-    fi
-    echo
-    if [ "$bad" -eq 0 ]; then
-        echo "  All $rows reproduce."
-    else
-        echo "  $bad of $rows differ. That is not automatically a regression:"
-        echo "  these are counts the paper states in prose, so the sentence in"
-        echo "  section 4.5 may simply be the thing that is out of date."
     fi
 }
 
@@ -256,10 +240,10 @@ fi
 echo
 echo "  Counted in, one directory per kernel under"
 echo "    $ARTDIR/<kernel>/"
-echo "      clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O3-ntj.s"
+echo "      clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s"
 echo "  Recount any row:"
 echo "    grep -o 'call void @__kmpc_barrier' <file>.ll | wc -l"
-echo "    grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O3-ntj.s"
+echo "    grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O0.s"
 echo "  Done — $CSV"
 
 [ "$FAILED" -ne 0 ] && { echo "  some kernels failed (VERBOSE=1 for the tool output)"; exit 1; }

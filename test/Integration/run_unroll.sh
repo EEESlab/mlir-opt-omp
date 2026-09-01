@@ -228,7 +228,7 @@ summarise() {
     ' "$CSV")
 
     echo
-    echo "  === AGAINST SECTION 4.5 (reference/claims.csv) ==="
+    echo "  === SECTION 4.5 (reference/claims.csv) ==="
     printf '  %-26s %10s %10s %10s\n' quantity measured paper diff
 
     local rows=0 value
@@ -253,14 +253,14 @@ summarise() {
         echo "  the paper gives a number of its own."
     fi
 
-    # Per kernel against the figure itself. The published values are exact, and
-    # unlike a host speedup they were taken on a simulator anyone can rerun, so
-    # this comparison is worth making kernel by kernel rather than in aggregate.
+    # Per kernel against the figure itself: the published values are exact, and
+    # were taken on a simulator anyone can rerun, so the comparison is worth
+    # making kernel by kernel rather than in aggregate.
     local pairs
     pairs="$(awk -F';' 'NR > 1 && $4 != "NA" && $5 != "" { print }' "$CSV")"
     [ -z "$pairs" ] && return 0
     echo
-    echo "  === AGAINST FIGURE 8 ITSELF (reference/reference.csv) ==="
+    echo "  === FIGURE 8 (reference/reference.csv) ==="
     printf '  %-20s %11s %11s %11s\n' kernel here published diff
     echo "$pairs" | awk -F';' '
         { printf "  %-20s %11.2f %11.2f %11.2f\n",

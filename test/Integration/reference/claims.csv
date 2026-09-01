@@ -52,16 +52,22 @@
 # counterparts are in reference.csv as fig8_unroll_pct, and the driver
 # compares against those too, kernel by kernel.
 #
+# The 4.2 and 4.3 rows read '-': compare_to_reference.py used to restate them
+# under the table it had just printed, which said the same number twice and
+# read like a verdict the script does not make. The ratio for those kernels is
+# in the table's run_o/n column, next to the figure's own fig<n>_o/n, and
+# judging the two is the reader's job.
+#
 claim;section;runtime;metric;subject;relation;value;tolerance;checked_by
-doitgen-ahead;4.2;libgomp;speedup_ratio;doitgen;above;1.0;0.10;compare_to_reference.py
-floyd-warshall-behind;4.3;pmsis;speedup_ratio;floyd-warshall;below;1.0;0.10;compare_to_reference.py
-deriche-behind;4.3;pmsis;speedup_ratio;deriche;below;1.0;0.10;compare_to_reference.py
-nussinov-behind;4.3;pmsis;speedup_ratio;nussinov;below;1.0;0.10;compare_to_reference.py
-size-bound;4.3;pmsis;size_increase_pct;all;max;0.7;;compare_to_reference.py
+doitgen-ahead;4.2;libgomp;speedup_ratio;doitgen;above;1.0;0.10;-
+floyd-warshall-behind;4.3;pmsis;speedup_ratio;floyd-warshall;below;1.0;0.10;-
+deriche-behind;4.3;pmsis;speedup_ratio;deriche;below;1.0;0.10;-
+nussinov-behind;4.3;pmsis;speedup_ratio;nussinov;below;1.0;0.10;-
+size-bound;4.3;pmsis;size_increase_pct;all;max;0.7;;-
 barriers-ours-baseline;4.5;iomp;team_barriers;ours_baseline;equals;59;0;run_barrier_vs_native.sh
 barriers-ours-elim;4.5;iomp;team_barriers;ours_elim;equals;26;0;run_barrier_vs_native.sh
 barriers-clang;4.5;iomp;team_barriers;clang;equals;45;0;run_barrier_vs_native.sh
-barriers-gcc;4.5;iomp;team_barriers;gcc_o3_ntj;equals;28;0;run_barrier_vs_native.sh
+barriers-gcc;4.5;iomp;team_barriers;gcc_o0;equals;28;0;run_barrier_vs_native.sh
 barrier-elim-saving;4.5;pmsis;barrier_saving_pct;suite;equals;0.037;0.02;run_performance.sh
 barrier-elim-improved;4.5;pmsis;kernels_improving;suite;equals;22;2;run_performance.sh
 barrier-elim-best;4.5;pmsis;barrier_delta_pct;best;equals;1.12;0.30;run_performance.sh

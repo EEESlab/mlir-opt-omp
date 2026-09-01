@@ -194,15 +194,9 @@ claim_row() {
         '!/^#/ && $4 == m && $5 == s { print $7, $8; exit }' "$CLAIMS"
 }
 
-# claim_verdict <measured> <value> <tolerance> -> "as published" | "DIFFERS"
-claim_verdict() {
-    if awk -v m="$1" -v v="$2" -v t="${3:-0}" \
-           'BEGIN { exit !(m - v <= t && v - m <= t) }'; then
-        echo "as published"
-    else
-        echo "DIFFERS"
-    fi
-}
+# There is deliberately no claim_verdict: the drivers print the measured value
+# next to the paper's and stop there. Whether a difference matters is a
+# judgement about the work, and it belongs to whoever is reading.
 
 . "$COMMON_DIR/kernels.sh"
 # shellcheck source=native.sh

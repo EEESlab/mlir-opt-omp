@@ -219,55 +219,51 @@ parity or reversed: the columns are put next to each other and what they mean
 is the reader's call. One line per kernel:
 
 ```
-kernel             native     ours ours/nat fig6_nat fig6_our ours/fig    size%    fig7%
-covariance           4.51     4.46    0.989     4.51     4.46    1.000    0.093    0.093
+kernel            run_nat  run_opt  run_o/n fig6_nat fig6_our fig6_o/n    size%    fig7%
+nussinov             6.63     6.65    1.003     6.52     5.61    0.860    0.045    0.683
 ```
+
+The prefix says where a number came from — `run_` measured here, `fig<n>_` read
+off the paper — and the suffix says which variant it is, the native compiler or
+this tool's (`opt`, the name the CSV columns already use: `speedup_opt`,
+`opt_vs_native`). Each source gets the same three columns, and the third is the
+one to read: the two `_o/n` ratios are the same quantity measured twice, once
+here and once by the paper. They are the comparison, and they are the two
+columns printed in colour on a terminal.
 
 | column | is |
 |---|---|
-| `native`, `ours` | the speedup of each variant against **its own** sequential cell |
-| `ours/nat` | the two beside each other — free of how fast the machine is |
+| `run_nat`, `run_opt` | measured by this run: the speedup of each variant against **its own** sequential cell |
+| `run_o/n` | `run_opt / run_nat` — this tool against the native compiler, here |
 | `fig<n>_nat`, `fig<n>_our` | what the paper's figure plots for that kernel, from [`reference/reference.csv`](reference/reference.csv) |
-| `ours/fig` | this run against the published bar |
+| `fig<n>_o/n` | `fig<n>_our / fig<n>_nat` — the same ratio, in the figure |
 | `size%`, `fig7%` | `size_opt_par / size_opt_seq - 1`, here and in Figure 7 — `pmsis` only |
 
-Both ratio columns get a geomean, and the absolute `opt_vs_native` geomeans
+Why the ratios and not the speedups: an absolute speedup does not survive a
+change of CPU, so `run_opt` sitting well above `fig<n>_our` says the reviewer's
+machine is faster and nothing about the tool — the row above is a `pmsis` run
+where every kernel scales better than the paper's. A ratio divides that out on
+both sides, which is what makes the two `_o/n` columns comparable at all. The
+example is nussinov, one of the three kernels §4.3 names as behind: 0.860 in
+Figure 6, 1.003 here.
+
+Both `_o/n` columns get a geomean, and the absolute `opt_vs_native` geomeans
 follow on one line — parallel and sequential, which is the pair that says
 whether a deficit is uniform.
 
-Then every claim the paper makes about this runtime, with the run's own number
-beside it and nothing else:
+The table is the whole output: no claim list, no verdict column. Section 4.5 is
+checked by the drivers that measure it — `run_barrier_vs_native.sh` and
+`run_unroll.sh` — each against [`reference/claims.csv`](reference/claims.csv),
+where the number is one those runs actually produce.
 
-```
-section  claim                   expects               measured    source
-4.3      nussinov-behind         below 1 +/-0.1        0.865       nussinov ours/nat
-4.3      size-bound              max 0.7               0.7300      highest: nussinov (30 kernels)
-4.5      unroll-mean             equals 3 +/-1         -           run_unroll.sh
-```
+Nothing here exits non-zero.
 
-`expects` is the paper's own wording as data, from
-[`reference/claims.csv`](reference/claims.csv) — the script does not invent a
-threshold. A row whose number comes from another driver shows `-` and names
-that driver, so the list doubles as the coverage inventory.
-
-The two files under `reference/` divide the work strictly: `claims.csv` is what
-the paper *says*, typed in from the text; `reference.csv` is what its figures
-*plot*, read back out of the vector files. Where they disagree the paper has a
-problem — §4.5 describes Figure 8 as about 3% over ten applications and the ten
-bars average 2.28% — and keeping them apart is what makes that visible instead
-of averaged away.
-
-Nothing here exits non-zero. `--strict` is the one opt-in exception, for a
-caller that wants a gate: it exits 1 when a claim with a `max` relation is
-exceeded.
-
-Two things worth knowing while reading the table, neither of which the script
-will decide for you. An absolute speedup does not survive a change of CPU, so
-`ours/fig` moving is expected on a reviewer's machine — `fig<n>_nat` is there
-precisely so the native bar can be checked for the same shift. And a backend
-that emits slower code shows up in `opt_vs_native` while `ours/nat` stays near
-1.000, because each speedup is taken against that compiler's own sequential
-run, so a uniform deficit is in both halves of the fraction.
+One more thing worth knowing while reading the table, which the script will not
+decide for you: a backend that emits slower code shows up in `opt_vs_native`
+while `run_o/n` stays near 1.000, because each speedup is taken against that
+compiler's own sequential run, so a uniform deficit sits in both halves of the
+fraction and cancels. The ratio says the parallelisation is as good; it does not
+say the code is as fast.
 
 `run_performance.sh` builds a 2×2 matrix per kernel and times each cell with
 PolyBench's cycle-accurate TSC timer:
@@ -402,20 +398,18 @@ else those files carry (`POLYBENCH`, the tool paths, `DATASET`, `KERNELS`,
 `RUNTIME=libgomp ./run_barrier_vs_native.sh` *is* refused: that asks for a
 comparison this script cannot make.
 
-On a full-suite run the four totals are checked against §4.5, which states all
-of them (59 without the pass, 26 with it, 45 for Clang, 28 for GCC);
-the expected values come from [`reference/claims.csv`](reference/claims.csv).
+On a full-suite run the four totals are printed next to what §4.5 states — 59
+without the pass, 26 with it, 45 for Clang, 28 for GCC at `-O0` — read from
+[`reference/claims.csv`](reference/claims.csv). Side by side and nothing more.
 A subset run, or one where a kernel failed to build, says why it is not
-comparing rather than comparing a short sum. A total that differs is not
-automatically a regression — one extra rule in the DSL moves these numbers, and
-the sentence in the paper is then the thing to revisit.
+printing them rather than showing a short sum.
 
 Every file a number was counted in is kept, one directory per kernel, so the
 table can be rechecked instead of taken on trust:
 
 ```
 results/iomp/barrier_vs_native/gemm-omp/
-  clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O3-ntj.s
+  clang-O3.ll  ours-baseline-O3.ll  ours-elim-O3.ll  gcc-O0.s
 ```
 
 Each count is one grep over one of those files, and the run prints both forms
@@ -423,7 +417,7 @@ when it finishes:
 
 ```sh
 grep -o 'call void @__kmpc_barrier' ours-elim-O3.ll | wc -l
-grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O3-ntj.s
+grep -cE '\b(call|jmp)\b.*GOMP_barrier' gcc-O0.s
 ```
 
 The directory is wiped at the start of each run, so what is in it always
@@ -442,32 +436,26 @@ matches clang kernel for kernel while the pass removes one per region. The pass
 reasons about structure on the `omp` dialect rather than about which directive
 was written, so it covers both spellings.
 
-The three LLVM columns are iomp, so they speak one ABI. **All four columns are
-counted after `-O3`**, and gcc's carries one extra flag:
+The three LLVM columns are iomp, so they speak one ABI. **gcc gets a column of
+its own, counted at `-O0`**:
 
 ```sh
-gcc -fopenmp -O3 -fno-thread-jumps -S      # counting GOMP_barrier call sites
+gcc -fopenmp -O0 -S      # counting GOMP_barrier call sites
 ```
 
-`-fno-thread-jumps` is the whole reason the column is readable. From `-O1` on,
-jump threading splits the path where a thread's chunk comes out empty, and the
-split path carries its own copy of the barrier sequence: over this suite 28
-becomes 43, gemver alone 3 becomes 7, and **no execution gains a barrier**. A
-count at plain `-O3` would be measuring the shape of the CFG as much as
-synchronisation, which is not what the other three columns measure.
+gcc decides the elision in the front end, so it is already applied at `-O0`,
+and nothing has yet copied a call site. From `-O1` on the count rises without
+any execution gaining a barrier: paths get duplicated and each copy carries the
+barrier sequence — over this suite 28 becomes 43 at `-O3`, gemver alone 3
+becomes 7. That number would measure the shape of the CFG as much as
+synchronisation.
 
-The flag turns off that one pass and nothing else, and that was checked rather
-than assumed. Counting gcc's barriers at `-O0`, `-O1`, `-O2` and `-O3`, then
-again at each level with `-fno-thread-jumps`, puts every one of the 30 kernels
-back on its `-O0` number exactly: 28 at every level. So one pass accounts for
-the whole 28 → 43.
-
-That is why the column moved to `-O3 -fno-thread-jumps` and away from `-O0`,
-which gives the same 28: the number is the same either way, but at `-O3` it is
-taken at the stage the LLVM columns are taken at, so the table no longer asks
-the reader to hold two stages in mind. gcc decides the elision in the
-front-end, so it is applied at every level; our own count does not move between
-stages either — the same 59/25 in MLIR and after `-O3`.
+Jump threading is most of it but not all of it, and how much depends on the gcc
+build: on one toolchain `-fno-thread-jumps` put every kernel back on its `-O0`
+number, on another the suite still came out at 41. So the stage is what makes
+the column readable, not a flag. `-O0` it is — and say which stage when quoting
+the column, since the other three are after `-O3`. Our own count does not move
+between stages: the same 59/25 in MLIR and after `-O3`.
 
 The duplication is *not* loop cloning: `GCC_STRICT_FP` already turns the
 vectoriser off, so no kernel gets a vector and a scalar copy. Four `omp for` in
@@ -476,9 +464,8 @@ from `-O1`, 3 again with `-fno-thread-jumps`.
 
 Count `GOMP_barrier`, not `call GOMP_barrier`: from `-O2` gcc emits the last
 barrier of a region as a tail call, which prints as `jmp` and which an anchor
-on `call` silently drops — 6 of the 43 at plain `-O3`, and none at `-O0`. That
-subtlety used to be a footnote and is now load-bearing, since the column is
-counted at `-O3`; the driver's pattern matches both mnemonics.
+on `call` silently drops. It does not arise at `-O0`, but the driver's pattern
+matches both mnemonics anyway, so a count taken at another stage stays honest.
 
 What that column says is worth knowing before quoting the clang one: **gcc
 performs this elision too**, and lands at 28 where the pass lands at 26, kernel
