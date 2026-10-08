@@ -47,13 +47,13 @@ Which one you need depends on whether you want to compile **from C** or to use a
 
 ClangIR is the front-end that turns C into the MLIR this tool consumes, and the
 OpenMP part of it is not upstream yet: upstream ClangIR emits `omp.parallel`
-and `omp.barrier`, while `#pragma omp for`, `parallel for` and `task` still hit
+and `omp.barrier`, while `#pragma omp for` and `parallel for` still hit
 `errorNYI`. The emission this pipeline needs lives in the **EEESlab fork**.
 
 ```sh
-git clone -b users/lucap/cir-omp-clauses \
+git clone -b users/gtagliavini/cir-unroll-by-two \
   https://github.com/EEESlab/llvm-project.git
-git -C llvm-project checkout 9be70f177d9b     # last known-good, see below
+git -C llvm-project checkout a73fc656e538     # last known-good, see below
 ```
 
 and build it with CIR enabled — the paths below are relative to the directory
@@ -74,9 +74,10 @@ cmake --build llvm-project/build
 
 Notes:
 
-- `9be70f177d9b` is the commit the C pipelines below are tested against
-  (`clang --version` then reports `23.0.0git … EEESlab/llvm-project`). Skip the
-  `git checkout` to take the branch tip instead.
+- `a73fc656e538` is the commit the C pipelines below are tested against
+  (`clang --version` then reports `23.0.0git … EEESlab/llvm-project`), and the
+  one the Docker image is built from. Skip the `git checkout` to take the
+  branch tip instead.
 - `RISCV` in `LLVM_TARGETS_TO_BUILD` is only needed for the PULP/`pmsis` target.
 - `LLVM_INSTALL_UTILS=ON` installs `FileCheck`, for Regression tests.
 - No install step is needed: step 2 works against this build tree as it is. Add

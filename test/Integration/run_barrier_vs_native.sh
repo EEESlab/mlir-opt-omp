@@ -64,7 +64,7 @@ build_ours() {
         -o "$TMPDIR/$name-s3.mlir" 2>"$ERRSINK" || return 1
     "$MLIR_TRANSLATE" "$TMPDIR/$name-s3.mlir" --mlir-to-llvmir \
         > "$TMPDIR/$name.ll" 2>"$ERRSINK" || return 1
-    "$OPT" -S -O3 "$TMPDIR/$name.ll" > "$out" 2>"$ERRSINK" || return 1
+    "$OPT" -S -O3 $OPT_STRICT_FP "$TMPDIR/$name.ll" > "$out" 2>"$ERRSINK" || return 1
 }
 
 # Post-O3 the call prints as `tail call void @__kmpc_barrier(...)`, so match the

@@ -55,7 +55,7 @@ compile_opt() {
         > "$tmpdir/$name.ll" || { rm -rf "$tmpdir"; return 1; }
 
     # 6) opt -O3, 7) llc -> object
-    "$OPT" -S -O3 "$tmpdir/$name.ll" > "$tmpdir/$name.opt.ll" \
+    "$OPT" -S -O3 $OPT_STRICT_FP "$tmpdir/$name.ll" > "$tmpdir/$name.opt.ll" \
         || { rm -rf "$tmpdir"; return 1; }
     "$LLC" -O3 -relocation-model=pic -filetype=obj "$tmpdir/$name.opt.ll" \
         -o "$tmpdir/$name.o" || { rm -rf "$tmpdir"; return 1; }

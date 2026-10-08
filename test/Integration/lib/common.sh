@@ -97,8 +97,8 @@ case "$DATASET" in
         ;;
 esac
 
-#export OMP_PLACES="${OMP_PLACES:-cores}"
-#export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
+export OMP_PLACES="${OMP_PLACES:-cores}"
+export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 
 POLYBENCH_ROOT_CFLAGS=""
 POLYBENCH_LFLAGS="${POLYBENCH_LFLAGS:-}"
@@ -109,6 +109,11 @@ fi
 
 CLANG_STRICT_FP="${CLANG_STRICT_FP:--ffp-contract=off -fno-vectorize -fno-slp-vectorize}"
 GCC_STRICT_FP="${GCC_STRICT_FP:--ffp-contract=off -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize}"
+# The vectorisers run in `opt`, not in the front-end: the -fno-*vectorize in
+# CLANG_STRICT_FP stops at the clang->CIR step and never reaches the opt/llc half
+# of compile_opt. Without them the reference is scalar and our binaries are not,
+# and the two cells stop being comparable.
+OPT_STRICT_FP="${OPT_STRICT_FP:--vectorize-loops=false -vectorize-slp=false}"
 
 WARN_SUPPRESS="${WARN_SUPPRESS:--Wno-ignored-attributes}"
 
