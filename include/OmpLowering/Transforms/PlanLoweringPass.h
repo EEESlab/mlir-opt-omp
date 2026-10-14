@@ -1,15 +1,5 @@
-// PlanLoweringPass.h
-//
-// Declares the MLIR pass that walks every omp_lower.construct operation and
-// replaces it with concrete func.call / llvm.call operations that target the
-// runtime library (iomp or libgomp) described in the plan attributes.
-//
-// Registration:
-//   #include "OmpLowering/Transforms/PlanLoweringPass.h"
-//   mlir::registerPlanLoweringPass();  // or add to a PassPipeline
-//
-// Usage in a pass pipeline string:
-//   mlir-opt --omp-lower-plan input.mlir
+// Replaces every omp_lower.construct with the concrete runtime calls named by
+// its plan attributes.
 
 #pragma once
 

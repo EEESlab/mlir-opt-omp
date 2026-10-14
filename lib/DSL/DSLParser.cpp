@@ -1,6 +1,4 @@
-// DSLParser.cpp
-//
-// C++ port of the lexer and parser from parser.py.
+// Lexer and parser for the rules DSL.
 
 #include "OmpLowering/DSL/DSLParser.h"
 
@@ -18,14 +16,15 @@ using llvm::make_error;
 using llvm::StringError;
 using llvm::inconvertibleErrorCode;
 
-// ===========================================================================
-// Token
-// ===========================================================================
+// --- Token ---
 
 enum class TK {
   // Keywords
-  RUNTIME, CONSTRUCT, WHEN, OTHERWISE, PRE, INVOKE, POST,
-  LET, CALL, EMIT, HAS, AND, OR, NOT, TRUE, FALSE,
+  // pre/invoke/post are deliberately NOT keywords: a block is any identifier
+  // followed by '{', which lets a construct declare first_chunk / next_chunk
+  // without a token of their own.  The evaluator rejects a name it cannot use.
+  RUNTIME, CONSTRUCT, WHEN, OTHERWISE,
+  LET, CALL, EMIT, HAS, AND, OR, NOT, TRUE, FALSE, BRANCH,
   // Punctuation
   LBRACE, RBRACE, LPAREN, RPAREN, LBRACKET, RBRACKET,
   SEMI, COMMA, EQUALS, ARROW, EQEQ, NEQ,
@@ -41,9 +40,7 @@ struct Token {
   int line, col;
 };
 
-// ===========================================================================
-// Lexer
-// ===========================================================================
+// --- Lexer ---
 
 class Lexer {
   std::string src;
@@ -119,12 +116,12 @@ class Lexer {
     static const std::unordered_map<std::string, TK> kw = {
       {"runtime",   TK::RUNTIME},   {"construct", TK::CONSTRUCT},
       {"when",      TK::WHEN},      {"otherwise", TK::OTHERWISE},
-      {"pre",       TK::PRE},       {"invoke",    TK::INVOKE},
-      {"post",      TK::POST},      {"let",       TK::LET},
+      {"let",       TK::LET},
       {"call",      TK::CALL},      {"emit",      TK::EMIT},
       {"has",       TK::HAS},       {"and",       TK::AND},
       {"or",        TK::OR},        {"not",       TK::NOT},
       {"true",      TK::TRUE},      {"false",     TK::FALSE},
+      {"branch",    TK::BRANCH},
     };
     auto it = kw.find(s);
     TK k = (it != kw.end()) ? it->second : TK::IDENT;
@@ -183,9 +180,7 @@ public:
   }
 };
 
-// ===========================================================================
-// Parser
-// ===========================================================================
+// --- Parser ---
 
 class Parser {
   std::vector<Token> toks;
@@ -193,6 +188,11 @@ class Parser {
 
   const Token &cur() const { return toks[pos]; }
   bool at(TK k) const { return cur().kind == k; }
+  // One-token lookahead, for where the next token decides how to read this one
+  // (an identifier opening a block vs a property).
+  bool at(TK k, size_t off) const {
+    return pos + off < toks.size() && toks[pos + off].kind == k;
+  }
 
   Expected<Token> expect(TK k) {
     if (!at(k))
@@ -352,7 +352,6 @@ class Parser {
   Expected<Action> parseAction() {
     if (at(TK::CALL)) {
       advance();
-      // callee: IDENT or STRING
       Expr callee;
       if (at(TK::IDENT))        callee = IdentExpr{advance().value};
       else if (at(TK::STRING))  callee = StringExpr{advance().value};
@@ -372,7 +371,16 @@ class Parser {
       advance();
       auto name = cur().value;
       if (auto e = expect(TK::IDENT); !e) return e.takeError();
-      return Action{EmitAction{name}};
+      // Optional single parenthesized argument, e.g. `emit populate_shareds(task)`.
+      std::optional<Expr> arg;
+      if (at(TK::LPAREN)) {
+        advance();
+        auto a = parseExpr();
+        if (!a) return a.takeError();
+        arg = std::move(*a);
+        if (auto e = expect(TK::RPAREN); !e) return e.takeError();
+      }
+      return Action{EmitAction{name, std::move(arg)}};
     }
     return make_error<StringError>(
       "expected 'call' or 'emit' at line " + std::to_string(cur().line),
@@ -381,7 +389,65 @@ class Parser {
 
   // ---- Statement ----------------------------------------------------------
 
+  // One arm of a `branch`: a single statement, or a braced sequence of them.
+  Expected<std::vector<Statement>> parseBranchArm() {
+    std::vector<Statement> stmts;
+    if (at(TK::LBRACE)) {
+      advance();
+      while (!at(TK::RBRACE) && !at(TK::END)) {
+        auto st = parseStatement();
+        if (!st) return st.takeError();
+        stmts.push_back(std::move(*st));
+      }
+      if (auto e = expect(TK::RBRACE); !e) return e.takeError();
+      return stmts;
+    }
+    auto st = parseStatement();
+    if (!st) return st.takeError();
+    stmts.push_back(std::move(*st));
+    return stmts;
+  }
+
   Expected<Statement> parseStatement() {
+    if (at(TK::BRANCH)) {
+      advance();
+      auto cond = parseExpr();
+      if (!cond) return cond.takeError();
+      if (auto e = expect(TK::LBRACE); !e) return e.takeError();
+
+      BranchStmt br{std::move(*cond), {}, {}};
+      bool sawTrue = false, sawFalse = false;
+      while (at(TK::TRUE) || at(TK::FALSE)) {
+        bool isTrue = at(TK::TRUE);
+        int line = cur().line;
+        advance();
+        if (auto e = expect(TK::ARROW); !e) return e.takeError();
+        auto arm = parseBranchArm();
+        if (!arm) return arm.takeError();
+        if (isTrue) {
+          if (sawTrue)
+            return make_error<StringError>(
+              "duplicate 'true' arm in branch at line " + std::to_string(line),
+              inconvertibleErrorCode());
+          sawTrue = true;
+          br.ifTrue = std::move(*arm);
+        } else {
+          if (sawFalse)
+            return make_error<StringError>(
+              "duplicate 'false' arm in branch at line " + std::to_string(line),
+              inconvertibleErrorCode());
+          sawFalse = true;
+          br.ifFalse = std::move(*arm);
+        }
+      }
+      if (auto e = expect(TK::RBRACE); !e) return e.takeError();
+      if (!sawTrue && !sawFalse)
+        return make_error<StringError>(
+          "branch needs at least a 'true' or a 'false' arm at line " +
+            std::to_string(cur().line),
+          inconvertibleErrorCode());
+      return Statement{std::move(br)};
+    }
     if (at(TK::WHEN)) {
       advance();
       auto pred = parsePredicate();
@@ -405,6 +471,20 @@ class Parser {
       auto name = cur().value;
       if (auto e = expect(TK::IDENT); !e) return e.takeError();
       if (auto e = expect(TK::EQUALS); !e) return e.takeError();
+      // `let <name> = call "<callee>"(...)` binds the call's SSA result; any
+      // other RHS is an expression binding.
+      if (at(TK::CALL)) {
+        auto act = parseAction();
+        if (!act) return act.takeError();
+        auto *ca = std::get_if<CallAction>(&*act);
+        if (!ca)
+          return make_error<StringError>(
+            "expected a call after 'let " + name + " =' at line " +
+              std::to_string(cur().line),
+            inconvertibleErrorCode());
+        if (auto e = expect(TK::SEMI); !e) return e.takeError();
+        return Statement{LetCallStmt{name, std::move(*ca)}};
+      }
       auto expr = parseExpr();
       if (!expr) return expr.takeError();
       if (auto e = expect(TK::SEMI); !e) return e.takeError();
@@ -418,11 +498,12 @@ class Parser {
 
   // ---- Construct items ----------------------------------------------------
 
+  // `<name> { <statements> }`.  Any identifier will do — the name says *when*
+  // the statements run, and which names mean something is the evaluator's
+  // business, not the parser's.
   Expected<BlockDecl> parseBlock() {
-    std::string name;
-    if (at(TK::PRE))    { name = "pre";    advance(); }
-    else if (at(TK::INVOKE)) { name = "invoke"; advance(); }
-    else { name = "post"; if (auto e = expect(TK::POST); !e) return e.takeError(); }
+    std::string name = cur().value;
+    if (auto e = expect(TK::IDENT); !e) return e.takeError();
 
     if (auto e = expect(TK::LBRACE); !e) return e.takeError();
     std::vector<Statement> stmts;
@@ -476,14 +557,18 @@ class Parser {
         auto ld = parseLetDecl();
         if (!ld) return ld.takeError();
         items.push_back(std::move(*ld));
-      } else if (at(TK::PRE) || at(TK::INVOKE) || at(TK::POST)) {
-        auto bd = parseBlock();
-        if (!bd) return bd.takeError();
-        items.push_back(std::move(*bd));
       } else if (at(TK::IDENT)) {
-        auto pd = parsePropertyDecl();
-        if (!pd) return pd.takeError();
-        items.push_back(std::move(*pd));
+        // The token after the name tells the two apart: '{' opens a block,
+        // '=' a property.
+        if (at(TK::LBRACE, 1)) {
+          auto bd = parseBlock();
+          if (!bd) return bd.takeError();
+          items.push_back(std::move(*bd));
+        } else {
+          auto pd = parsePropertyDecl();
+          if (!pd) return pd.takeError();
+          items.push_back(std::move(*pd));
+        }
       } else {
         return make_error<StringError>(
           "unexpected token in construct at line " + std::to_string(cur().line),
@@ -510,6 +595,10 @@ class Parser {
         auto cd = parseConstructDecl();
         if (!cd) return cd.takeError();
         items.push_back(std::move(*cd));
+      } else if (at(TK::IDENT)) {
+        auto pd = parsePropertyDecl();
+        if (!pd) return pd.takeError();
+        items.push_back(std::move(*pd));
       } else {
         return make_error<StringError>(
           "unexpected token in runtime at line " + std::to_string(cur().line),
@@ -534,9 +623,7 @@ public:
   }
 };
 
-// ===========================================================================
-// Entry point
-// ===========================================================================
+// --- Entry point ---
 
 namespace dsl {
 

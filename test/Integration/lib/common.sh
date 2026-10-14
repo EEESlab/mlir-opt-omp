@@ -1,23 +1,13 @@
 #!/bin/bash
-# =============================================================================
-# common.sh — shared setup for the Integration test drivers
-# (run_correctness.sh, run_performance.sh, tasks/run_tasks.sh).
+# common.sh — shared setup for the Integration drivers. Sourced, not run.
 #
-# This file holds the configuration: run.env loading, tool/path resolution
-# and the per-runtime knobs. The rest is sourced from sibling files at the end:
-#   kernels.sh  kernel lists + selection helpers
-#   native.sh   compile_opt()/compile_ref() — the host pipelines
-#   pulp.sh     the PULP/gvsoc target (only when TARGET=pulp)
+# Loads the config (local.env, then run.env or $RUN_ENV), resolves the tools and
+# the per-runtime knobs, then pulls in kernels.sh, native.sh and — on pmsis —
+# pulp.sh. RUNTIME picks the target: iomp/libgomp run on the host, pmsis
+# cross-compiles for PULP/GAP8 and runs on gvsoc.
 #
-# Two execution targets, selected by RUNTIME:
-#   iomp | libgomp -> TARGET=native  compile+run on the host
-#   pmsis          -> TARGET=pulp    cross-compile riscv32, build+run through
-#                     the PULP-SDK
-# =============================================================================
+# Every variable and its default: README.md, "Configuration reference".
 
-# COMMON_DIR is this lib/ directory; INTEGRATION_DIR is the test/Integration
-# root (run.env, the vendored kernels/ and the drivers live there);
-# REPO_ROOT holds local.env and rules.dsl.
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTEGRATION_DIR="$(cd "$COMMON_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$INTEGRATION_DIR/../.." && pwd)"
@@ -30,33 +20,68 @@ else
     GREEN=''; RED=''; CYAN=''; YELLOW=''; BOLD=''; RESET=''
 fi
 
-# --- Config ------------------------------------------------------------------
-# Two files, both optional and both git-ignored:
-#   <repo>/local.env      where the tools are — shared with quick-compile/
-#   Integration/run.env   what to run
-# The shared loader handles both, plus the tool defaults, PATH and the sanity
-# checks. run.env wins over local.env, and anything already in the environment
-# wins over both, so `RUNTIME=libgomp ./run_correctness.sh` still overrides them.
+OMP_RUN_ENV_FILE="$INTEGRATION_DIR/run.env"
+if [ -n "${RUN_ENV:-}" ]; then
+    if [ -f "$RUN_ENV" ]; then
+        OMP_RUN_ENV_FILE="$RUN_ENV"
+    elif [ -f "$INTEGRATION_DIR/$RUN_ENV" ]; then
+        OMP_RUN_ENV_FILE="$INTEGRATION_DIR/$RUN_ENV"
+    else
+        echo "ERROR: RUN_ENV='$RUN_ENV' names no readable file." >&2
+        echo "       Tried: $RUN_ENV" >&2
+        echo "          and: $INTEGRATION_DIR/$RUN_ENV" >&2
+        echo "       Available: $(cd "$INTEGRATION_DIR" 2>/dev/null \
+            && echo configs/*.env)" >&2
+        exit 2
+    fi
+fi
+
 OMP_REPO_ROOT="$REPO_ROOT"
 # shellcheck source=../../../scripts/load-local-env.sh
-. "$REPO_ROOT/scripts/load-local-env.sh" "$INTEGRATION_DIR/run.env"
+. "$REPO_ROOT/scripts/load-local-env.sh" "$OMP_RUN_ENV_FILE"
 
-# --- Paths -----------------------------------------------------------------
-# Defaults to the kernels vendored in this repo, so the tests are
-# self-contained. Point POLYBENCH at a full PolyBench/OMP checkout (and use
-# SUITE=full) to run the whole benchmark set.
-POLYBENCH="${POLYBENCH:-$INTEGRATION_DIR/kernels}"
+POLYBENCH="${POLYBENCH:-}"
+if [ -z "$POLYBENCH" ] || [ ! -d "$POLYBENCH" ]; then
+    echo "ERROR: POLYBENCH must point at a PolyBench/OMP checkout." >&2
+    if [ -n "$POLYBENCH" ]; then
+        echo "       POLYBENCH='$POLYBENCH' is not a directory." >&2
+    else
+        echo "       It is not set. Put it in <repo>/local.env:" >&2
+        echo "         POLYBENCH=\"/path/to/PolyBenchC-4.2.1-OpenMP\"" >&2
+    fi
+    exit 2
+fi
 INC="${POLYBENCH_UTIL:-$POLYBENCH/utilities}"
 # Serial OpenMP stubs, linked into the sequential builds (see compile_*).
 OMP_STUBS_SRC="$COMMON_DIR/omp_stubs.c"
 
-# --- Run parameters --------------------------------------------------------
-# DATASET_DEFAULT lets a driver pick its own default (e.g. LARGE for perf)
-# while still letting the user/run.env override via DATASET.
 RUNTIME="${RUNTIME:-iomp}"           # iomp | libgomp | pmsis (pulp/gvsoc)
+# Redundant team-barrier elimination (--omp-barrier-elim). Off by default so a
+# plain run is the baseline to compare against.
+BARRIER_ELIM="${BARRIER_ELIM:-0}"    # 0 | 1 | both
+case "$BARRIER_ELIM" in
+    0|1|both) ;;
+    *)
+        echo "ERROR: BARRIER_ELIM='$BARRIER_ELIM' is not 0, 1 or both." >&2
+        exit 1
+        ;;
+esac
+BARRIER_ELIM_FLAG=""
+BARRIER_ELIM_DIR_TAG=""
+BARRIER_ELIM_FILE_TAG=""
+case "$BARRIER_ELIM" in
+    1)
+        BARRIER_ELIM_FLAG="--omp-barrier-elim"
+        BARRIER_ELIM_DIR_TAG="-barrier-elim"
+        BARRIER_ELIM_FILE_TAG="_barrier-elim"
+        ;;
+    both)
+        BARRIER_ELIM_DIR_TAG="-barrier-ab"
+        BARRIER_ELIM_FILE_TAG="_barrier-ab"
+        ;;
+esac
 __DATASET_EXPLICIT="${DATASET:-}"    # remember whether the user/config chose one
 DATASET="${DATASET:-${DATASET_DEFAULT:-MINI_DATASET}}"
-SUITE="${SUITE:-bundled}"            # bundled | full
 
 # PolyBench silently maps an unknown name to LARGE_DATASET — on GAP8 that dies
 # in pi_l2_malloc — and setting DATASET at all disables the pmsis guard below.
@@ -75,10 +100,6 @@ esac
 export OMP_PLACES="${OMP_PLACES:-cores}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 
-# --- Root / FIFO scheduler handling ----------------------------------------
-# Running as root lets PolyBench use the FIFO scheduler for lower variance, but
-# it needs the define + an explicit libc link. Exposed as POLYBENCH_ROOT_CFLAGS
-# so each driver can fold it into its own POLYBENCH_CFLAGS.
 POLYBENCH_ROOT_CFLAGS=""
 POLYBENCH_LFLAGS="${POLYBENCH_LFLAGS:-}"
 if [ "$(id -u)" -eq 0 ]; then
@@ -86,15 +107,14 @@ if [ "$(id -u)" -eq 0 ]; then
     POLYBENCH_LFLAGS="$POLYBENCH_LFLAGS -lc"
 fi
 
-# --- Strict FP flags — keep ref and opt in sync ----------------------------
-# Without these, FMA contraction and reordered reductions make iterative
-# kernels diverge even though both binaries are IEEE-correct.
 CLANG_STRICT_FP="${CLANG_STRICT_FP:--ffp-contract=off -fno-vectorize -fno-slp-vectorize}"
 GCC_STRICT_FP="${GCC_STRICT_FP:--ffp-contract=off -fno-tree-vectorize -fno-tree-loop-vectorize -fno-tree-slp-vectorize}"
+# The vectorisers run in `opt`, not in the front-end: the -fno-*vectorize in
+# CLANG_STRICT_FP stops at the clang->CIR step and never reaches the opt/llc half
+# of compile_opt. Without them the reference is scalar and our binaries are not,
+# and the two cells stop being comparable.
+OPT_STRICT_FP="${OPT_STRICT_FP:--vectorize-loops=false -vectorize-slp=false}"
 
-# Silence the noisy (harmless) warnings clang emits when it parses GCC's omp.h
-# (the __malloc__ attribute signature it does not implement). Both clang and
-# gcc accept -Wno-ignored-attributes.
 WARN_SUPPRESS="${WARN_SUPPRESS:--Wno-ignored-attributes}"
 
 # --- Per-runtime knobs -----------------------------------------------------
@@ -132,16 +152,62 @@ case "$RUNTIME" in
 esac
 unset __DATASET_EXPLICIT
 
-# --- Load the pieces ---------------------------------------------------------
-# kernels.sh  kernel lists + select_kernels/resolve_src
-# native.sh   compile_opt/compile_ref (host pipelines)
-# pulp.sh     everything TARGET=pulp specific (PULP_* knobs, SDK env,
-#             pulp_cell and the riscv32 kernel.o pipeline)
-# shellcheck source=kernels.sh
+# --- Plotting ----------------------------------------------------------------
+# is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
+is_true() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+plot_python() {
+    local py
+    if [ -n "${PLOT_PYTHON:-}" ]; then
+        py="$PLOT_PYTHON"
+    elif [ -x "$INTEGRATION_DIR/.venv/bin/python" ]; then
+        py="$INTEGRATION_DIR/.venv/bin/python"
+    else
+        py="$(command -v python3 || command -v python)" || {
+            echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
+            return 1
+        }
+    fi
+    if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
+        echo -e "${YELLOW}[plot] matplotlib not available in $py — skipping plot.${RESET}" >&2
+        echo -e "${YELLOW}[plot] set it up once with:${RESET}" >&2
+        echo -e "${YELLOW}[plot]   python3 -m venv $INTEGRATION_DIR/.venv${RESET}" >&2
+        echo -e "${YELLOW}[plot]   $INTEGRATION_DIR/.venv/bin/pip install matplotlib numpy${RESET}" >&2
+        return 1
+    fi
+    printf '%s' "$py"
+}
+
+# --- The paper's own claims -------------------------------------------------
+# reference/claims.csv holds what the paper states in prose, one row per
+# sentence, so a driver can check its own totals against it instead of leaving
+# them to be read off the screen. reference/reference.csv is the other half:
+# what the figures plot. See reference/README.md.
+CLAIMS="$INTEGRATION_DIR/reference/claims.csv"
+
+# claim_row <metric> <subject> -> "value tolerance", empty when the file or the
+# row is missing. The header line cannot collide: its 4th field is the literal
+# "metric", which is not one.
+claim_row() {
+    [ -f "$CLAIMS" ] || return 0
+    awk -F';' -v m="$1" -v s="$2" \
+        '!/^#/ && $4 == m && $5 == s { print $7, $8; exit }' "$CLAIMS"
+}
+
+# There is deliberately no claim_verdict: the drivers print the measured value
+# next to the paper's and stop there. Whether a difference matters is a
+# judgement about the work, and it belongs to whoever is reading.
+
 . "$COMMON_DIR/kernels.sh"
 # shellcheck source=native.sh
 . "$COMMON_DIR/native.sh"
-if [ "$TARGET" = "pulp" ]; then
+# SKIP_PULP_SDK is for a driver that only goes as far as MLIR
+if [ "$TARGET" = "pulp" ] && [ -z "${SKIP_PULP_SDK:-}" ]; then
     # shellcheck source=pulp.sh
     . "$COMMON_DIR/pulp.sh"
 fi

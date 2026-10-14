@@ -1,57 +1,22 @@
 #!/bin/bash
-# =============================================================================
-# run_performance.sh — MLIR OpenMP performance comparison (our tool vs native)
-#
-# For each PolyBench kernel it builds the 2x2 matrix and times each cell:
-#
-#                 sequential (1 thread)      parallel ($THREADS threads)
-#   native (ref)  ref_seq  (clang/gcc -O3)   ref_par  (clang/gcc -fopenmp)
-#   our tool(opt) opt_seq  (CIR/MLIR, no omp) opt_par  (CIR/MLIR -fopenmp)
-#
-# From those four numbers it reports:
-#   speedup_native      = ref_seq / ref_par   native self seq->par speedup
-#   speedup_opt         = opt_seq / opt_par    our    self seq->par speedup
-#   opt_vs_native_par   = ref_par / opt_par    headline: our parallel vs the
-#                                              native parallel compiler
-#                                              (>1 => our tool is faster)
-#   opt_vs_native_seq   = ref_seq / opt_seq    same, sequential
-#
-# Timing uses PolyBench's cycle-accurate TSC timer. Each cell is run 5 times;
-# the min and max are dropped and the mean of the 3 middle runs is reported,
-# together with its standard deviation. A cell whose relative std-dev exceeds
-# VARIANCE_ACCEPTED% is flagged (noisy machine / background load).
-#
-# RUNTIME=pmsis (PULP/gvsoc) builds the same 2x2 matrix but through the
-# PolyBench-PULP harness Makefile (PULP_APP_DIR): ref = the PULP-SDK gcc
-# (plain / OMP_NATIVE=1), opt = our riscv32 kernel.o (OMP_OPT=1). Cycles come
-# from the 'Cycles = N' line in the gvsoc run log — one run per cell, the
-# simulator is deterministic — and four binary-size columns are appended to
-# the CSV. Only runs on machines with the GAP SDK + gvsoc installed.
-#
-# All shared setup (config, tools, kernel lists, the compile pipeline) lives in
-# common.sh — same run.env as run_correctness.sh.
+# run_performance.sh — builds a 2x2 matrix per kernel (sequential/parallel x
+# native/ours), times each cell with PolyBench's cycle-accurate timer, and
+# reports the self-relative parallel speedup of each toolchain.
 #
 # Usage:
-#   ./run_performance.sh                              # all kernels, defaults
-#   RUNTIME=libgomp ./run_performance.sh              # pick the runtime
-#   RUNTIME=pmsis ./run_performance.sh                # PULP/gvsoc (needs GAP SDK)
-#   DATASET=LARGE_DATASET THREADS=16 ./run_performance.sh
-#   ./run_performance.sh path/to/kernel-omp.c         # a single kernel
-#   SUITE=full POLYBENCH=/path/to/checkout ./run_performance.sh
-#   PLOT=true SUITE=full ./run_performance.sh          # also render the chart
+#   ./run_performance.sh                            # all kernels, defaults
+#   RUNTIME=libgomp ./run_performance.sh            # iomp | libgomp | pmsis
+#   RUN_ENV=configs/paper-iomp.env ./run_performance.sh   # reproduce a figure
+#   ./run_performance.sh path/to/kernel-omp.c
+#   REPS=5 ./run_performance.sh                     # fewer timed runs, faster
+#   PLOT=true ./run_performance.sh                  # + the chart(s)
+#   BARRIER_ELIM=1|both ./run_performance.sh        # with the pass, or A/B
+#   COMPARE=false ./run_performance.sh              # skip the paper comparison
+#   KEEP=1 ./run_performance.sh                     # keep binaries and logs
 #
-# Output lands under $OUTDIR/<runtime> (default ./results/<runtime>), one
-# folder per runtime (iomp, libgomp, pmsis) so runs against different runtimes
-# never overwrite each other:
-#   results_performance.csv        one row per kernel + a GEOMEAN row
-#   <kernel>-omp/performance/...   the four binaries and raw timing logs
-#   results_performance_<sel>.png  speedup bar chart (only when PLOT=true;
-#                                  needs python3 + matplotlib — see
-#                                  plot_speedup.py). <sel> = the kernel
-#                                  selection (the SUITE, full/bundled, or the
-#                                  explicit kernel name(s)) + the dataset size,
-#                                  e.g. _full_large or _gemm-omp_mini.
-# =============================================================================
+# Leaves results_performance.csv: one row per kernel plus a GEOMEAN row. The
+# cycle counts are the result; the binaries and per-repetition logs behind them
+# go unless KEEP=1. Configuration: README.md, "Configuration reference".
 
 set -uo pipefail
 
@@ -66,20 +31,40 @@ DATASET_DEFAULT="LARGE_DATASET"
 THREADS="${THREADS:-16}"             # thread count for the parallel cells
 REPS="${REPS:-10}"                    # timed runs per cell (>=3; min+max dropped)
 VARIANCE_ACCEPTED="${VARIANCE_ACCEPTED:-5}"   # rel std-dev warn threshold (%)
-# Results are split per runtime — results/<runtime>/... — so an iomp run only
-# replaces a previous iomp run, never a libgomp/pmsis one.
-OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME"
+OUTDIR="${OUTDIR:-$PWD/results}/$RUNTIME$BARRIER_ELIM_DIR_TAG"
 PLOT="${PLOT:-false}"                # true -> render a speedup bar chart at the end
 
 # Performance times the kernel with the cycle-accurate TSC timer. This is
 # mutually exclusive with -DPOLYBENCH_DUMP_ARRAYS, hence its own CFLAGS.
 POLYBENCH_CFLAGS="-DPOLYBENCH_TIME -DPOLYBENCH_CYCLE_ACCURATE_TIMER $POLYBENCH_ROOT_CFLAGS"
 
-# --- Stats helpers ---------------------------------------------------------
-# run_benchmark <binary> <nthreads> <label> <logfile>
-# Runs the binary REPS times, drops min+max, and computes the mean / std-dev /
-# min over the middle runs. Echoes "mean" on stdout; also sets BENCH_STDDEV,
-# BENCH_MIN, BENCH_RELSD (relative std-dev %). Returns non-zero on failure.
+bench_stats() {
+    local logfile="$1"
+    local keep=$((REPS - 2))
+    [ "$keep" -lt 1 ] && keep=$REPS   # REPS<3: keep them all
+    sort -g "$logfile" | head -n $((REPS == keep ? REPS : REPS - 1)) \
+        | tail -n "$keep" | awk '
+        /^[0-9.eE+-]+$/ { v[++n] = $1; s += $1; if (n == 1 || $1 < mn) mn = $1 }
+        END {
+            if (n < 1) exit 1
+            m = s / n
+            for (i = 1; i <= n; i++) { d = v[i] - m; ss += d * d }
+            sd = sqrt(ss / n)
+            rsd = (m != 0) ? sd / m * 100 : 0
+            printf "%.6f %.6f %.6f %.4f", m, sd, mn, rsd
+        }'
+}
+
+# bench_noisy <label> <relsd> — warn when a cell's spread says it is measuring
+# the machine rather than the code.
+bench_noisy() {
+    local warn
+    warn=$(awk -v r="$2" -v t="$VARIANCE_ACCEPTED" 'BEGIN { print (r < t) ? "ok" : "warn" }')
+    [ "$warn" = "warn" ] && \
+        echo -e "    ${YELLOW}[noisy]${RESET} $1: rel std-dev $2% > ${VARIANCE_ACCEPTED}%" >&2
+    return 0
+}
+
 run_benchmark() {
     local binary="$1" nthreads="$2" label="$3" logfile="$4"
     BENCH_STDDEV="NA"; BENCH_MIN="NA"; BENCH_RELSD="NA"
@@ -92,39 +77,48 @@ run_benchmark() {
             || { echo -e "    ${RED}run failed${RESET}" >&2; return 1; }
     done
 
-    # Keep the middle (REPS-2) values after sorting numerically.
-    local keep=$((REPS - 2))
-    [ "$keep" -lt 1 ] && keep=$REPS   # REPS<3: keep them all
-    local stats
-    stats=$(sort -g "$logfile" | head -n $((REPS == keep ? REPS : REPS - 1)) \
-            | tail -n "$keep" | awk '
-        /^[0-9.eE+-]+$/ { v[++n] = $1; s += $1; if (n == 1 || $1 < mn) mn = $1 }
-        END {
-            if (n < 1) { print "ERR"; exit }
-            m = s / n
-            for (i = 1; i <= n; i++) { d = v[i] - m; ss += d * d }
-            sd = sqrt(ss / n)
-            rsd = (m != 0) ? sd / m * 100 : 0
-            printf "%.6f %.6f %.6f %.4f", m, sd, mn, rsd
-        }')
-
-    if [ "$stats" = "ERR" ] || [ -z "$stats" ]; then
+    local stats; stats="$(bench_stats "$logfile")"
+    if [ -z "$stats" ]; then
         echo -e "    ${RED}no numeric output — is -DPOLYBENCH_TIME set?${RESET}" >&2
         return 1
     fi
 
     local mean
     read -r mean BENCH_STDDEV BENCH_MIN BENCH_RELSD <<< "$stats"
-
-    local warn
-    warn=$(awk -v r="$BENCH_RELSD" -v t="$VARIANCE_ACCEPTED" \
-        'BEGIN { print (r < t) ? "ok" : "warn" }')
-    if [ "$warn" = "warn" ]; then
-        echo -e "    ${YELLOW}[noisy]${RESET} ${label}: rel std-dev ${BENCH_RELSD}% > ${VARIANCE_ACCEPTED}%" >&2
-    fi
+    bench_noisy "$label" "$BENCH_RELSD"
     echo -e "    ${BOLD}${label}: ${mean} cyc${RESET} (sd ${BENCH_STDDEV}, min ${BENCH_MIN})" >&2
 
     printf "%s" "$mean"
+}
+
+# run_benchmark_ab <binA> <binB> <nthreads> <logA> <logB>
+run_benchmark_ab() {
+    local a="$1" b="$2" nthreads="$3" loga="$4" logb="$5"
+
+    echo -e "    ${CYAN}timing base/elim, alternati (${nthreads}T) x${REPS}...${RESET}" >&2
+    : > "$loga"; : > "$logb"
+    local i
+    for ((i = 0; i < REPS; i++)); do
+        OMP_NUM_THREADS="$nthreads" "$a" >> "$loga" 2>/dev/null \
+            || { echo -e "    ${RED}run failed (base)${RESET}" >&2; return 1; }
+        OMP_NUM_THREADS="$nthreads" "$b" >> "$logb" 2>/dev/null \
+            || { echo -e "    ${RED}run failed (elim)${RESET}" >&2; return 1; }
+    done
+
+    local sa sb; sa="$(bench_stats "$loga")"; sb="$(bench_stats "$logb")"
+    if [ -z "$sa" ] || [ -z "$sb" ]; then
+        echo -e "    ${RED}no numeric output — is -DPOLYBENCH_TIME set?${RESET}" >&2
+        return 1
+    fi
+
+    local ma mb sda sdb rsda rsdb skip
+    read -r ma sda skip rsda <<< "$sa"
+    read -r mb sdb skip rsdb <<< "$sb"
+    bench_noisy base "$rsda"
+    bench_noisy elim "$rsdb"
+    echo -e "    ${BOLD}base: ${ma} cyc${RESET} (sd ${sda})   ${BOLD}elim: ${mb} cyc${RESET} (sd ${sdb})" >&2
+
+    printf "%s %s %s %s" "$ma" "$sda" "$mb" "$sdb"
 }
 
 # ratio <a> <b> -> a/b with 4 decimals, or NA.
@@ -133,10 +127,6 @@ ratio() {
         'BEGIN { if (b+0 == 0) print "NA"; else printf "%.4f", a / b }'
 }
 
-# --- Per-kernel driver: pulp/gvsoc -----------------------------------------
-# One gvsoc run per cell (build+run are fused in the harness 'make', and the
-# simulator is deterministic, so REPS does not apply). Also records the size
-# of the linked ELF for each cell.
 run_kernel_pulp() {
     local src="$1" name="$2"
     local d="$OUTDIR/$name/performance"
@@ -181,9 +171,106 @@ run_kernel_pulp() {
     } >&2
 
     echo "${name};${CYC[ref_seq]};${CYC[ref_par]};${CYC[opt_seq]};${CYC[opt_par]};${SP_NATIVE};${SP_OPT};${OPT_VS_NAT_PAR};${OPT_VS_NAT_SEQ};${SIZ[ref_seq]};${SIZ[ref_par]};${SIZ[opt_seq]};${SIZ[opt_par]}" >> "$CSV"
+    prune_kernel "$d"
 }
 
-# --- Per-kernel driver -----------------------------------------------------
+run_kernel_ab() {
+    local src="$1" name="$2"
+    local d="$OUTDIR/$name/performance"
+    mkdir -p "$d"
+
+    echo -e "${BOLD}── $name${RESET}" >&2
+
+    echo "  [1/2] base (without the pass)..." >&2
+    BARRIER_ELIM_FLAG=""
+    compile_opt "$src" "$d" "${name}_ab_base" on >&2 \
+        || { echo "  ERROR base compile" >&2; emit_na "$name"; return; }
+    echo "  [2/2] elim (--omp-barrier-elim)..." >&2
+    BARRIER_ELIM_FLAG="--omp-barrier-elim"
+    compile_opt "$src" "$d" "${name}_ab_elim" on >&2 \
+        || { echo "  ERROR elim compile" >&2; BARRIER_ELIM_FLAG=""; emit_na "$name"; return; }
+    BARRIER_ELIM_FLAG=""
+
+    local out
+    out=$(run_benchmark_ab "$d/${name}_ab_base" "$d/${name}_ab_elim" \
+                           "$THREADS" "$d/ab_base.log" "$d/ab_elim.log") \
+        || { emit_na "$name"; return; }
+    local C_BASE SD_BASE C_ELIM SD_ELIM
+    read -r C_BASE SD_BASE C_ELIM SD_ELIM <<< "$out"
+
+    local DELTA DELTA_SD
+    read -r DELTA DELTA_SD < <(awk -v b="$C_BASE" -v e="$C_ELIM" \
+        -v sb="$SD_BASE" -v se="$SD_ELIM" 'BEGIN {
+            if (b + 0 == 0) { print "NA NA"; exit }
+            printf "%.4f %.4f", 100 * (b - e) / b, 100 * sqrt(sb*sb + se*se) / b
+        }')
+
+    {
+        echo ""
+        printf "  %-24s %18s\n" "base (${THREADS}T) cycles" "$C_BASE"
+        printf "  %-24s %18s\n" "elim (${THREADS}T) cycles" "$C_ELIM"
+        printf "  %-24s %17s%%\n" "saving" "${DELTA} ± ${DELTA_SD}"
+        echo ""
+    } >&2
+
+    echo "${name};${C_BASE};${SD_BASE};${C_ELIM};${SD_ELIM};${DELTA};${DELTA_SD}" >> "$CSV"
+    prune_kernel "$d"
+}
+
+run_kernel_pulp_ab() {
+    local src="$1" name="$2"
+    local d="$OUTDIR/$name/performance"
+    mkdir -p "$d"
+
+    echo -e "${BOLD}── $name${RESET}" >&2
+
+    # pulp.sh splices $BARRIER_ELIM_FLAG into the mlir-opt-omp command, exactly
+    # as native.sh does, so the flag is set around each build and cleared after.
+    local base elim
+    echo "  [1/2] base (without the pass)..." >&2
+    : > "$d/ab_base.log"
+    BARRIER_ELIM_FLAG=""
+    if ! base="$(pulp_cell "$src" opt_par "$d" "$d/ab_base.log")"; then
+        echo "  ERROR: base failed" >&2; emit_na "$name"; return
+    fi
+    echo "  [2/2] elim (--omp-barrier-elim)..." >&2
+    : > "$d/ab_elim.log"
+    BARRIER_ELIM_FLAG="--omp-barrier-elim"
+    if ! elim="$(pulp_cell "$src" opt_par "$d" "$d/ab_elim.log")"; then
+        echo "  ERROR: elim failed" >&2; BARRIER_ELIM_FLAG=""; emit_na "$name"; return
+    fi
+    BARRIER_ELIM_FLAG=""
+
+    local C_BASE="${base%%;*}" C_ELIM="${elim%%;*}"
+    if [ "$C_BASE" = "NA" ] || [ "$C_ELIM" = "NA" ]; then
+        echo -e "    ${YELLOW}WARNING: no 'Cycles =' line — see $d/ab_*.log${RESET}" >&2
+        emit_na "$name"; return
+    fi
+
+    # Positive = the pass saved time. No uncertainty to propagate here.
+    local DELTA
+    DELTA=$(awk -v b="$C_BASE" -v e="$C_ELIM" 'BEGIN {
+        if (b + 0 == 0) { print "NA"; exit }
+        printf "%.4f", 100 * (b - e) / b
+    }')
+
+    {
+        echo ""
+        printf "  %-24s %18s\n" "base cycles" "$C_BASE"
+        printf "  %-24s %18s\n" "elim cycles" "$C_ELIM"
+        printf "  %-24s %17s%%\n" "saving" "$DELTA"
+        echo ""
+    } >&2
+
+    echo "${name};${C_BASE};0;${C_ELIM};0;${DELTA};0" >> "$CSV"
+    prune_kernel "$d"
+}
+
+prune_kernel() {   # $1 = the kernel's output directory
+    [ -n "${KEEP:-}" ] && return 0
+    rm -rf "$1"
+}
+
 run_kernel() {
     local kernel="$1" src
     if ! src="$(resolve_src "$kernel")"; then
@@ -193,7 +280,15 @@ run_kernel() {
     local name; name="$(basename "${src%-omp.c}")-omp"
 
     if [ "$TARGET" = "pulp" ]; then
-        run_kernel_pulp "$src" "$name"
+        if [ "$BARRIER_ELIM" = "both" ]; then
+            run_kernel_pulp_ab "$src" "$name"
+        else
+            run_kernel_pulp "$src" "$name"
+        fi
+        return
+    fi
+    if [ "$BARRIER_ELIM" = "both" ]; then
+        run_kernel_ab "$src" "$name"
         return
     fi
 
@@ -243,27 +338,19 @@ run_kernel() {
     } >&2
 
     echo "${name};${C_REF_SEQ};${C_REF_PAR};${C_OPT_SEQ};${C_OPT_PAR};${SP_NATIVE};${SP_OPT};${OPT_VS_NAT_PAR};${OPT_VS_NAT_SEQ}" >> "$CSV"
+    prune_kernel "$d"
 }
 
 emit_na() {
     local row="$1;NA;NA;NA;NA;NA;NA;NA;NA"
-    [ "$TARGET" = "pulp" ] && row="$row;NA;NA;NA;NA"
+    if [ "$BARRIER_ELIM" = "both" ]; then
+        row="$1;NA;NA;NA;NA;NA;NA"
+    elif [ "$TARGET" = "pulp" ]; then
+        row="$row;NA;NA;NA;NA"
+    fi
     echo "$row" >> "$CSV"
 }
 
-# is_true <value> -> 0 if it reads as a boolean "yes" (1/true/yes/on), else 1.
-is_true() {
-    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# Suffix naming what this run covered, appended to the plot filename:
-# the kernel selection — the SUITE name (full/bundled), or, when an explicit
-# KERNELS list (or a single-kernel argument) was given, the kernel basenames
-# (the part after the last '/', without the .c extension) joined by '_' —
-# followed by the dataset size (LARGE_DATASET -> large).
 plot_suffix() {
     local sel
     if [ -n "${KERNELS:-}" ]; then
@@ -274,63 +361,72 @@ plot_suffix() {
         done
         sel=$(IFS=_; printf '%s' "${parts[*]}")
     else
-        sel="$SUITE"
+        sel="suite"
     fi
     local ds="${DATASET%_DATASET}"
     printf '%s_%s' "$sel" "${ds,,}"
 }
 
-# Render the speedup bar chart from $CSV via plot_speedup.py. Best-effort: a
-# missing python/matplotlib is a warning, not a failure (the CSV is the result).
-# Python resolution order: $PLOT_PYTHON, then the local venv ./.venv (create it
-# once with:  python3 -m venv .venv && .venv/bin/pip install matplotlib numpy),
-# then whatever python3 is on PATH.
-render_plot() {
+render_plot() {   # $1 = metric (speedup | size), default speedup
+    local metric="${1:-speedup}"
     local script="$SCRIPT_DIR/lib/plot_speedup.py"
-    local png="$OUTDIR/results_performance_$(plot_suffix).png"
-    local py
-    if [ -n "${PLOT_PYTHON:-}" ]; then
-        py="$PLOT_PYTHON"
-    elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
-        py="$SCRIPT_DIR/.venv/bin/python"
-    else
-        py="$(command -v python3 || command -v python)" || {
-            echo -e "${YELLOW}[plot] python3 not found — skipping plot${RESET}" >&2
-            return
-        }
-    fi
-    if ! "$py" -c 'import matplotlib' >/dev/null 2>&1; then
-        echo -e "${YELLOW}[plot] matplotlib not available in $py — skipping plot.${RESET}" >&2
-        echo -e "${YELLOW}[plot] set it up once with:${RESET}" >&2
-        echo -e "${YELLOW}[plot]   python3 -m venv $SCRIPT_DIR/.venv${RESET}" >&2
-        echo -e "${YELLOW}[plot]   $SCRIPT_DIR/.venv/bin/pip install matplotlib numpy${RESET}" >&2
-        return
-    fi
-    echo -e "${CYAN}[plot] rendering speedup chart...${RESET}" >&2
-    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME"; then
+    local tag=""; [ "$metric" = "size" ] && tag="_size"
+    local png="$OUTDIR/results_performance_$(plot_suffix)$BARRIER_ELIM_FILE_TAG$tag.png"
+    local py; py="$(plot_python)" || return
+    echo -e "${CYAN}[plot] rendering $metric chart...${RESET}" >&2
+    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME" --metric "$metric"; then
         echo "  Plot  — $png"
     else
         echo -e "${YELLOW}[plot] plot_speedup.py failed — see output above${RESET}" >&2
     fi
 }
 
+# The A/B chart: what the pass saved on each kernel, with the error bar that
+# says whether the sign can be trusted. Same best-effort contract as above.
+render_ab_plot() {
+    local script="$SCRIPT_DIR/lib/plot_delta.py"
+    local png="$OUTDIR/results_performance_$(plot_suffix)$BARRIER_ELIM_FILE_TAG.png"
+    local py; py="$(plot_python)" || return
+    echo -e "${CYAN}[plot] rendering A/B chart...${RESET}" >&2
+    if "$py" "$script" "$CSV" "$png" --runtime "$RUNTIME" --threads "$THREADS"; then
+        echo "  Plot  — $png"
+    else
+        echo -e "${YELLOW}[plot] plot_delta.py failed — see output above${RESET}" >&2
+    fi
+}
+
 # --- Main ------------------------------------------------------------------
 mkdir -p "$OUTDIR"
-CSV="$OUTDIR/results_performance.csv"
+CSV="$OUTDIR/results_performance$BARRIER_ELIM_FILE_TAG.csv"
 CSV_HEADER="kernel;ref_seq_cyc;ref_par_cyc;opt_seq_cyc;opt_par_cyc;speedup_native;speedup_opt;opt_vs_native_par;opt_vs_native_seq"
-[ "$TARGET" = "pulp" ] && \
+if [ "$BARRIER_ELIM" = "both" ]; then
+    CSV_HEADER="kernel;base_par_cyc;base_sd;elim_par_cyc;elim_sd;delta_pct;delta_sd_pct"
+elif [ "$TARGET" = "pulp" ]; then
     CSV_HEADER="$CSV_HEADER;size_ref_seq;size_ref_par;size_opt_seq;size_opt_par"
+fi
 
 echo "=== MLIR OpenMP PERFORMANCE COMPARISON ==="
-if [ "$TARGET" = "pulp" ]; then
-    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET    suite: $SUITE"
+if [ "$BARRIER_ELIM" = "both" ]; then
+    echo "mode: A/B barrier elimination — our two builds against each other"
+    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS"
+    if [ "$TARGET" = "pulp" ]; then
+        echo "timer: 'Cycles =' from the gvsoc log — 1 run per build, no alternation"
+        echo "       (the simulator is deterministic: REPS would return the same number)"
+    else
+        echo "reps: $REPS (alternati base/elim)    timer: cycle-accurate TSC"
+    fi
+    echo "no native comparison: this run answers what the pass costs, nothing else"
+    echo "polybench: $POLYBENCH"
+    echo "rules: $RULES"
+elif [ "$TARGET" = "pulp" ]; then
+    echo "runtime: $RUNTIME (pulp/$PULP_PLATFORM)    dataset: $DATASET"
     echo "app dir: $PULP_APP_DIR"
     echo "ref: pulp-sdk gcc (make / OMP_NATIVE=1)    opt: CIR/MLIR kernel.o (OMP_OPT=1)"
     echo "timer: 'Cycles =' from the gvsoc log — 1 run/cell (simulator is deterministic)"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
 else
-    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS    suite: $SUITE"
+    echo "runtime: $RUNTIME    dataset: $DATASET    par threads: $THREADS"
     echo "ref cc : $REF_CC    reps: $REPS    timer: cycle-accurate TSC"
     echo "polybench: $POLYBENCH"
     echo "rules: $RULES"
@@ -342,7 +438,7 @@ echo "$CSV_HEADER" > "$CSV"
 select_kernels
 
 if [ $# -ge 1 ]; then
-    KERNELS="$1"   # so plot_suffix names the kernel, not the unused SUITE
+    KERNELS="$1"   # so plot_suffix names the kernel rather than the suite
     run_kernel "$1"
 else
     for k in "${KERNEL_LIST[@]}"; do
@@ -350,9 +446,101 @@ else
     done
 fi
 
-# --- Suite-level summary (geometric means over non-NA rows) ----------------
-# Geomean is the standard way to summarise speedup ratios across a benchmark
-# set (arithmetic mean over-weights the largest ratios).
+# Section 4.5 gives the saving, how many kernels improve, and the two ends of
+# the per-kernel range. All four come out of the A/B CSV, so they are printed
+# next to it. Side by side and nothing more.
+compare_ab_to_claims() {
+    local rows=0 value tol
+    local best_k best worst_k worst
+    read -r best_k best worst_k worst < <(awk -F';' '
+        NR > 1 && $1 != "TOTAL" && $2 != "NA" {
+            d = $6 + 0
+            if (++n == 1 || d > hi) { hi = d; hk = $1 }
+            if (n == 1 || d < lo) { lo = d; lk = $1 }
+        }
+        END { if (n) printf "%s %.4f %s %.4f", hk, hi, lk, lo
+              else printf "- NA - NA" }' "$CSV")
+
+    echo ""
+    echo -e "${BOLD}  === SECTION 4.5 (reference/claims.csv) ===${RESET}"
+    printf '  %-26s %9s %9s\n' quantity measured paper
+
+    check_one() {   # $1 metric  $2 subject  $3 label  $4 measured
+        # cleared first: read leaves them untouched when claim_row finds no
+        # row, and the previous quantity's number would be printed again.
+        value=""; tol=""
+        read -r value tol < <(claim_row "$1" "$2")
+        [ -z "${value:-}" ] && return 0
+        rows=$((rows + 1))
+        printf '  %-26s %9s %9s\n' "$3" "$4" "$value"
+    }
+
+    check_one barrier_saving_pct suite   "saving over the suite %" "$T_DELTA"
+    check_one kernels_improving  suite   "kernels improving"       "$N_SIG"
+    check_one barrier_delta_pct  best    "best kernel %"           "$best"
+    check_one barrier_delta_pct  worst   "worst kernel %"          "$worst"
+    unset -f check_one
+
+    if [ "$rows" -eq 0 ]; then
+        echo "  no rows for this run in $CLAIMS"
+        return 0
+    fi
+    echo ""
+    echo "  best: $best_k    worst: $worst_k"
+}
+
+if [ "$BARRIER_ELIM" = "both" ]; then
+    read -r T_BASE T_ELIM T_DELTA N_OK N_SIG < <(awk -F';' -v det="$([ "$TARGET" = "pulp" ] && echo 1 || echo 0)" '
+        NR == 1 || $2 == "NA" { next }
+        {
+            b += $2; e += $4; n++
+            if (det) { if ($6 + 0 > 0) sig++ }
+            else if ($6 + 0 > 2 * ($7 + 0)) sig++
+        }
+        END {
+            if (n == 0) { print "NA NA NA 0 0"; exit }
+            printf "%.0f %.0f %.4f %d %d", b, e, 100 * (b - e) / b, n, sig
+        }' "$CSV")
+
+    echo "TOTAL;${T_BASE};;${T_ELIM};;${T_DELTA};" >> "$CSV"
+
+    echo ""
+    echo -e "${BOLD}=== SUMMARY A/B (${DATASET}, ${THREADS}T, runtime=${RUNTIME}) ===${RESET}"
+    printf "${BOLD}  %-20s %16s %16s %12s${RESET}\n" "kernel" "base" "elim" "saving"
+    if [ "$TARGET" = "pulp" ]; then
+        awk -F';' 'NR > 1 && $1 != "TOTAL" && $2 != "NA" {
+            printf "  %-20s %16.0f %16.0f %10s%%\n", $1, $2, $4, $6
+        }' "$CSV"
+    else
+        awk -F';' 'NR > 1 && $1 != "TOTAL" && $2 != "NA" {
+            printf "  %-20s %16.0f %16.0f %10s%% ± %s\n", $1, $2, $4, $6, $7
+        }' "$CSV"
+    fi
+    echo "  --------------------------------------------------------------------"
+    printf "${BOLD}  %-20s %16s %16s %10s%%${RESET}\n" "TOTAL" "$T_BASE" "$T_ELIM" "$T_DELTA"
+    echo ""
+    if [ "$TARGET" = "pulp" ]; then
+        echo "  $N_SIG of $N_OK kernels improve."
+    else
+        echo "  $N_SIG of $N_OK kernels save more than twice their own error."
+        echo "  The rest are below the sensitivity of the measurement, not necessarily zero."
+    fi
+
+    # --- against the paper ---------------------------------------------------
+    # Section 4.5 states this run's four aggregates. They are on GAP8 and over
+    # the whole suite, so anything else is not comparable with them.
+    if [ "$TARGET" = "pulp" ] && [ $# -eq 0 ] \
+       && [ "${#KERNEL_LIST[@]}" -eq "${#ALL_KERNELS[@]}" ] \
+       && [ -f "$CLAIMS" ]; then
+        compare_ab_to_claims
+    fi
+
+    echo ""
+    echo "  Done — $CSV"
+    if is_true "$PLOT"; then render_ab_plot; fi
+    exit 0
+fi
+
 read -r GM_NATIVE GM_OPT GM_VS_PAR GM_VS_SEQ < <(awk -F';' '
     NR == 1 { next }                         # header
     $6 == "NA" { next }                      # skipped/failed kernel
@@ -391,7 +579,23 @@ echo "    A ratio > 1.0 means lower runtime (faster); < 1.0 means higher (slower
 echo ""
 echo "  Done — $CSV"
 
-# --- Optional speedup plot -------------------------------------------------
-# (an `if`, not `&&`: as the last command, a false PLOT must not turn into a
-# non-zero exit code for the whole script)
-if is_true "$PLOT"; then render_plot; fi
+# --- Optional plots ---------------------------------------------------------
+if is_true "$PLOT"; then
+    render_plot
+    if [ "$TARGET" = "pulp" ]; then render_plot size; fi
+fi
+
+if is_true "${COMPARE:-true}" && [ "$BARRIER_ELIM" != "both" ]; then
+    compare_py="${PLOT_PYTHON:-}"
+    [ -n "$compare_py" ] || compare_py="$(command -v python3 || command -v python)" || compare_py=""
+    if [ -n "$compare_py" ]; then
+        # The configuration goes with the CSV: the comparison only runs
+        # when this run was made the way the figure was, and it is the one
+        # that knows which configuration that is.
+        "$compare_py" "$SCRIPT_DIR/lib/compare_to_reference.py" \
+            "$CSV" --runtime "$RUNTIME" \
+            --dataset "$DATASET" --threads "$THREADS" \
+            --barrier-elim "$BARRIER_ELIM" || true
+    fi
+fi
+exit 0

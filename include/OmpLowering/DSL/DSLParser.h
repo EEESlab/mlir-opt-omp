@@ -1,13 +1,4 @@
-// DSLParser.h
-//
-// C++ port of parser.py.
-// Provides:
-//   - AST node types (Program, RuntimeDecl, ConstructDecl, …)
-//   - Lexer / Parser: parse a DSL source string into a Program AST
-//
-// Usage:
-//   auto program = dsl::parse(source);   // returns dsl::Program
-//   // then pass to dsl::Evaluator
+// AST node types and the entry point that parses DSL source into a Program.
 
 #pragma once
 
@@ -22,9 +13,7 @@
 
 namespace dsl {
 
-// ===========================================================================
-// Expr
-// ===========================================================================
+// --- Expr ---
 
 struct IdentExpr;
 struct StringExpr;
@@ -43,9 +32,7 @@ struct BoolExpr   { bool value; };
 struct CallExpr   { std::string name; std::vector<Expr> args; };
 struct ListExpr   { std::vector<Expr> values; };
 
-// ===========================================================================
-// Predicate
-// ===========================================================================
+// --- Predicate ---
 
 struct PredHas;
 struct PredEq;
@@ -69,45 +56,52 @@ struct PredNot   { std::shared_ptr<Predicate> inner; };
 struct PredAnd   { std::shared_ptr<Predicate> left, right; };
 struct PredOr    { std::shared_ptr<Predicate> left, right; };
 
-// ===========================================================================
-// Action
-// ===========================================================================
+// --- Action ---
 
-struct EmitAction { std::string name; };
+struct EmitAction { std::string name; std::optional<Expr> arg; };
 struct CallAction { Expr callee; std::vector<Expr> args; };
 using Action = std::variant<EmitAction, CallAction>;
 
-// ===========================================================================
-// Statement
-// ===========================================================================
+// --- Statement ---
 
 struct LetDecl;
 struct ActionStmt;
 struct WhenStmt;
 struct OtherwiseStmt;
 struct LetStmt;
+struct LetCallStmt;
+struct BranchStmt;
 
 struct LetDecl { std::string name; Expr expr; };
 
-using Statement = std::variant<ActionStmt, WhenStmt, OtherwiseStmt, LetStmt>;
+using Statement =
+  std::variant<ActionStmt, WhenStmt, OtherwiseStmt, LetStmt, LetCallStmt,
+               BranchStmt>;
 
 struct ActionStmt    { Action action; };
 struct WhenStmt      { Predicate predicate; Action action; };
 struct OtherwiseStmt { Action action; };
+// Unlike `when`, which is settled during evaluation, this condition is a
+// run-time value and becomes a real branch in the emitted IR.  Arms hold
+// statements so the two kinds of choice can nest.  A null condition means the
+// clause is absent: the true arm is emitted inline and no branch survives.
+struct BranchStmt {
+  Expr condition;
+  std::vector<Statement> ifTrue;
+  std::vector<Statement> ifFalse;
+};
 struct LetStmt       { LetDecl decl; };
+// Binds <name> to the call's SSA result for later statements.
+struct LetCallStmt   { std::string name; CallAction call; };
 
-// ===========================================================================
-// Construct items
-// ===========================================================================
+// --- Construct items ---
 
 struct PropertyDecl { std::string name; Expr expr; };
 struct BlockDecl    { std::string name; std::vector<Statement> statements; };
 
 using ConstructItem = std::variant<LetDecl, PropertyDecl, BlockDecl>;
 
-// ===========================================================================
-// Top-level
-// ===========================================================================
+// --- Top-level ---
 
 struct ConstructDecl {
   std::string name;
@@ -115,7 +109,7 @@ struct ConstructDecl {
   std::vector<ConstructItem> items;
 };
 
-using RuntimeItem = std::variant<LetDecl, ConstructDecl>;
+using RuntimeItem = std::variant<LetDecl, PropertyDecl, ConstructDecl>;
 
 struct RuntimeDecl {
   std::string name;
@@ -126,9 +120,7 @@ struct Program {
   std::vector<RuntimeDecl> runtimes;
 };
 
-// ===========================================================================
-// Entry point
-// ===========================================================================
+// --- Entry point ---
 
 llvm::Expected<Program> parse(llvm::StringRef source);
 

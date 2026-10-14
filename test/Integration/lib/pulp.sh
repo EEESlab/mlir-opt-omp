@@ -1,37 +1,17 @@
 #!/bin/bash
-# =============================================================================
-# pulp.sh — PULP / gvsoc target (RUNTIME=pmsis, TARGET=pulp).
+# pulp.sh — the PULP/GAP8 target. Sourced by common.sh only when RUNTIME=pmsis.
 #
-# Sourced by common.sh when TARGET=pulp; not meant to be sourced directly.
-# Holds everything specific to the PULP-SDK flow: the PULP_* knobs, the SDK
-# environment setup, and the build/run helpers.
+# Builds and runs each cell through the PolyBench-PULP harness Makefile
+# ($PULP_APP_DIR) on the gvsoc simulator: the native side straight from the
+# harness, ours by cross-compiling the kernel to $PULP_APP_DIR/kernel.o first.
+# Cycles come from the 'Cycles = N' line in the run log.
 #
-# The pulp target drives an external PULP-SDK application directory: a
-# PolyBench-PULP checkout whose Makefile understands
-#     make clean all run platform=gvsoc KERNEL_SRC=<kernel.c> [OMP_NATIVE=1|OMP_OPT=1]
-# OMP_NATIVE=1 builds the kernel with the SDK's native OpenMP; OMP_OPT=1 links
-# the kernel.o we cross-compile through mlir-opt-omp (runtime=pmsis) instead.
-#
-# Build+run are fused: 'make clean all run' compiles with the PULP-SDK GCC
-# toolchain and executes on gvsoc in one shot. A "cell" is one such invocation:
-#     ref_seq  make                    (no OpenMP, plain SDK build)
-#     ref_par  make OMP_NATIVE=1       (SDK's native OpenMP)
-#     opt_seq  kernel.o (no -fopenmp) + make OMP_OPT=1
-#     opt_par  kernel.o (-fopenmp)    + make OMP_OPT=1
-# Cycle counts are scraped from the 'Cycles = N' line the harness prints.
-# =============================================================================
+# Needs the GAP SDK, gvsoc, and PULP_APP_DIR — see the PULP section of README.md.
 
-# --- PULP / gvsoc knobs ------------------------------------------------------
-
-# GAP RISC-V GCC toolchain used by the PULP-SDK make (prepended to PATH),
-# e.g. .../gap_riscv_toolchain_ubuntu/INSTALL/bin.
 PULP_TOOLCHAIN_BIN="${PULP_TOOLCHAIN_BIN:-}"
 [ -n "$PULP_TOOLCHAIN_BIN" ] && PATH="$PULP_TOOLCHAIN_BIN:$PATH"
 
 # Optional: a script to source for the GAP SDK environment
-# (e.g. $GAP_SDK/configs/gap8_v3.sh). Alternatively source it yourself
-# before running the driver. SDK scripts routinely reference unset
-# variables, so relax `set -u` around the source.
 if [ -n "${PULP_SDK_ENV:-}" ]; then
     __had_u=0; case "$-" in *u*) __had_u=1;; esac
     set +u
@@ -65,21 +45,15 @@ PULP_OPT_FLAGS="${PULP_OPT_FLAGS:-}"         # host 'opt' pass; none by default
 PULP_LLC_FLAGS="${PULP_LLC_FLAGS:--O3 -mtriple=riscv32-unknown-elf -mattr=+m,+c,+xpulpv -relocation-model=pic}"
 # Where the harness Makefile leaves the linked ELF (relative to PULP_APP_DIR).
 PULP_BUILD_BIN="${PULP_BUILD_BIN:-BUILD/GAP8_V3/GCC_RISCV_PULPOS/test}"
-# PolyBench defines baked into the opt kernel.o. Must match what the harness
-# Makefile uses for the native (ref) builds, or ref/opt would not be
-# comparable: the harness defines both TIME and DUMP_ARRAYS, so we do too
-# (on gvsoc everything ends up in the same console log anyway).
-#
-# DATA_TYPE_IS_FLOAT is the one that bites. The harness builds the ref for
-# GAP8's 32-bit FPU, so PolyBench's DATA_TYPE is float there; without the same
-# define here our kernel.o silently falls back to PolyBench's default, double.
-# The two then disagree in the last bits, which at the dump's "%0.2f" surfaces
-# as a handful of elements off by 0.01 while the rest match — a correctness
-# FAIL that looks like a lowering bug and is not one. It also made the opt side
-# do double-precision arithmetic the ref never paid for, so it skewed the
-# performance numbers the same way.
 PULP_POLYBENCH_DEFS="${PULP_POLYBENCH_DEFS:--DPOLYBENCH_DUMP_ARRAYS -DPOLYBENCH_TIME -DDATA_TYPE_IS_FLOAT}"
 PULP_VERBOSE="${PULP_VERBOSE:-0}"            # 1: stream make/gvsoc output
+# 1: keep the per-cell scratch directory (the .cir and every .mlir between it
+# and the object) instead of deleting it, so a failing step can be rerun by hand.
+PULP_KEEP_TMP="${PULP_KEEP_TMP:-0}"
+# A cir-opt pass to run on the CIR before --cir-to-llvm. Empty here and set
+# per cell by run_unroll.sh, the same way run_performance.sh sets
+# BARRIER_ELIM_FLAG for the mlir-opt-omp call below.
+CIR_UNROLL_FLAG="${CIR_UNROLL_FLAG:-}"
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -104,11 +78,16 @@ pulp_extract_dump() {
     tr -d '\r' < "$1" | sed -n '/==BEGIN DUMP_ARRAYS==/,/==END DUMP_ARRAYS==/p'
 }
 
+# Drop the scratch directory, or say where it is when asked to keep it.
+pulp_drop_tmp() {
+    if [ "$PULP_KEEP_TMP" = "1" ]; then
+        echo "  intermediates kept in $1"
+    else
+        rm -rf "$1"
+    fi
+}
+
 # compile_pulp_kernel_obj <src> <outdir> <omp:on|off>
-# The CIR/MLIR pipeline for the pulp target: lowers through mlir-opt-omp with
-# the pmsis rules and cross-compiles to $PULP_APP_DIR/kernel.o (riscv32), which
-# the harness Makefile links when invoked with OMP_OPT=1. The final LLVM IR is
-# kept in <outdir> for debugging.
 compile_pulp_kernel_obj() {
     local src="$1" outdir="$2" omp="${3:-on}"
     local name; name="$(basename "${src%.c}")"
@@ -126,11 +105,22 @@ compile_pulp_kernel_obj() {
         -Xclang -fclangir -Xclang -emit-cir $omp_cir $WARN_SUPPRESS \
         -I"$INC" -I"$(dirname "$src")" -I"$INC_OMP" \
         -DPULP_TARGET -D"$DATASET" $PULP_POLYBENCH_DEFS \
-        "$src" -o "$tmpdir/$name.cir" || { rm -rf "$tmpdir"; return 1; }
+        "$src" -o "$tmpdir/$name.cir" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
-    # 2) CIR -> LLVM dialect MLIR (strip residual cir.* attrs)
-    "$CIR_OPT" "$tmpdir/$name.cir" --cir-to-llvm --reconcile-unrealized-casts \
-        -o "$tmpdir/$name-s1.mlir" || { rm -rf "$tmpdir"; return 1; }
+    # 2) CIR -> LLVM dialect MLIR (strip residual cir.* attrs). A CIR-level
+    #    pass, when one was asked for, runs here: on the CIR, while it is
+    #    still there to work on.
+    #    --mlir-disable-threading: with the thread pool on, the unroll pass
+    #    fails on a different kernel each run, always as a segfault inside
+    #    the parallel verifier. Single-threaded the run is reproducible, and
+    #    a pass that really does produce bad IR then reports it instead of
+    #    crashing. Costs nothing measurable on modules this size, and it
+    #    applies to both cells so the two stay comparable.
+    "$CIR_OPT" "$tmpdir/$name.cir" \
+        --mlir-disable-threading \
+        ${CIR_UNROLL_FLAG:+$CIR_UNROLL_FLAG} \
+        --cir-to-llvm --reconcile-unrealized-casts \
+        -o "$tmpdir/$name-s1.mlir" || { pulp_drop_tmp "$tmpdir"; return 1; }
     sed -i -E 's/cir\.[^,}]+,? ?//g' "$tmpdir/$name-s1.mlir"
 
     # 3) custom OMP lowering (pmsis rules)
@@ -138,37 +128,34 @@ compile_pulp_kernel_obj() {
         --allow-unregistered-dialect \
         --omp-lower-dsl="$RULES" \
         --omp-lower-runtime="$RUNTIME" \
+        ${BARRIER_ELIM_FLAG:+$BARRIER_ELIM_FLAG} \
         --omp-to-omp-lower --omp-outline --omp-lower-plan \
         "$tmpdir/$name-s1.mlir" > "$tmpdir/$name-s2.mlir" \
-        || { rm -rf "$tmpdir"; return 1; }
+        || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 4) minimal conversion to the LLVM dialect (no canonicalise/cse pipeline
     #    here — mirrors the proven pulp flow)
     "$MLIR_OPT" "$tmpdir/$name-s2.mlir" \
         --convert-arith-to-llvm --convert-func-to-llvm \
         --reconcile-unrealized-casts \
-        -o "$tmpdir/$name-s3.mlir" || { rm -rf "$tmpdir"; return 1; }
+        -o "$tmpdir/$name-s3.mlir" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 5) MLIR -> LLVM IR
     "$MLIR_TRANSLATE" "$tmpdir/$name-s3.mlir" --mlir-to-llvmir \
-        > "$tmpdir/$name.ll" || { rm -rf "$tmpdir"; return 1; }
+        > "$tmpdir/$name.ll" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
     # 6) opt (riscv-capable install), 7) llc -> riscv32 object for the harness
     "$PULP_OPT" $PULP_OPT_FLAGS -S "$tmpdir/$name.ll" -o "$tmpdir/$name.opt.ll" \
-        || { rm -rf "$tmpdir"; return 1; }
+        || { pulp_drop_tmp "$tmpdir"; return 1; }
     "$PULP_LLC" $PULP_LLC_FLAGS -filetype=obj "$tmpdir/$name.opt.ll" \
-        -o "$PULP_APP_DIR/kernel.o" || { rm -rf "$tmpdir"; return 1; }
+        -o "$PULP_APP_DIR/kernel.o" || { pulp_drop_tmp "$tmpdir"; return 1; }
 
-    cp "$tmpdir/$name.opt.ll" "$outdir/${name}_omp-${omp}.ll"
-    rm -rf "$tmpdir"
+    cp "$tmpdir/$name.opt.ll" \
+        "$outdir/${name}_omp-${omp}${CIR_UNROLL_FLAG:+_unrolled}.ll"
+    pulp_drop_tmp "$tmpdir"
     [ -f "$PULP_APP_DIR/kernel.o" ]
 }
 
-# pulp_cell <src> <cell:ref_seq|ref_par|opt_seq|opt_par> <outdir> <logfile>
-# Builds and runs one cell on gvsoc (appending to <logfile>) and echoes
-# "cycles;bytes" — cycles from the run log, bytes = size of the linked ELF.
-# Either field is NA when it could not be determined. Non-zero on build/run
-# failure.
 pulp_cell() {
     local src="$1" cell="$2" outdir="$3" logfile="$4"
     local karg; karg="$(pulp_kernel_arg "$src")"
@@ -180,7 +167,8 @@ pulp_cell() {
         opt_seq|opt_par)
             local omp="off"; [ "$cell" = "opt_par" ] && omp="on"
             compile_pulp_kernel_obj "$src" "$outdir" "$omp" >> "$logfile" 2>&1 \
-                || { echo "  ERROR: kernel.o pipeline failed — see $logfile" >&2; return 1; }
+                || { echo "  ERROR: kernel.o pipeline failed — last lines of $logfile:" >&2
+                     tail -n 8 "$logfile" >&2; return 1; }
             mk+=(OMP_OPT=1)
             ;;
         *) echo "pulp_cell: bad cell '$cell'" >&2; return 1 ;;

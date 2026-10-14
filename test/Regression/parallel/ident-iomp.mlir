@@ -1,0 +1,50 @@
+// Per-construct ident_t emission on the iomp path (OmpOutliningPass).
+//
+// An omp.parallel emits a default-flags ident for the fork
+//   KMPC                = 0x02 = 2   -> @__omp_ident_2
+// An explicit omp.barrier inside the outlined region emits
+//   KMPC | BARRIER_EXPL = 0x22 = 34  -> @__omp_ident_22
+//
+// The ident_t global name encodes the flag bitmask in hex, so asserting the
+// name asserts the flags. One private constant global is interned per distinct
+// flags value (dedup by construction via lookupSymbol), and they all share a
+// single psource string @__omp_src_loc_default = ";unknown;unknown;0;0;;"
+// whose length (NUL excluded) is stored in reserved_3 = 22.
+// See docs/lowering-specs/ident-lowering-spec.md.
+//
+// The @sink call after the barrier keeps it from being the region's trailing
+// op, so --omp-barrier-elim could not drop it either (that removal is covered
+// by barrier-elim/explicit-barriers.mlir) and its ident is emitted here as
+// intended.
+//
+// RUN: mlir-opt-omp %s --omp-lower-dsl=%rules_dsl --omp-lower-runtime=iomp \
+// RUN:   --omp-to-omp-lower --omp-outline --omp-lower-plan | FileCheck %s
+
+llvm.func @sink()
+
+func.func @parallel_with_barrier() {
+  omp.parallel {
+    omp.barrier
+    llvm.call @sink() : () -> ()
+    omp.terminator
+  }
+  return
+}
+
+// Two distinct ident globals — the hex suffix is the flag bitmask:
+// CHECK-DAG: llvm.mlir.global {{.*}}@__omp_ident_2(
+// CHECK-DAG: llvm.mlir.global {{.*}}@__omp_ident_22(
+
+// Shared default source-location string (one global, reused by every ident):
+// CHECK-DAG: llvm.mlir.global {{.*}}@__omp_src_loc_default(";unknown;unknown;0;0;;
+
+// Struct payload: explicit-barrier flags = 34, reserved_3 = strlen(psource) = 22:
+// CHECK-DAG: llvm.mlir.constant(34 : i32)
+// CHECK-DAG: llvm.mlir.constant(22 : i32)
+// CHECK-DAG: llvm.mlir.addressof @__omp_src_loc_default
+
+// The fork takes the default ident; the barrier takes the explicit-barrier one:
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_2 :
+// CHECK-DAG: llvm.mlir.addressof @__omp_ident_22 :
+// CHECK-DAG: @__kmpc_fork_call
+// CHECK-DAG: @__kmpc_barrier

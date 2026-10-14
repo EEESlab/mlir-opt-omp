@@ -25,7 +25,7 @@ ready for `mlir-translate` and the LLVM back-end.
 |---|---|---|---|
 | `omp.parallel` | ✅ `__kmpc_fork_call` | ✅ `GOMP_parallel` | ✅ `ext_pi_cl_team_fork` |
 | `omp.barrier` | ✅ `__kmpc_barrier` | ✅ `GOMP_barrier` | ✅ `ext_pi_cl_team_barrier` |
-| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4` | ✅ static — computed thread bounds | ✅ computed thread bounds |
+| `omp.wsloop` | ✅ static — `__kmpc_for_static_init_4`<br>✅ dynamic — `__kmpc_dispatch_init_4`/`_next_4` | ✅ static — computed thread bounds<br>✅ dynamic — `GOMP_loop_dynamic_start`/`_next` | ✅ static — computed thread bounds |
 | `omp.task` | ⏳ planned | ✅ `GOMP_task` | ⏳ API to be defined |
 
 
@@ -47,13 +47,13 @@ Which one you need depends on whether you want to compile **from C** or to use a
 
 ClangIR is the front-end that turns C into the MLIR this tool consumes, and the
 OpenMP part of it is not upstream yet: upstream ClangIR emits `omp.parallel`
-and `omp.barrier`, while `#pragma omp for`, `parallel for` and `task` still hit
+and `omp.barrier`, while `#pragma omp for` and `parallel for` still hit
 `errorNYI`. The emission this pipeline needs lives in the **EEESlab fork**.
 
 ```sh
-git clone -b users/lucap/cir-omp-clauses \
+git clone -b users/gtagliavini/cir-unroll-by-two \
   https://github.com/EEESlab/llvm-project.git
-git -C llvm-project checkout 9be70f177d9b     # last known-good, see below
+git -C llvm-project checkout a73fc656e538     # last known-good, see below
 ```
 
 and build it with CIR enabled — the paths below are relative to the directory
@@ -74,9 +74,10 @@ cmake --build llvm-project/build
 
 Notes:
 
-- `9be70f177d9b` is the commit the C pipelines below are tested against
-  (`clang --version` then reports `23.0.0git … EEESlab/llvm-project`). Skip the
-  `git checkout` to take the branch tip instead.
+- `a73fc656e538` is the commit the C pipelines below are tested against
+  (`clang --version` then reports `23.0.0git … EEESlab/llvm-project`), and the
+  one the Docker image is built from. Skip the `git checkout` to take the
+  branch tip instead.
 - `RISCV` in `LLVM_TARGETS_TO_BUILD` is only needed for the PULP/`pmsis` target.
 - `LLVM_INSTALL_UTILS=ON` installs `FileCheck`, for Regression tests.
 - No install step is needed: step 2 works against this build tree as it is. Add
@@ -103,8 +104,7 @@ LLVM **install** prefix, if you installed it. Everything resolves through
 `LLVM_LIBRARY_DIR`, so both work unchanged.
 
 Keep the build directory named `build`: it is what `local.env.example` and the
-setups in [`docs/setups/`](docs/setups/) use for `OMP_TOOL_BIN`, and what the
-`quick-compile/` scripts fall back to.
+setups in [`docs/setups/`](docs/setups/) use for `OMP_TOOL_BIN`.
 
 If `<LLVM_DIR>` is an install prefix and its build tree is gone, CMake warns
 here that it found no `lit` and the regression suite will not run. Either
@@ -130,7 +130,8 @@ cmake --build build --target check-omp
 different runtimes.
 
 ```sh
-build/mlir-opt-omp quick-compile/test.mlir --omp-lower-dsl=rules.dsl \
+build/mlir-opt-omp test/Regression/wsloop/schedule-static/schedule-static-iomp.mlir \
+  --omp-lower-dsl=rules.dsl \
   --omp-to-omp-lower --omp-outline --omp-lower-plan \
   --omp-lower-runtime=iomp | grep 'call @'
 ```
@@ -139,7 +140,7 @@ build/mlir-opt-omp quick-compile/test.mlir --omp-lower-dsl=rules.dsl \
 call @__kmpc_for_static_init_4(...)
 call @__kmpc_for_static_fini(...)
 call @__kmpc_barrier(...)
-%6 = call @__kmpc_global_thread_num(...)
+llvm.call @sink(...)
 llvm.call @__kmpc_fork_call(...)
 ```
 
@@ -147,29 +148,27 @@ Change one word — `--omp-lower-runtime=libgomp` — and the same loop comes ou
 against the GCC runtime instead:
 
 ```mlir
-%17 = call @omp_get_thread_num() : () -> i32
-%27 = call @omp_get_num_threads() : () -> i32
+%15 = call @omp_get_thread_num() : () -> i32
+%16 = call @omp_get_num_threads() : () -> i32
 call @GOMP_barrier() : () -> ()
+llvm.call @sink(...)
 call @GOMP_parallel(...)
 ```
 
+`@sink` is the loop body of that test case — everything around it is what the
+rule file put there.
 
-**3. Run binary.** Takes the same MLIR to a linked executable and checks the
-numbers it prints. Besides `gcc` and `libgomp` it drives `mlir-opt`,
-`mlir-translate`, `opt` and `llc`, which it locates through `local.env` — so
-either copy the template first or have them on `PATH`:
+**3. Run it end to end.** The suite above checks IR. The integration drivers
+take a real PolyBench kernel through clang→CIR→`mlir-opt-omp`→binary and compare
+the numbers it prints against the same kernel built on the native runtime. They
+need the full toolchain, which they locate through `local.env`:
 
 ```sh
-cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN
-quick-compile/compile-from-mlir.sh
+cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN, INC_OMP
+cd test/Integration && ./run_correctness.sh
 ```
 
-```
-PASS (libgomp): ./test printed 11..110
-```
-
-From here: [Usage](#usage) for the pass pipeline,
-[`quick-compile/`](quick-compile/README.md) for the C front-end pipelines, and
+From here: [Usage](#usage) for the pass pipeline, and
 [`test/Integration/`](test/Integration/README.md) for the PolyBench
 correctness and performance suites.
 
@@ -195,6 +194,7 @@ omp.*  ──[--omp-to-omp-lower]──▶  omp_lower.construct  ──[--omp-ou
 
 | Pass | Does |
 |---|---|
+| `--omp-barrier-elim` | optional, runs first: drops redundant team barriers. It doesn't read DSL |
 | `--omp-to-omp-lower` | reads the DSL and turns each `omp.*` op into an `omp_lower.construct` carrying its `pre`/`invoke`/`post` plan |
 | `--omp-outline` | outlines construct body regions into `func.func` with the runtime's entry signature, and lowers `omp.wsloop` |
 | `--omp-lower-plan` | replaces each `omp_lower.construct` with the concrete runtime calls |
@@ -233,8 +233,8 @@ llc -relocation-model=pic -filetype=obj s4.ll -o test.o
 clang -O3 -fopenmp test.o main.o -o test
 ```
 
-Runnable versions of this, per runtime, are in
-[`quick-compile/`](quick-compile/README.md)
+A runnable version of this, per runtime, is what the integration drivers do —
+see [`test/Integration/`](test/Integration/README.md).
 
 ## Testing
 
@@ -256,13 +256,13 @@ and a per-machine config:
 ```sh
 cp local.env.example local.env && $EDITOR local.env   # LLVM_BIN, OMP_TOOL_BIN, INC_OMP
 cd test/Integration
-./run_correctness.sh                     # bundled kernels, iomp
+./run_correctness.sh                     # whole PolyBench suite, iomp
 RUNTIME=libgomp ./run_performance.sh
 ```
 
-`local.env` holds the per-machine tool paths and is git-ignored; the
-`quick-compile/` scripts read the same file. Ready-made ones for the machines
-this project is developed on are in [`docs/setups/`](docs/setups/). What the
+`local.env` holds the per-machine tool paths and is git-ignored. Ready-made ones
+for the machines this project is developed on are in
+[`docs/setups/`](docs/setups/). What the
 tests *run* is separate and optional
 ([`test/Integration/run.env.example`](test/Integration/run.env.example)).
 
@@ -292,10 +292,10 @@ tools/mlir-opt-omp/          the executable: flag extraction, registration
 test/                        regression + integration suites
 docs/
   lowering-specs/            lowering specifications (ident_t parity, omp.task)
+                             and DSL design notes
   setups/                    ready-made local.env files, per dev machine
-quick-compile/               one-shot pipeline scripts for a small kernel
 scripts/                     load-local-env.sh — the tool-path resolution the
-                             test drivers and quick-compile/ share
+                             test drivers share
 ```
 
 The sources behind it:
@@ -318,7 +318,26 @@ only `LLVMSupport`), `MLIROmpLowering` (the dialect) and
 
 To add a construct or a runtime, start from [`rules.dsl`](rules.dsl): each
 `runtime` block declares its constructs, and each construct its
-`outline_signature`, `capture_strategy` and `pre`/`invoke`/`post` blocks. A
+`capture_strategy` — the sole ABI selector, which also fixes the outlined
+function's signature — and its blocks. A block is any name followed by `{ ... }`
+and says *when* its calls run: `pre`, `invoke` and `post` around the construct,
+and for a work-sharing loop whose iterations the runtime hands out a chunk at a
+time, `first_chunk` and `next_chunk` around each chunk. `next_chunk` is what
+makes a loop chunked; `first_chunk` is only for a runtime whose opening call
+differs from the repeat one, as libgomp's does.
+
+Such a loop also has three properties for the shape of its dispatch ABI. Each
+defaults to what iomp's `__kmpc_dispatch_*_4` does, so a runtime that agrees
+declares none of them, and a value none of them understands is an error rather
+than a silent fallback:
+
+| property | default | says |
+|---|---|---|
+| `chunk_index` | the induction variable's type | width of the bound slots and of the values passed by value (`i64` for libgomp, which is `long`-based whatever the loop is) |
+| `chunk_result` | `i32` | what the acquisition call answers with (`i8` for a C `_Bool`) |
+| `chunk_bound` | `inclusive` | whether the upper bound written into the slot is the last valid iteration or the one past it |
+
+A
 change there is picked up at run time — no rebuild needed — which makes it easy
 to iterate with a regression test. Constructs whose lowering needs more than the
 DSL expresses (new `emit` primitives, a different outline shape) also require
@@ -327,3 +346,8 @@ C++ work in `lib/Transforms/OmpOutliningPass.cpp`.
 Every new feature should come with a regression test under `test/Regression/`;
 [`test/README.md`](test/README.md) documents the format and the available lit
 substitutions.
+
+## License
+
+Apache License v2.0 with LLVM Exceptions, the license of the LLVM project this
+tool builds on. See [`LICENSE`](LICENSE).

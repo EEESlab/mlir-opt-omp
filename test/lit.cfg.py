@@ -11,8 +11,9 @@ from lit.llvm import llvm_config
 # name: The name of this test suite.
 config.name = "OMP-LOWER"
 
-# testFormat: shell-based, like the rest of LLVM/MLIR.
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+# testFormat: shell-based, like the rest of LLVM/MLIR. Internal shell: running
+# the RUN lines through an external one is deprecated from LLVM-23 on.
+config.test_format = lit.formats.ShTest(execute_external=False)
 
 # suffixes: a regression test is a .mlir file with RUN/CHECK annotations.
 config.suffixes = [".mlir"]
@@ -27,6 +28,7 @@ config.test_exec_root = os.path.join(config.omp_lower_obj_root, "test")
 config.excludes = [
     "Inputs",
     "Integration",
+    "LoC",
     "CMakeLists.txt",
     "README.md",
     "lit.cfg.py",

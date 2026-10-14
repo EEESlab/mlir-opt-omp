@@ -1,21 +1,11 @@
 #!/bin/bash
-# =============================================================================
-# native.sh — the host (TARGET=native) compile pipelines.
+# native.sh — the host compile pipelines. Sourced by common.sh.
 #
-# Sourced by common.sh; not meant to be sourced directly.
-#   compile_opt  — clang->CIR -> mlir-opt-omp -> LLVM -> host binary
-#   compile_ref  — stock OpenMP compiler ($REF_CC), the reference build
+#   compile_ref  the stock OpenMP compiler, one step
+#   compile_opt  C -> ClangIR -> mlir-opt-omp -> LLVM IR -> object -> link
 #
-# The caller sets POLYBENCH_CFLAGS before invoking the compile functions:
-#   correctness -> -DPOLYBENCH_DUMP_ARRAYS
-#   performance -> -DPOLYBENCH_TIME -DPOLYBENCH_CYCLE_ACCURATE_TIMER
-# =============================================================================
+# Both take (src, outdir, binname, omp on|off) and leave the binary in outdir.
 
-# --- opt: the CIR/MLIR pipeline --------------------------------------------
-# compile_opt <src> <outdir> <binname> <omp:on|off>
-#   omp=on  -> parallel (constructs lowered through mlir-opt-omp)
-#   omp=off -> sequential baseline of the *same* pipeline (no -fopenmp, so the
-#              front-end never emits omp.* ops)
 compile_opt() {
     local src="$1" outdir="$2" binname="$3" omp="${4:-on}"
     local name; name="$(basename "${src%.c}")"
@@ -47,6 +37,7 @@ compile_opt() {
         --allow-unregistered-dialect \
         --omp-lower-dsl="$RULES" \
         --omp-lower-runtime="$RUNTIME" \
+        ${BARRIER_ELIM_FLAG:+$BARRIER_ELIM_FLAG} \
         --omp-to-omp-lower --omp-outline --omp-lower-plan \
         "$tmpdir/$name-s1.mlir" > "$tmpdir/$name-s2.mlir" \
         || { rm -rf "$tmpdir"; return 1; }
@@ -64,7 +55,7 @@ compile_opt() {
         > "$tmpdir/$name.ll" || { rm -rf "$tmpdir"; return 1; }
 
     # 6) opt -O3, 7) llc -> object
-    "$OPT" -S -O3 "$tmpdir/$name.ll" > "$tmpdir/$name.opt.ll" \
+    "$OPT" -S -O3 $OPT_STRICT_FP "$tmpdir/$name.ll" > "$tmpdir/$name.opt.ll" \
         || { rm -rf "$tmpdir"; return 1; }
     "$LLC" -O3 -relocation-model=pic -filetype=obj "$tmpdir/$name.opt.ll" \
         -o "$tmpdir/$name.o" || { rm -rf "$tmpdir"; return 1; }

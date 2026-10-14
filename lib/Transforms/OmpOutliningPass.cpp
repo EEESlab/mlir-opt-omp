@@ -1,29 +1,11 @@
-// OmpOutliningPass.cpp
-//
-// Two responsibilities in one pass:
-//
-// 1. PARALLEL OUTLINING — for each omp_lower.construct with a body region:
-//    - Collect captures, create @outlined_parallel_N func.func
-//    - Move region body into it, wire captured values as block args
-//    - Emit __kmpc_fork_call (iomp) or GOMP_parallel (libgomp) with captures
-//    - Create per-flags __omp_ident_<hex> globals (Clang-parity ident_t) on
-//      demand via getOrCreateIdent; "emit ident" requests the default one
-//
-//    Capture strategies:
-//      by_pointer (iomp): each capture passed as a separate pointer argument
-//      packed (libgomp):  all captures packed into an alloca'd struct,
-//                         a single ptr to the struct is passed as 'data'
-//
-// 2. WSLOOP LOWERING — for each omp.wsloop surviving inside outlined funcs:
-//    - Extract context (schedule, nowait, bounds) from the omp.loop_nest
-//    - Call dsl::Evaluator::buildPlan(runtime, "wsloop", ctx) to get the plan
-//    - Emit plan.pre (runtime init call OR `emit thread_bounds` → block chunk),
-//      then an explicit loop, then plan.post
+// Two passes in one: outlines omp_lower.construct bodies into func.func ops,
+// and lowers omp.wsloop from its DSL plan.
 
 #include "OmpLowering/Transforms/OmpOutliningPass.h"
 #include "OmpLowering/IR/OmpLoweringOps.h"
 #include "OmpLowering/DSL/DSLEvaluator.h"
 #include "OmpLowering/DSL/DSLParser.h"
+#include "PlanEmit.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -41,39 +23,21 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::omp_lower;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Type helpers
-// ---------------------------------------------------------------------------
-
-static Type ptrTy(MLIRContext *ctx) {
-  return LLVM::LLVMPointerType::get(ctx);
-}
-
-static Type i32Ty(MLIRContext *ctx) {
-  return IntegerType::get(ctx, 32);
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-// Classify captures: returns true if this capture is a private variable
-// (scalar alloca written before read inside the region — e.g. loop IV).
 static bool isPrivateCapture(Value val, Region &region) {
   auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
   if (!allocaOp) return false;
   Type elemTy = allocaOp.getElemType();
-  // Only scalar non-pointer types can be private IVs.
   if (!LLVM::isCompatibleType(elemTy)) return false;
   if (llvm::isa<LLVM::LLVMPointerType>(elemTy)) return false;
   if (llvm::isa<LLVM::LLVMArrayType>(elemTy)) return false;
   if (llvm::isa<LLVM::LLVMStructType>(elemTy)) return false;
-  // Check if first use in region is a store (addr operand).
   bool firstIsStore = false, found = false;
   region.walk([&](Operation *op) {
     if (found) return;
@@ -89,26 +53,16 @@ static bool isPrivateCapture(Value val, Region &region) {
   return firstIsStore;
 }
 
-// Returns true if this capture is a scalar alloca whose value should be packed
-// by value into the capture struct (instead of storing the alloca pointer).
-// Criteria: the captured value is an AllocaOp result whose element type is a
-// scalar non-pointer LLVM-compatible type (i.e. integer or float), AND the
-// first use of the alloca inside the region is a load (shared-read, not a
-// private-write like a loop IV).  These captures correspond to variables like
-// alpha and beta in GEMM: their value is read-only inside the parallel region,
-// so we can capture the scalar value itself and avoid the extra pointer
-// dereference that would otherwise appear on every use inside the inner loop.
+// A scalar alloca read-only inside the region, so its value can be packed into
+// the capture struct directly and save a dereference on every use.
 static bool isScalarAllocaCapture(Value val, Region &region) {
   auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
   if (!allocaOp) return false;
   Type elemTy = allocaOp.getElemType();
-  // Must be a scalar non-pointer LLVM type (integer or float).
   if (!LLVM::isCompatibleType(elemTy)) return false;
   if (llvm::isa<LLVM::LLVMPointerType>(elemTy)) return false;
   if (llvm::isa<LLVM::LLVMArrayType>(elemTy)) return false;
   if (llvm::isa<LLVM::LLVMStructType>(elemTy)) return false;
-  // The first use in the region must be a load (addr operand), not a store.
-  // If it is a store this is a private IV — handled by isPrivateCapture.
   bool firstIsLoad = false, found = false;
   region.walk([&](Operation *op) {
     if (found) return;
@@ -124,11 +78,6 @@ static bool isScalarAllocaCapture(Value val, Region &region) {
   return firstIsLoad;
 }
 
-// Returns true if this capture is a ptr-typed alloca whose stored value
-// (a pointer to e.g. an array) should be packed directly into the capture
-// struct, eliminating one extra dereference inside the outlined function.
-// Criteria: alloca with element type ptr, and the first use in the region
-// is a load (reading the stored pointer, not writing it — i.e. not a private IV).
 static bool isPtrAllocaCapture(Value val, Region &region) {
   auto allocaOp = val.getDefiningOp<LLVM::AllocaOp>();
   if (!allocaOp) return false;
@@ -159,18 +108,64 @@ static SmallVector<Value> collectCaptures(Region &region) {
   return captures;
 }
 
+// Partition captures into the three special-cased kinds.  Anything in none of
+// them is captured as-is.  Order matters: each test excludes earlier claims.
+static void classifyCaptures(ArrayRef<Value> captures, Region &region,
+                             llvm::SetVector<Value> &privateCaptures,
+                             llvm::SetVector<Value> &scalarAllocaCaptures,
+                             llvm::SetVector<Value> &ptrAllocaCaptures) {
+  for (auto cap : captures)
+    if (isPrivateCapture(cap, region))
+      privateCaptures.insert(cap);
+  for (auto cap : captures)
+    if (!privateCaptures.contains(cap) && isScalarAllocaCapture(cap, region))
+      scalarAllocaCaptures.insert(cap);
+  for (auto cap : captures)
+    if (!privateCaptures.contains(cap) && !scalarAllocaCaptures.contains(cap) &&
+        isPtrAllocaCapture(cap, region))
+      ptrAllocaCaptures.insert(cap);
+}
+
+// A firstprivate value must be snapshotted into the capture struct at creation,
+// not read through a pointer at entry, or a deferred task running after the
+// source was mutated sees the wrong value.  classifyCaptures misses these.
+static void forceFirstprivateByValue(
+    Region &body, ArrayRef<Value> captures,
+    const llvm::SetVector<Value> &privateCaptures,
+    llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures) {
+  size_t numPriv = body.empty() ? 0 : body.front().getNumArguments();
+  for (size_t i = 0; i < numPriv && i < captures.size(); i++) {
+    Value src = captures[i];
+    if (privateCaptures.contains(src) || scalarAllocaCaptures.contains(src) ||
+        ptrAllocaCaptures.contains(src))
+      continue;
+    if (auto a = src.getDefiningOp<LLVM::AllocaOp>()) {
+      Type et = a.getElemType();
+      if (LLVM::isCompatibleType(et) &&
+          !llvm::isa<LLVM::LLVMPointerType>(et) &&
+          !llvm::isa<LLVM::LLVMArrayType>(et) &&
+          !llvm::isa<LLVM::LLVMStructType>(et))
+        scalarAllocaCaptures.insert(src);
+    }
+  }
+}
+
 static void replaceUsesInRegion(Region &region, Value oldVal, Value newVal) {
   for (auto &use : llvm::make_early_inc_range(oldVal.getUses()))
     if (region.isAncestor(use.getOwner()->getParentRegion()))
       use.set(newVal);
 }
 
-// The single clause operand carried by a ConstructOp, if any: num_threads for
-// parallel, if_clause for task.  Which one it is follows from the construct
-// kind and the symbolic arg name being resolved in the plan.
-static Value getClauseOperand(ConstructOp op) {
-  auto ops = op.getClauseOperands();
-  return ops.empty() ? Value() : ops[0];
+// Clause operands ride on the ConstructOp as one variadic list; the parallel
+// clause_names attribute says which clause each entry is.
+static Value getClauseOperand(ConstructOp op, llvm::StringRef name) {
+  auto names = op.getClauseNames();
+  if (!names) return Value();
+  for (auto [i, n] : llvm::enumerate(*names))
+    if (llvm::cast<StringAttr>(n).getValue() == name)
+      return op.getClauseOperands()[i];
+  return Value();
 }
 
 static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
@@ -181,44 +176,24 @@ static std::string getPropStr(ConstructOp op, llvm::StringRef key) {
   return "";
 }
 
-static func::FuncOp getOrInsertDecl(ModuleOp module,
-                                    llvm::StringRef name,
-                                    ArrayRef<Type> argTypes,
-                                    OpBuilder &builder) {
-  if (auto f = module.lookupSymbol<func::FuncOp>(name)) return f;
-  auto fnType = builder.getFunctionType(argTypes, {});
-  OpBuilder::InsertionGuard g(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  auto decl = func::FuncOp::create(builder.getUnknownLoc(), name, fnType);
-  module.getBody()->push_back(decl);
-  decl.setVisibility(SymbolTable::Visibility::Private);
-  decl->setAttr("llvm.linkage",
-                LLVM::LinkageAttr::get(module.getContext(),
-                                       LLVM::Linkage::External));
-  return decl;
+// capture_strategy is the single ABI discriminator; it entails the signature.
+//   by_pointer -> microtask     void(gtid, btid, cap0, ...)
+//   packed     -> closure       void(ptr data)
+//   shareds    -> task routine  i32(gtid, ptr task), captures via task->shareds
+enum class CaptureAbi { ByPointer, Packed, Shareds };
+
+static std::optional<CaptureAbi> parseCaptureAbi(llvm::StringRef s) {
+  if (s == "by_pointer") return CaptureAbi::ByPointer;
+  if (s == "packed")     return CaptureAbi::Packed;
+  if (s == "shareds")    return CaptureAbi::Shareds;
+  return std::nullopt;
 }
 
-static func::FuncOp getOrInsertDeclWithReturn(ModuleOp module,
-                                              llvm::StringRef name,
-                                              ArrayRef<Type> argTypes,
-                                              Type returnType,
-                                              OpBuilder &builder) {
-  if (auto f = module.lookupSymbol<func::FuncOp>(name)) return f;
-  SmallVector<Type> resultTypes = {returnType};
-  auto fnType = builder.getFunctionType(argTypes, resultTypes);
-  OpBuilder::InsertionGuard g(builder);
-  builder.setInsertionPointToStart(module.getBody());
-  auto decl = func::FuncOp::create(builder.getUnknownLoc(), name, fnType);
-  module.getBody()->push_back(decl);
-  decl.setVisibility(SymbolTable::Visibility::Private);
-  decl->setAttr("llvm.linkage",
-                LLVM::LinkageAttr::get(module.getContext(),
-                                       LLVM::Linkage::External));
-  return decl;
+static LLVM::LLVMStructType getPropStructType(ConstructOp op, llvm::StringRef key,
+    MLIRContext *ctx, LLVM::LLVMStructType fallback) {
+  return parseStructProp(ctx, getPropStr(op, key), fallback);
 }
 
-// Emit a call to a no-arg function returning i32 (e.g. pi_core_id).
-// Handles both func.func and llvm.func declarations.
 static Value emitNoArgI32Call(ModuleOp module, OpBuilder &builder,
                                Location loc, llvm::StringRef name) {
   MLIRContext *ctx = module.getContext();
@@ -231,163 +206,455 @@ static Value emitNoArgI32Call(ModuleOp module, OpBuilder &builder,
   return func::CallOp::create(builder, loc, decl, ValueRange{}).getResult(0);
 }
 
-// Map a DSL ident flag token to the effective `ident_t.flags` bitmask.
-// KMP_IDENT_KMPC (0x02) is always set, mirroring OMPIRBuilder::getOrCreateIdent.
-// Values match clang's OpenMPLocationFlags (CGOpenMPRuntime.cpp).
-static uint32_t identFlagBits(llvm::StringRef tok) {
-  uint32_t kmpc = 0x02;
-  if (tok.empty() || tok == "kmpc")        return kmpc;
-  if (tok == "barrier_expl")               return kmpc | 0x20;
-  if (tok == "barrier_impl" ||
-      tok == "barrier_impl_for")           return kmpc | 0x40;
-  if (tok == "barrier_impl_sections")      return kmpc | 0xC0;
-  if (tok == "barrier_impl_single")        return kmpc | 0x140;
-  if (tok == "work_loop")                  return kmpc | 0x200;
-  if (tok == "work_sections")              return kmpc | 0x400;
-  if (tok == "work_distribute")            return kmpc | 0x800;
-  return kmpc; // unknown token → plain KMPC
+// --- Capture-layout helpers (closure and task_entry) ---
+// Both use the same packed struct; only where it lives differs.
+
+static LLVM::LLVMStructType buildCaptureStruct(
+    MLIRContext *ctx, ArrayRef<Value> captures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    SmallVectorImpl<Type> &fieldTypes) {
+  for (auto cap : captures) {
+    if (scalarAllocaCaptures.contains(cap))
+      fieldTypes.push_back(cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
+    else
+      fieldTypes.push_back(cap.getType());
+  }
+  return LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
 }
 
-// Recognise a symbolic ident reference: "ident", "%ident", or "%ident:<flag>".
-// On match, set `flagsOut` to the effective flag bits and return true.
-static bool parseIdentRef(llvm::StringRef s, uint32_t &flagsOut) {
-  if (!(s.consume_front("%ident") || s.consume_front("ident")))
-    return false;
-  llvm::StringRef flag = "";
-  if (s.consume_front(":"))
-    flag = s;
-  else if (!s.empty())
-    return false; // e.g. "identity" must not match
-  flagsOut = identFlagBits(flag);
-  return true;
+static void unpackCapturesFromBase(
+    OpBuilder &b, Location loc, Value one64, Value structBase,
+    LLVM::LLVMStructType structTy, ArrayRef<Value> captures,
+    const llvm::SetVector<Value> &privateCaptures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures, Region &fnBody,
+    SmallVectorImpl<Value> *loadedCaptures = nullptr) {
+  auto ptr = ptrTy(b.getContext());
+  for (size_t i = 0; i < captures.size(); i++) {
+    Value result;
+    if (privateCaptures.contains(captures[i])) {
+      // Private capture: a fresh per-thread alloca, not read from the struct.
+      auto srcAlloca = captures[i].getDefiningOp<LLVM::AllocaOp>();
+      result = LLVM::AllocaOp::create(b, loc, ptr, srcAlloca.getElemType(),
+        one64);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    } else if (scalarAllocaCaptures.contains(captures[i])) {
+      // Load the scalar, then stash it in a fresh alloca so existing
+      // load/store-of-alloca patterns keep working (SROA promotes it).
+      Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+      Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+        ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      Value scalar = LLVM::LoadOp::create(b, loc, elemTy, gep);
+      result = LLVM::AllocaOp::create(b, loc, ptr, elemTy, one64);
+      LLVM::StoreOp::create(b, loc, scalar, result);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    } else if (ptrAllocaCaptures.contains(captures[i])) {
+      Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+        ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      Value pv = LLVM::LoadOp::create(b, loc, ptr, gep);
+      result = LLVM::AllocaOp::create(b, loc, ptr, ptr, one64);
+      LLVM::StoreOp::create(b, loc, pv, result);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    } else {
+      Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+        ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+      result = LLVM::LoadOp::create(b, loc, captures[i].getType(), gep);
+      replaceUsesInRegion(fnBody, captures[i], result);
+    }
+    if (loadedCaptures) loadedCaptures->push_back(result);
+  }
 }
 
-// Get (creating on first use) the address of the `ident_t` global for a given
-// flags value. Mirrors OMPIRBuilder::getOrCreateIdent: one private constant
-// global per distinct flags value, all sharing a single default psource string
-// ";unknown;unknown;0;0;;" (reserved_3 = its length, NUL excluded).
-static Value getOrCreateIdent(ModuleOp module, OpBuilder &builder, Location loc,
-                              MLIRContext *ctx, uint32_t flags) {
-  auto i32t = IntegerType::get(ctx, 32);
+// Compute the value each capture field receives; mirrors
+// unpackCapturesFromBase.  Split from the store because the iomp task writes
+// into a block the *plan* pass allocates, so these are handed over as bindings.
+static void resolveCaptureValues(
+    OpBuilder &b, Location loc, ArrayRef<Value> captures,
+    ArrayRef<Type> fieldTypes,
+    const llvm::SetVector<Value> &privateCaptures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures,
+    SmallVectorImpl<Value> &out) {
+  auto ptr = ptrTy(b.getContext());
+  for (size_t i = 0; i < captures.size(); i++) {
+    Value capVal;
+    if (privateCaptures.contains(captures[i]))
+      capVal = LLVM::UndefOp::create(b, loc, fieldTypes[i]);
+    else if (scalarAllocaCaptures.contains(captures[i])) {
+      Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
+      capVal = LLVM::LoadOp::create(b, loc, elemTy, captures[i]);
+    } else if (ptrAllocaCaptures.contains(captures[i]))
+      capVal = LLVM::LoadOp::create(b, loc, ptr, captures[i]);
+    else
+      capVal = captures[i];
+    out.push_back(capVal);
+  }
+}
+
+static void storeCapturesToBase(
+    OpBuilder &b, Location loc, Value structBase,
+    LLVM::LLVMStructType structTy, ArrayRef<Value> captures,
+    ArrayRef<Type> fieldTypes,
+    const llvm::SetVector<Value> &privateCaptures,
+    const llvm::SetVector<Value> &scalarAllocaCaptures,
+    const llvm::SetVector<Value> &ptrAllocaCaptures) {
+  SmallVector<Value> capVals;
+  resolveCaptureValues(b, loc, captures, fieldTypes, privateCaptures,
+                       scalarAllocaCaptures, ptrAllocaCaptures, capVals);
+  auto ptr = ptrTy(b.getContext());
+  for (size_t i = 0; i < capVals.size(); i++) {
+    Value gep = LLVM::GEPOp::create(b, loc, ptr, structTy, structBase,
+      ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
+    LLVM::StoreOp::create(b, loc, capVals[i], gep);
+  }
+}
+
+static Block &takeOutlinedBody(Region &body, func::FuncOp outlinedFn,
+                               SmallVectorImpl<BlockArgument> &preexistingArgs) {
+  // Strip private_vars before takeBody so replaceUsesInRegion cannot corrupt
+  // those operand references.
+  body.walk([&](Operation *walkOp) {
+    if (auto wsOp = llvm::dyn_cast<omp::WsloopOp>(walkOp))
+      if (!wsOp.getPrivateVars().empty())
+        wsOp.getPrivateVarsMutable().clear();
+    if (auto parOp = llvm::dyn_cast<omp::ParallelOp>(walkOp))
+      if (!parOp.getPrivateVars().empty())
+        parOp.getPrivateVarsMutable().clear();
+  });
+
+  outlinedFn.getBody().takeBody(body);
+  Block &entry = outlinedFn.getBody().front();
+  preexistingArgs.assign(entry.getArguments().begin(),
+                         entry.getArguments().end());
+  return entry;
+}
+
+static void eraseDeadCasts(func::FuncOp outlinedFn) {
+  SmallVector<Operation *> casts;
+  outlinedFn.getBody().walk([&](UnrealizedConversionCastOp c) {
+    if (c->use_empty()) casts.push_back(c);
+  });
+  for (auto *c : casts) c->erase();
+}
+
+static void replaceTerminatorsWithReturn(
+    func::FuncOp outlinedFn,
+    llvm::function_ref<void(OpBuilder &, Location)> emitReturn) {
+  SmallVector<Operation *> terms;
+  for (auto &blk : outlinedFn.getBody())
+    for (auto &innerOp : blk)
+      if (innerOp.getName().getStringRef() == "omp.terminator")
+        terms.push_back(&innerOp);
+  for (auto *t : terms) {
+    OpBuilder tb(t);
+    emitReturn(tb, t->getLoc());
+    t->erase();
+  }
+}
+
+// --- 1a. IOMP TASK OUTLINING (capture_strategy = shareds) ---
+// Outlines the construct into an entry i32(i32 gtid, ptr task) that loads
+// task->shareds and unpacks the captures, leaving the construct standing with
+// the entry pointer, ABI sizes and capture values bound to it.
+// v1: pure private diagnosed not wired; no final; task_flags = 1 (tied).
+static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
+                             llvm::function_ref<Value(OpBuilder &, Location)>
+                                 makeGtid);
+static bool planNamesToken(ConstructOp op, llvm::StringRef token);
+static void warnIgnoredClauses(ConstructOp op);
+
+static void outlineTaskEntry(ConstructOp op, ModuleOp module, int &counter) {
+  Region &body = op.getBody();
+  if (body.empty()) return;
+
+  MLIRContext *ctx = op.getContext();
+  Location loc = op.getLoc();
   auto ptr  = ptrTy(ctx);
+  auto i32t = i32Ty(ctx);
+  auto i64t = IntegerType::get(ctx, 64);
 
-  // Shared default source-location string, NUL-terminated like
-  // ConstantDataArray::getString. reserved_3 stores the length without NUL.
-  llvm::StringRef srcName = "__omp_src_loc_default";
-  const std::string srcText = ";unknown;unknown;0;0;;";
-  if (!module.lookupSymbol(srcName)) {
-    std::string data = srcText;
-    data.push_back('\0');
-    auto arrTy = LLVM::LLVMArrayType::get(IntegerType::get(ctx, 8), data.size());
-    OpBuilder gb(ctx);
-    gb.setInsertionPointToStart(module.getBody());
-    LLVM::GlobalOp::create(gb, loc, arrTy, /*isConstant=*/true,
-      LLVM::Linkage::Private, srcName, StringAttr::get(ctx, data));
+  SmallVector<Value> captures = collectCaptures(body);
+  llvm::SetVector<Value> privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures;
+  classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
+                   ptrAllocaCaptures);
+
+  forceFirstprivateByValue(body, captures, privateCaptures,
+                           scalarAllocaCaptures, ptrAllocaCaptures);
+
+  SmallVector<Type> fieldTypes;
+  auto sharedsTy =
+      buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
+
+  // kmp_task_t header.  Only field 0 (shareds) is read here, but the full size
+  // goes to the alloc call so the runtime's header writes stay in bounds.
+  auto kmpTaskTy = getPropStructType(op, "kmp_task_t", ctx,
+      LLVM::LLVMStructType::getLiteral(ctx, {ptr, ptr, i32t, ptr, ptr}));
+
+  std::string fnName =
+      "outlined_" + op.getConstructName().str() + "_" + std::to_string(counter++);
+
+  OpBuilder builder(ctx);
+  if (auto parentFn = op->getParentOfType<func::FuncOp>())
+    builder.setInsertionPoint(parentFn);
+  else
+    builder.setInsertionPointToStart(module.getBody());
+
+  auto outlinedFn = func::FuncOp::create(loc, fnName,
+    FunctionType::get(ctx, {i32t, ptr}, {i32t}));
+  outlinedFn.setVisibility(SymbolTable::Visibility::Nested);
+  builder.insert(outlinedFn);
+
+  // staleArgs receives the privatizer block args; the leftovers are dropped
+  // after unpacking so the entry keeps its i32(i32 gtid, ptr task) ABI.
+  SmallVector<BlockArgument> staleArgs;
+  Block &entry = takeOutlinedBody(body, outlinedFn, staleArgs);
+
+  entry.insertArgument(0u, i32t, loc);                         // gtid
+  BlockArgument taskArg = entry.insertArgument(1u, ptr, loc);  // task
+
+  if (!captures.empty()) {
+    OpBuilder prologue(&entry, entry.begin());
+    Value shGep = LLVM::GEPOp::create(prologue, loc, ptr, kmpTaskTy, taskArg,
+      ArrayRef<LLVM::GEPArg>{0, 0});
+    Value shareds = LLVM::LoadOp::create(prologue, loc, ptr, shGep);
+    Value one64 = LLVM::ConstantOp::create(prologue, loc, i64t,
+      IntegerAttr::get(i64t, 1));
+    SmallVector<Value> loadedCaptures;
+    unpackCapturesFromBase(prologue, loc, one64, shareds, sharedsTy, captures,
+      privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures,
+      outlinedFn.getBody(), &loadedCaptures);
+
+    // firstprivate copy-in.  The source ptrs were injected at the start of the
+    // region, so they lead the captures: loadedCaptures[i] pairs staleArgs[i].
+    for (size_t i = 0; i < staleArgs.size() && i < loadedCaptures.size(); i++) {
+      BlockArgument dstArg = staleArgs[i];
+      Value srcPtr = loadedCaptures[i];
+      if (!llvm::isa<LLVM::LLVMPointerType>(srcPtr.getType())) continue;
+      Type elemTy;
+      outlinedFn.getBody().walk([&](LLVM::LoadOp loadOp) {
+        if (!elemTy && loadOp.getAddr() == dstArg)
+          elemTy = loadOp.getRes().getType();
+      });
+      if (!elemTy || !LLVM::isCompatibleType(elemTy)) continue;
+      Value privAlloca =
+        LLVM::AllocaOp::create(prologue, loc, ptr, elemTy, one64);
+      Value srcVal = LLVM::LoadOp::create(prologue, loc, elemTy, srcPtr);
+      LLVM::StoreOp::create(prologue, loc, srcVal, privAlloca);
+      replaceUsesInRegion(outlinedFn.getBody(), dstArg, privAlloca);
+    }
   }
 
-  std::string identName = "__omp_ident_" + llvm::utohexstr(flags, true);
-  if (!module.lookupSymbol(identName)) {
-    auto identStructTy = LLVM::LLVMStructType::getLiteral(
-      ctx, {i32t, i32t, i32t, i32t, ptr});
-    OpBuilder gb(ctx);
-    gb.setInsertionPointToStart(module.getBody());
-    auto global = LLVM::GlobalOp::create(gb, loc, identStructTy,
-      /*isConstant=*/true, LLVM::Linkage::Private, identName, Attribute{},
-      /*alignment=*/8);
-    global.setUnnamedAddr(LLVM::UnnamedAddr::Global);
-    Block *initBlock = new Block();
-    global.getInitializerRegion().push_back(initBlock);
-    OpBuilder ib(ctx);
-    ib.setInsertionPointToStart(initBlock);
-    auto ci = [&](int64_t v) -> Value {
-      return LLVM::ConstantOp::create(ib, loc, i32t, IntegerAttr::get(i32t, v));
-    };
-    auto ins = [&](Value v, Value st, unsigned idx) -> Value {
-      return LLVM::InsertValueOp::create(ib, loc, identStructTy, st, v,
-        ArrayRef<int64_t>{(int64_t)idx});
-    };
-    Value s = LLVM::UndefOp::create(ib, loc, identStructTy);
-    s = ins(ci(0),                       s, 0); // reserved_1
-    s = ins(ci((int64_t)flags),          s, 1); // flags (incl. KMPC)
-    s = ins(ci(0),                       s, 2); // reserved_2
-    s = ins(ci((int64_t)srcText.size()), s, 3); // reserved_3 = strlen(psource)
-    Value srcAddr = LLVM::AddressOfOp::create(ib, loc, ptr,
-      FlatSymbolRefAttr::get(ctx, srcName));
-    s = ins(srcAddr, s, 4);                     // psource
-    LLVM::ReturnOp::create(ib, loc, s);
+  // Drop the args the copy-in made dead.  A survivor with live uses is an
+  // unsupported clause shape: diagnose rather than emit a wrong-ABI entry.
+  for (auto arg : llvm::reverse(staleArgs)) {
+    if (arg.use_empty())
+      entry.eraseArgument(arg.getArgNumber());
+    else
+      op.emitError("omp-outline: iomp task has an unsupported private/"
+                   "firstprivate clause; entry ABI would break");
   }
-  return LLVM::AddressOfOp::create(builder, loc, ptr,
-    FlatSymbolRefAttr::get(ctx, identName));
+
+  eraseDeadCasts(outlinedFn);
+
+  outlinedFn.setFunctionType(
+      FunctionType::get(ctx, entry.getArgumentTypes(), {i32t}));
+
+  replaceTerminatorsWithReturn(outlinedFn, [&](OpBuilder &tb, Location l) {
+    Value zero = LLVM::ConstantOp::create(tb, l, i32t,
+      IntegerAttr::get(i32t, 0));
+    func::ReturnOp::create(tb, l, ValueRange{zero});
+  });
+
+  // A barrier is illegal in a task region — report it before binding below.
+  outlinedFn.walk([&](ConstructOp inner) {
+    if (inner.getConstructName() == "barrier")
+      inner->emitError(
+          "omp-outline: 'omp.barrier' is not valid inside a task region");
+  });
+
+  // A nested taskwait is lowered by the plan pass like any other leaf.  Here
+  // %gtid is arg 0 *by value*, not the microtask's ptr-to-i32.
+  bindGtidOnLeaves(outlinedFn, ctx, [&](OpBuilder &, Location) -> Value {
+    return outlinedFn.getBody().front().getArgument(0);
+  });
+
+  // ---- Call site ----
+  // Attach what only this pass can produce; ident and the thread id are left to
+  // the plan pass, which materialises both on first reference.
+  builder.setInsertionPoint(op);
+
+  DataLayout dl(module);
+  uint64_t taskSize    = dl.getTypeSize(kmpTaskTy).getFixedValue();
+  uint64_t sharedsSize = dl.getTypeSize(sharedsTy).getFixedValue();
+
+  Value fnPtr = func::ConstantOp::create(builder, loc,
+    outlinedFn.getFunctionType(), FlatSymbolRefAttr::get(ctx, fnName));
+  Value fnPtrCast = UnrealizedConversionCastOp::create(builder, loc,
+    TypeRange{ptr}, ValueRange{fnPtr}).getResult(0);
+
+  // Resolved here because the capture classification is outlining knowledge;
+  // the plan pass only GEPs and stores them, in this order.
+  SmallVector<Value> capVals;
+  resolveCaptureValues(builder, loc, captures, fieldTypes, privateCaptures,
+                       scalarAllocaCaptures, ptrAllocaCaptures, capVals);
+
+  SmallVector<Value> operands(op.getClauseOperands().begin(),
+                              op.getClauseOperands().end());
+  SmallVector<Attribute> names;
+  if (auto existing = op.getClauseNames())
+    names.assign(existing->begin(), existing->end());
+  auto bind = [&](llvm::StringRef n, Value v) {
+    operands.push_back(v);
+    names.push_back(StringAttr::get(ctx, n));
+  };
+  bind("body", fnPtrCast);
+  bind("task_size", LLVM::ConstantOp::create(builder, loc, i64t,
+                      IntegerAttr::get(i64t, (int64_t)taskSize)));
+  bind("shareds_size", LLVM::ConstantOp::create(builder, loc, i64t,
+                         IntegerAttr::get(i64t, (int64_t)sharedsSize)));
+  // A list: every operand under this name belongs to it, and list_names keeps
+  // it a list even when there are none.
+  for (Value v : capVals) bind("%captures", v);
+
+  op->setOperands(operands);
+  op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+  op.setListNamesAttr(ArrayAttr::get(ctx,
+      {StringAttr::get(ctx, "%captures")}));
+  warnIgnoredClauses(op);
+  return;   // deliberately not erased: the plan pass consumes it
 }
 
-// ---------------------------------------------------------------------------
-// 1. PARALLEL OUTLINING
-// ---------------------------------------------------------------------------
+static bool blockNamesToken(ArrayAttr block, llvm::StringRef token) {
+  if (!block) return false;
+  auto is = [&](Attribute a) {
+    auto s = llvm::dyn_cast<StringAttr>(a);
+    return s && s.getValue() == token;
+  };
+  for (Attribute a : block) {
+    if (auto call = llvm::dyn_cast<PlanCallAttr>(a)) {
+      for (Attribute arg : call.getArgs())
+        if (is(arg)) return true;
+      continue;
+    }
+    if (auto br = llvm::dyn_cast<PlanBranchAttr>(a)) {
+      if (is(br.getCond())) return true;
+      if (blockNamesToken(br.getIfTrue(), token) ||
+          blockNamesToken(br.getIfFalse(), token))
+        return true;
+    }
+  }
+  return false;
+}
 
-static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
-                              const dsl::LoweringPlan &barrierPlan) {
+static bool planNamesToken(ConstructOp op, llvm::StringRef token) {
+  return blockNamesToken(op.getPre(), token) ||
+         blockNamesToken(op.getInvoke(), token) ||
+         blockNamesToken(op.getPost(), token);
+}
+
+// A clause no plan action names has no lowering in this runtime's rules, and
+// emitting it anyway would change semantics silently.  Per construct: only the
+// plan knows which.
+static void warnIgnoredClauses(ConstructOp op) {
+  // The tokens a plan may name the clause by.  proc_bind has two — the push
+  // argument (iomp) and the flags word GOMP always takes — and either counts.
+  struct Clause { llvm::StringRef token, altToken, spelling; };
+  static const Clause kClauses[] = {
+    {"if_clause",   "",                "if"},
+    {"num_threads", "",                "num_threads"},
+    {"proc_bind",   "proc_bind_flags", "proc_bind"},
+  };
+  for (auto [token, altToken, spelling] : kClauses) {
+    // proc_bind is the one clause with no SSA value: it rides as an attribute.
+    bool present = token == "proc_bind" ? op.getProcBind().has_value()
+                                        : (bool)getClauseOperand(op, token);
+    bool named = planNamesToken(op, token) ||
+                 (!altToken.empty() && planNamesToken(op, altToken));
+    if (present && !named)
+      op.emitWarning("omp-outline: `")
+          << spelling
+          << "` clause is not supported by this runtime/construct lowering "
+             "and was ignored";
+  }
+}
+
+static void bindGtidOnLeaves(func::FuncOp outlinedFn, MLIRContext *ctx,
+                             llvm::function_ref<Value(OpBuilder &, Location)>
+                                 makeGtid) {
+  // Only leaves whose plan names %gtid.  Binding the rest would leave a dead
+  // undef at the top of every closure-runtime outlined function.
+  SmallVector<ConstructOp> leaves;
+  outlinedFn.walk([&](ConstructOp c) {
+    if (c.getBody().empty() && planNamesToken(c, "%gtid"))
+      leaves.push_back(c);
+  });
+  if (leaves.empty()) return;
+
+  auto &entry = outlinedFn.getBody().front();
+  OpBuilder bb(ctx);
+  bb.setInsertionPointToStart(&entry);
+  Value gtid = makeGtid(bb, outlinedFn.getLoc());
+
+  for (auto c : leaves) {
+    SmallVector<Value> operands(c.getClauseOperands().begin(),
+                                c.getClauseOperands().end());
+    SmallVector<Attribute> names;
+    if (auto existing = c.getClauseNames())
+      names.assign(existing->begin(), existing->end());
+    operands.push_back(gtid);
+    names.push_back(StringAttr::get(ctx, "%gtid"));
+    c->setOperands(operands);
+    c.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+  }
+}
+
+
+static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter) {
   Region &body = op.getBody();
   if (body.empty()) return;
 
   MLIRContext *ctx = op.getContext();
   Location loc = op.getLoc();
 
-  std::string outlineSig   = getPropStr(op, "outline_signature");
   std::string captureStrat = getPropStr(op, "capture_strategy");
+  std::optional<CaptureAbi> abiOpt = parseCaptureAbi(captureStrat);
+  if (!abiOpt) {
+    op.emitError("unknown capture_strategy '" + captureStrat +
+                 "' (expected by_pointer, packed, or shareds)");
+    return;
+  }
+  CaptureAbi abi = *abiOpt;
 
-  bool isMicrotask = outlineSig.find("microtask") != std::string::npos;
-  bool isClosure   = outlineSig.find("closure")   != std::string::npos;
-  bool isPacked    = captureStrat == "packed";
+  if (abi == CaptureAbi::Shareds) {
+    outlineTaskEntry(op, module, counter);
+    return;
+  }
 
-  // Collect all values used inside the region but defined outside.
   SmallVector<Value> captures = collectCaptures(body);
 
-  // Compute private captures before takeBody (body region is consumed after).
-  llvm::SetVector<Value> privateCaptures;
-  for (auto cap : captures)
-    if (isPrivateCapture(cap, body))
-      privateCaptures.insert(cap);
+  // Classify before takeBody (which consumes the region).  Scalar- and
+  // ptr-alloca captures are packed by value under the packed strategy, removing
+  // a level of indirection on every use and unblocking LICM.
+  llvm::SetVector<Value> privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures;
+  classifyCaptures(captures, body, privateCaptures, scalarAllocaCaptures,
+                   ptrAllocaCaptures);
 
-  // Compute scalar-alloca captures: allocas holding a scalar (int/float) whose
-  // first use in the region is a load.  For the packed/closure strategy these
-  // will be stored by value in the capture struct so the outlined function
-  // receives the scalar directly — eliminating the double indirection (struct
-  // field → alloca pointer → scalar) that would otherwise appear on every use
-  // inside the innermost loop and block LLVM's LICM from hoisting those loads.
-  llvm::SetVector<Value> scalarAllocaCaptures;
-  for (auto cap : captures)
-    if (!privateCaptures.contains(cap) && isScalarAllocaCapture(cap, body))
-      scalarAllocaCaptures.insert(cap);
+  // Only the packed path consumes these buckets; by_pointer passes captures as
+  // individual args.
+  if (abi == CaptureAbi::Packed)
+    forceFirstprivateByValue(body, captures, privateCaptures,
+                             scalarAllocaCaptures, ptrAllocaCaptures);
 
-  // Compute ptr-alloca captures: allocas holding a pointer (e.g. array ptr)
-  // whose first use in the region is a load.  Pack the pointer VALUE directly
-  // into the struct field instead of the alloca address, saving one dereference
-  // per array access inside the outlined function.
-  llvm::SetVector<Value> ptrAllocaCaptures;
-  for (auto cap : captures)
-    if (!privateCaptures.contains(cap) && !scalarAllocaCaptures.contains(cap) &&
-        isPtrAllocaCapture(cap, body))
-      ptrAllocaCaptures.insert(cap);
-
-  // Name the outlined function after the construct ("outlined_parallel_N",
-  // "outlined_task_N", ...).  Parallel keeps its historical name.
   std::string fnName =
       "outlined_" + op.getConstructName().str() + "_" + std::to_string(counter++);
 
-  // Build outlined function argument types.
   SmallVector<Type> fnArgTypes;
-  if (isMicrotask) {
+  if (abi == CaptureAbi::ByPointer) {
     fnArgTypes.push_back(ptrTy(ctx)); // ptr gtid
     fnArgTypes.push_back(ptrTy(ctx)); // ptr btid
-    if (isPacked)
-      fnArgTypes.push_back(ptrTy(ctx)); // ptr to capture struct
-    else
-      for (auto cap : captures) fnArgTypes.push_back(cap.getType());
-  } else if (isClosure) {
-    // libgomp: void(void *data) — data points to capture struct
-    fnArgTypes.push_back(ptrTy(ctx));
-  } else {
     for (auto cap : captures) fnArgTypes.push_back(cap.getType());
+  } else {
+    fnArgTypes.push_back(ptrTy(ctx));
   }
 
   OpBuilder builder(ctx);
@@ -398,138 +665,41 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
 
   auto outlinedFn = func::FuncOp::create(loc, fnName,
     FunctionType::get(ctx, fnArgTypes, {}));
-  // Use nested visibility: the outlined function is referenced via
-  // func.constant which --remove-dead-values may not track after lowering.
-  // Nested visibility prevents the symbol from being eliminated by DCE.
+  // Nested visibility: the function is referenced via func.constant, which
+  // --remove-dead-values may not track after lowering.
   outlinedFn.setVisibility(SymbolTable::Visibility::Nested);
   builder.insert(outlinedFn);
 
-  // Strip omp.wsloop/omp.parallel private_vars operands before takeBody to
-  // prevent replaceUsesInRegion from corrupting those operand references.
-  body.walk([&](Operation *walkOp) {
-    if (auto wsOp = llvm::dyn_cast<omp::WsloopOp>(walkOp))
-      if (!wsOp.getPrivateVars().empty())
-        wsOp.getPrivateVarsMutable().clear();
-    if (auto parOp = llvm::dyn_cast<omp::ParallelOp>(walkOp))
-      if (!parOp.getPrivateVars().empty())
-        parOp.getPrivateVarsMutable().clear();
-  });
+  SmallVector<BlockArgument> privatizerArgs;
+  Block &entry = takeOutlinedBody(body, outlinedFn, privatizerArgs);
 
-  // Take the body. Entry block may have privatizer args from omp.parallel.
-  outlinedFn.getBody().takeBody(body);
-  Block &entry = outlinedFn.getBody().front();
+  if (abi == CaptureAbi::Packed) {
+    // --- PACKED / CLOSURE (libgomp): one ptr to a capture struct, arg 0 ---
+    entry.insertArgument(0u, ptrTy(ctx), loc);
+    BlockArgument dataPtr = entry.getArgument(0u);
 
-  // Save existing privatizer block args before inserting capture args.
-  SmallVector<BlockArgument> privatizerArgs(entry.getArguments().begin(),
-                                             entry.getArguments().end());
-
-  if (isPacked) {
-    // -------------------------------------------------------------------------
-    // PACKED / CLOSURE strategy (libgomp)
-    // -------------------------------------------------------------------------
-    // The outlined function receives a single ptr to a capture struct.
-    // We unpack each capture from the struct in the function prolog.
-    //
-    // Struct layout: { type_0, type_1, ..., type_N-1 }
-    // Each field is the capture value itself (not a pointer to it) for
-    // scalar types, or a pointer for pointer types.
-    //
-    // For isMicrotask+isPacked (unusual): prepend gtid/btid first.
-    if (isMicrotask) {
-      entry.insertArgument(0u, ptrTy(ctx), loc); // btid
-      entry.insertArgument(0u, ptrTy(ctx), loc); // gtid
-    }
-    // Always insert the data ptr at position 0 (closure) or 2 (microtask).
-    // The entry block may already have privatizer args — we insert before them.
-    unsigned dataPtrIdx = isMicrotask ? 2u : 0u;
-    entry.insertArgument(dataPtrIdx, ptrTy(ctx), loc);
-    BlockArgument dataPtr = entry.getArgument(dataPtrIdx);
-
-    // Build the capture struct type: { cap_0_type, cap_1_type, ... }
-    // Scalar-alloca captures use their element type as the field type (value
-    // semantics); all other captures use the captured value's own type (ptr).
     SmallVector<Type> fieldTypes;
-    for (auto cap : captures) {
-      if (scalarAllocaCaptures.contains(cap))
-        fieldTypes.push_back(
-            cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
-      else
-        fieldTypes.push_back(cap.getType());
-    }
-    auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+    auto structTy =
+        buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
 
-    // In the function prolog, unpack each capture from the struct.
     if (!captures.empty()) {
       OpBuilder prologue(&entry, entry.begin());
       Value one64 = LLVM::ConstantOp::create(prologue, loc,
         IntegerType::get(ctx, 64),
         IntegerAttr::get(IntegerType::get(ctx, 64), 1));
-      // Keep loaded values so privatizer handling can reuse them.
       SmallVector<Value> loadedCaptures;
-      for (size_t i = 0; i < captures.size(); i++) {
-        if (privateCaptures.contains(captures[i])) {
-          // Private capture (loop IV etc.): allocate fresh alloca per core.
-          // Don't load from struct — each core gets its own independent copy.
-          auto srcAlloca = captures[i].getDefiningOp<LLVM::AllocaOp>();
-          Value freshAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), srcAlloca.getElemType(), one64);
-          loadedCaptures.push_back(freshAlloca);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], freshAlloca);
-        } else if (scalarAllocaCaptures.contains(captures[i])) {
-          // Scalar-alloca capture packed by value: the struct field already
-          // holds the scalar (e.g. double), not a pointer to it.  Load the
-          // scalar directly from the struct — one load, no further dereference.
-          // All uses of the original alloca (previously a ptr) inside the body
-          // were load/store ops on that alloca; replace the alloca ptr with a
-          // fresh local alloca that is initialised with the unpacked scalar so
-          // existing load/store patterns in the body remain valid without any
-          // further IR surgery.
-          Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
-          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value scalarVal = LLVM::LoadOp::create(prologue, loc, elemTy, gep);
-          // Place the scalar into a fresh alloca so that any load/store uses
-          // of the original alloca inside the body continue to work.  LLVM's
-          // mem2reg/SROA will promote this single-store alloca to a register,
-          // making the value a true SSA constant visible to LICM.
-          Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), elemTy, one64);
-          LLVM::StoreOp::create(prologue, loc, scalarVal, privAlloca);
-          loadedCaptures.push_back(privAlloca);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
-        } else if (ptrAllocaCaptures.contains(captures[i])) {
-          // Ptr-alloca capture: the struct field holds the pointer value
-          // directly.  Unpack it into a fresh alloca so that existing
-          // load/store-of-alloca patterns in the body continue to work.
-          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value ptrVal = LLVM::LoadOp::create(prologue, loc, ptrTy(ctx), gep);
-          Value privAlloca = LLVM::AllocaOp::create(prologue, loc,
-            ptrTy(ctx), ptrTy(ctx), one64);
-          LLVM::StoreOp::create(prologue, loc, ptrVal, privAlloca);
-          loadedCaptures.push_back(privAlloca);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], privAlloca);
-        } else {
-          Value gep = LLVM::GEPOp::create(prologue, loc, ptrTy(ctx), structTy,
-            dataPtr, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          Value loaded = LLVM::LoadOp::create(prologue, loc,
-            captures[i].getType(), gep);
-          loadedCaptures.push_back(loaded);
-          replaceUsesInRegion(outlinedFn.getBody(), captures[i], loaded);
-        }
-      }
-      // Handle privatizer args (firstprivate).
-      // We already loaded the source ptrs from the struct above and stored
-      // them in loadedCaptures[i]. Reuse those values — don't create new GEPs.
+      unpackCapturesFromBase(prologue, loc, one64, dataPtr, structTy, captures,
+        privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures,
+        outlinedFn.getBody(), &loadedCaptures);
+      // firstprivate: the source ptrs were already loaded above into
+      // loadedCaptures — reuse them rather than making new GEPs.
       size_t numPriv = privatizerArgs.size();
-      // The injected unrealized_conversion_cast ops for privatizer sources
-      // are inserted at the START of the entry block, so collectCaptures
-      // finds them FIRST — they are at indices 0..numPriv-1.
+      // The injected marker casts sit at the START of the entry block, so
+      // collectCaptures found them first: indices 0..numPriv-1.
       size_t privCapStart = 0;
       for (size_t i = 0; i < numPriv; i++) {
         BlockArgument dstArg = privatizerArgs[i];
         Value srcPtr = loadedCaptures[privCapStart + i]; // already loaded ptr
-        // Find element type from loads of dstArg.
         Type elemTy;
         outlinedFn.getBody().walk([&](LLVM::LoadOp loadOp) {
           if (!elemTy && loadOp.getAddr() == dstArg)
@@ -544,20 +714,15 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         replaceUsesInRegion(outlinedFn.getBody(), dstArg, privAlloca);
       }
     }
-  } else if (isMicrotask) {
-    // -------------------------------------------------------------------------
-    // BY_POINTER strategy (iomp microtask)
-    // -------------------------------------------------------------------------
-    // Insert one capture arg per capture in reverse order.
+  } else if (abi == CaptureAbi::ByPointer) {
+    // --- BY_POINTER (iomp microtask): one arg per capture ---
     for (int i = (int)captures.size() - 1; i >= 0; i--) {
       BlockArgument arg = entry.insertArgument(0u, captures[i].getType(), loc);
       replaceUsesInRegion(outlinedFn.getBody(), captures[i], arg);
     }
-    // Prepend btid then gtid.
     entry.insertArgument(0u, ptrTy(ctx), loc); // btid
     entry.insertArgument(0u, ptrTy(ctx), loc); // gtid
 
-    // Emit firstprivate copies in the function prolog.
     if (!privatizerArgs.empty()) {
       size_t numPriv = privatizerArgs.size();
       size_t privCapStart = 2; // captures injected by OmpToOmpLowerPass start here
@@ -568,14 +733,12 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
       for (size_t i = 0; i < numPriv; i++) {
         BlockArgument srcArg = entry.getArgument(privCapStart + i);
         BlockArgument dstArg = privatizerArgs[i];
-        // Find element type from existing loads of dstArg.
         Type elemTy;
         outlinedFn.getBody().walk([&](LLVM::LoadOp loadOp) {
           if (!elemTy && loadOp.getAddr() == dstArg)
             elemTy = loadOp.getRes().getType();
         });
         if (!elemTy) {
-          // Fallback: try original capture alloca's elem type.
           if (i < captures.size())
             if (auto alloca = captures[i].getDefiningOp<LLVM::AllocaOp>())
               elemTy = alloca.getElemType();
@@ -587,8 +750,7 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         Value srcVal = LLVM::LoadOp::create(copyBuilder, loc, elemTy, srcArg);
         LLVM::StoreOp::create(copyBuilder, loc, srcVal, privAlloca);
         replaceUsesInRegion(outlinedFn.getBody(), dstArg, privAlloca);
-        // Fix alignment on loads/stores of the private alloca.
-        // The original privatizer arg loads used alignment=1; fix to natural align.
+        // The original privatizer arg loads used alignment=1.
         if (LLVM::isCompatibleType(elemTy)) {
           unsigned naturalAlign = 1;
           if (elemTy.isInteger(32) || elemTy.isF32()) naturalAlign = 4;
@@ -611,31 +773,25 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
         }
       }
     }
-  } else if (isClosure) {
-    // closure without microtask: single env ptr already at index 0
   }
 
-  // Remove unused privatizer block args from the entry block.
-  // They were already replaced by private copies in the prolog; keeping them
-  // would add extra parameters that receive no values at the call site.
+  // Drop the args the copy-in made dead; a live survivor is an unsupported shape.
   if (!privatizerArgs.empty()) {
-    for (auto arg : llvm::reverse(privatizerArgs))
+    for (auto arg : llvm::reverse(privatizerArgs)) {
       if (arg.use_empty())
         entry.eraseArgument(arg.getArgNumber());
+      else
+        op.emitError("omp-outline: ")
+            << op.getConstructName()
+            << " construct has an unsupported private/firstprivate clause; "
+               "outlined ABI would break";
+    }
   }
 
-  // Remove injected unrealized_conversion_cast marker ops (no users).
-  SmallVector<Operation *> injectedCasts;
-  outlinedFn.getBody().walk([&](UnrealizedConversionCastOp castOp) {
-    if (castOp->use_empty()) injectedCasts.push_back(castOp);
-  });
-  for (auto *c : injectedCasts) c->erase();
+  eraseDeadCasts(outlinedFn);
 
-  // Erase unused capture args from the entry block and filter captures list.
-  // This removes captures that were only needed as privatizer sources
-  // (e.g., source allocas for private vars that don't need copying).
   {
-    unsigned capBase = isMicrotask ? 2 : (isClosure ? 1 : 0);
+    unsigned capBase = abi == CaptureAbi::ByPointer ? 2 : 1; // microtask: [gtid,btid,...]; packed: [data,...]
     llvm::DenseSet<unsigned> erasedCapIdx;
     for (int i = (int)captures.size() - 1; i >= 0; i--) {
       unsigned argIdx = capBase + (unsigned)i;
@@ -654,363 +810,223 @@ static void outlineConstruct(ConstructOp op, ModuleOp module, int &counter,
     }
   }
 
-  // Update function type to match actual entry block args.
   SmallVector<Type> finalArgTypes;
   for (auto arg : entry.getArguments())
     finalArgTypes.push_back(arg.getType());
   outlinedFn.setFunctionType(FunctionType::get(ctx, finalArgTypes, {}));
 
-  // Replace omp.terminator with func.return (direct blocks only).
-  SmallVector<Operation *> terminators;
-  for (auto &block : outlinedFn.getBody())
-    for (auto &innerOp : block)
-      if (innerOp.getName().getStringRef() == "omp.terminator")
-        terminators.push_back(&innerOp);
-  for (auto *termOp : terminators) {
-    OpBuilder tb(termOp);
-    func::ReturnOp::create(tb, termOp->getLoc());
-    termOp->erase();
+  // Mark capture pointers noalias.  Each arrives as a pointer to a distinct
+  // caller-side slot, so a store through one never touches another's storage.
+  // Without it the optimiser must assume they alias, blocking LICM and
+  // vectorisation.  gtid/btid are runtime-owned (captures start at index 2).
+  if (abi == CaptureAbi::ByPointer) {
+    UnitAttr noalias = UnitAttr::get(ctx);
+    for (unsigned i = 2, e = entry.getNumArguments(); i < e; i++)
+      if (llvm::isa<LLVM::LLVMPointerType>(entry.getArgument(i).getType()))
+        outlinedFn.setArgAttr(i, "llvm.noalias", noalias);
   }
 
-  // Lower omp.barrier inside the outlined function — DSL-driven.
-  // The barrier plan (one per runtime) is built once in runOnOperation;
-  // here we only resolve the symbolic args (%ident, %gtid) at each call site.
-  SmallVector<Operation *> barriers;
-  for (auto &block : outlinedFn.getBody())
-    for (auto &innerOp : block)
-      if (innerOp.getName().getStringRef() == "omp.barrier")
-        barriers.push_back(&innerOp);
-  for (auto *barrierOp : barriers) {
-    OpBuilder bb(barrierOp);
-    Location bloc = barrierOp->getLoc();
+  replaceTerminatorsWithReturn(outlinedFn, [](OpBuilder &tb, Location l) {
+    func::ReturnOp::create(tb, l);
+  });
 
-    auto resolveArg = [&](const dsl::Value &v) -> Value {
-      if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
-        llvm::StringRef s = sv->value;
-        uint32_t identFlags;
-        if (parseIdentRef(s, identFlags))
-          return getOrCreateIdent(module, bb, bloc, ctx, identFlags);
-        if (s == "%gtid") {
-          // Microtask convention: first arg is ptr to i32 gtid.
-          auto &fnEntry = outlinedFn.getBody().front();
-          if (fnEntry.getNumArguments() >= 2)
-            return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx),
-                                         fnEntry.getArgument(0));
-          return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
-        }
-      }
-      if (auto *iv = std::get_if<dsl::IntVal>(&v))
-        return arith::ConstantOp::create(bb, bloc, i32Ty(ctx),
-          IntegerAttr::get(i32Ty(ctx), iv->value));
-      return LLVM::UndefOp::create(bb, bloc, ptrTy(ctx));
-    };
+  // Bind the thread id the leaf constructs cannot derive.  This is the microtask
+  // entry, so %gtid is a load of arg 0, materialised once so it dominates them.
+  bindGtidOnLeaves(outlinedFn, ctx, [&](OpBuilder &bb, Location bloc) -> Value {
+    auto &fnEntry = outlinedFn.getBody().front();
+    if (fnEntry.getNumArguments() >= 2)
+      return LLVM::LoadOp::create(bb, bloc, i32Ty(ctx), fnEntry.getArgument(0));
+    return LLVM::UndefOp::create(bb, bloc, i32Ty(ctx));
+  });
 
-    for (auto &action : barrierPlan.invoke) {
-      if (auto *ca = std::get_if<dsl::PlanCall>(&action)) {
-        SmallVector<Value> args;
-        SmallVector<Type>  types;
-        for (auto &av : ca->args) {
-          Value v = resolveArg(av);
-          args.push_back(v); types.push_back(v.getType());
-        }
-        auto decl = getOrInsertDecl(module, ca->callee, types, bb);
-        func::CallOp::create(bb, bloc, decl, args);
-      }
-    }
-    barrierOp->erase();
-  }
+  // ---- Hand the construct to PlanLoweringPass ----
+  // No runtime call is emitted here; only what this pass alone can produce.
+  builder.setInsertionPoint(op);
 
-  // ---- Check DSL pre block for emit ident / emit global_tid ----
-  bool needsIdent     = false;
-  bool needsGlobalTid = false;
-  for (auto attr : op.getPre()) {
-    if (auto ea = llvm::dyn_cast<PlanEmitAttr>(attr)) {
-      if (ea.getSymName().getValue() == "ident")      needsIdent = true;
-      if (ea.getSymName().getValue() == "global_tid") needsGlobalTid = true;
-    }
-  }
+  SmallVector<Value> operands(op.getClauseOperands().begin(),
+                              op.getClauseOperands().end());
+  SmallVector<Attribute> names;
+  if (auto existing = op.getClauseNames())
+    names.assign(existing->begin(), existing->end());
+  auto bind = [&](llvm::StringRef n, Value v) {
+    operands.push_back(v);
+    names.push_back(StringAttr::get(ctx, n));
+  };
 
-  // ---- Emit the runtime call at the call site ----
-  std::string runtimeCallee;
-  for (auto attr : op.getInvoke())
-    if (auto ca = llvm::dyn_cast<PlanCallAttr>(attr)) {
-      runtimeCallee = ca.getCallee().getValue().str();
-      break;
-    }
+  // Under every spelling a plan may use: the context seeds body for task and
+  // outlined_parallel for parallel, and a plan can also name it as a callee.
+  Value fnPtr = func::ConstantOp::create(builder, loc,
+    outlinedFn.getFunctionType(), FlatSymbolRefAttr::get(ctx, fnName));
+  Value fnPtrCast = UnrealizedConversionCastOp::create(
+    builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
+  bind("body", fnPtrCast);
+  bind("outlined_parallel", fnPtrCast);
+  bind("outlined_task", fnPtrCast);
 
-  if (!runtimeCallee.empty()) {
-    builder.setInsertionPoint(op);
-
-    SmallVector<Value> callArgs;
-    SmallVector<Type>  callTypes;
-
-    // ident (default flags: KMPC only) — used for the fork call, the
-    // global_thread_num seed, and bare `ident` references in the pre block.
-    Value identVal;
-    if (needsIdent)
-      identVal = getOrCreateIdent(module, builder, loc, ctx, /*flags=*/0x02);
+  // proc_bind is compile-time, so it arrives as an attribute and its constant is
+  // made here.  Two tokens carry it: proc_bind (the clause) and proc_bind_flags
+  // (the word GOMP always takes, 0 if none).  Each bound only if the plan names it.
+  uint32_t affinity = 0;  // kmp_proc_bind_false / omp_proc_bind_false
+  if (auto procBind = op.getProcBind()) {
+    if (auto value = procBindEnumValue(*procBind))
+      affinity = *value;
     else
-      identVal = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+      op.emitError("omp-outline: unknown proc_bind kind '")
+          << *procBind << "'; no affinity constant to emit";
+  }
+  auto affinityConst = [&] {
+    return LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
+             IntegerAttr::get(i32Ty(ctx), (int64_t)affinity));
+  };
+  if (op.getProcBind() && planNamesToken(op, "proc_bind"))
+    bind("proc_bind", affinityConst());
+  if (planNamesToken(op, "proc_bind_flags"))
+    bind("proc_bind_flags", affinityConst());
 
-    // global_tid at call site
-    Value gtidAtCallSite;
-    if (needsGlobalTid) {
-      auto gtidDecl = getOrInsertDeclWithReturn(module,
-        "__kmpc_global_thread_num", {ptrTy(ctx)}, i32Ty(ctx), builder);
-      gtidAtCallSite = func::CallOp::create(builder, loc, gtidDecl,
-        ValueRange{identVal}).getResult(0);
-    }
+  auto i64t = IntegerType::get(ctx, 64);
+  auto one64 = [&] {
+    return LLVM::ConstantOp::create(builder, loc, i64t,
+                                    IntegerAttr::get(i64t, 1));
+  };
 
-    // Emit pre-block calls (push_num_threads, push_proc_bind, etc.)
-    for (auto attr : op.getPre()) {
-      auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
-      if (!ca) continue;
-      SmallVector<Value> preArgs;
-      SmallVector<Type>  preTypes;
-      for (auto argAttr : ca.getArgs()) {
-        Value v;
-        if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-          llvm::StringRef s = sa.getValue();
-          uint32_t identFlags;
-          if (parseIdentRef(s, identFlags))
-            v = identFlags == 0x02
-              ? identVal
-              : getOrCreateIdent(module, builder, loc, ctx, identFlags);
-          else if (s == "%gtid")
-            v = gtidAtCallSite
-              ? gtidAtCallSite
-              : LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
-          else if (s == "num_threads" && getClauseOperand(op))
-            v = getClauseOperand(op);
-          else
-            v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-        } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
-          v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
-            IntegerAttr::get(i32Ty(ctx), ia.getInt()));
-        } else {
-          v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-        }
-        preArgs.push_back(v); preTypes.push_back(v.getType());
-      }
-      auto preDecl = getOrInsertDecl(module, ca.getCallee().getValue(),
-                                      preTypes, builder);
-      func::CallOp::create(builder, loc, preDecl, preArgs);
-    }
+  if (abi == CaptureAbi::Packed) {
+    // --- PACKED / CLOSURE: one capture struct on the stack, passed by ptr ---
+    // The struct type also gives env_size / env_align.
+    SmallVector<Type> fieldTypes;
+    auto structTy =
+        buildCaptureStruct(ctx, captures, scalarAllocaCaptures, fieldTypes);
 
-    if (isPacked) {
-      // -----------------------------------------------------------------------
-      // PACKED / CLOSURE: build capture struct on the stack, pass ptr to it
-      // -----------------------------------------------------------------------
-      // Scalar-alloca captures (e.g. alpha, beta) use their element type as the
-      // field type so the outlined function receives the scalar directly.  All
-      // other captures retain pointer semantics (field type == cap.getType()).
-      SmallVector<Type> fieldTypes;
-      for (auto cap : captures) {
-        if (scalarAllocaCaptures.contains(cap))
-          fieldTypes.push_back(
-              cap.getDefiningOp<LLVM::AllocaOp>().getElemType());
-        else
-          fieldTypes.push_back(cap.getType());
-      }
-
-      // Capture-struct type — also needed below for env_size / env_align (task).
-      auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
-
-      // Build the capture struct (same for all packed runtimes).
-      Value structAlloca;
-      if (!captures.empty()) {
-        Value one64 = LLVM::ConstantOp::create(builder, loc,
-          IntegerType::get(ctx, 64),
-          IntegerAttr::get(IntegerType::get(ctx, 64), 1));
-        structAlloca = LLVM::AllocaOp::create(builder, loc,
-          ptrTy(ctx), structTy, one64);
-        for (size_t i = 0; i < captures.size(); i++) {
-          Value capVal;
-          if (privateCaptures.contains(captures[i])) {
-            // Private capture — slot not read in outlined fn; pass undef.
-            capVal = LLVM::UndefOp::create(builder, loc, fieldTypes[i]);
-          } else if (scalarAllocaCaptures.contains(captures[i])) {
-            // Scalar-alloca capture: load the scalar value from the alloca at
-            // the parallel call site and store the scalar into the struct field.
-            // The outlined function will unpack it with a single load — no
-            // second pointer dereference anywhere inside the parallel region.
-            Type elemTy = captures[i].getDefiningOp<LLVM::AllocaOp>().getElemType();
-            capVal = LLVM::LoadOp::create(builder, loc, elemTy, captures[i]);
-          } else if (ptrAllocaCaptures.contains(captures[i])) {
-            // Ptr-alloca capture: load the pointer value from the alloca and
-            // store the pointer directly into the struct field — eliminates one
-            // extra dereference (struct field → alloca → ptr → array).
-            capVal = LLVM::LoadOp::create(builder, loc, ptrTy(ctx), captures[i]);
-          } else {
-            capVal = captures[i];
-          }
-          Value gep = LLVM::GEPOp::create(builder, loc, ptrTy(ctx), structTy,
-            structAlloca, ArrayRef<LLVM::GEPArg>{0, (int32_t)i});
-          LLVM::StoreOp::create(builder, loc, capVal, gep);
-        }
-      } else {
-        structAlloca = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-      }
-
-      // outlined fn pointer
-      Value fnPtr = func::ConstantOp::create(builder, loc,
-        outlinedFn.getFunctionType(),
-        FlatSymbolRefAttr::get(ctx, fnName));
-      Value fnPtrCast = UnrealizedConversionCastOp::create(
-        builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
-
-      // Capture-struct size/alignment for GOMP_task's `long arg_size,
-      // long arg_align` (libgomp memcpys arg_size bytes into task-private
-      // memory when cpyfn is NULL).  Computed via the module DataLayout;
-      // alignment falls back to 16 (a valid power-of-2 ≥ any field's align).
-      auto i64t = IntegerType::get(ctx, 64);
-      auto i8t  = IntegerType::get(ctx, 8);
-      DataLayout dataLayout(module);
-      uint64_t envSize  = captures.empty()
-        ? 0u : dataLayout.getTypeSize(structTy).getFixedValue();
-      uint64_t envAlign = captures.empty()
-        ? 1u : dataLayout.getTypeABIAlignment(structTy);
-      if (envAlign == 0) envAlign = 16;
-
-      // Build call args from DSL invoke args, resolving symbolic names:
-      //   "body"               → fnPtrCast  (the outlined function pointer)
-      //   "env_ptr"            → structAlloca (the capture struct pointer)
-      //   "num_threads"        → clause operand (SSA value)
-      //   "env_size"/"env_align" → i64 constants (task capture struct)
-      //   "if_clause"          → clause operand, as i8 (C _Bool)
-      //   "null"               → null pointer
-      //   bool literal         → i8 constant (C _Bool)
-      //   integer              → i32 constant
-      //   other str            → undef ptr
-      for (auto attr : op.getInvoke()) {
-        auto ca = llvm::dyn_cast<PlanCallAttr>(attr);
-        if (!ca) continue;
-        for (auto argAttr : ca.getArgs()) {
-          Value v;
-          if (auto sa = llvm::dyn_cast<StringAttr>(argAttr)) {
-            llvm::StringRef s = sa.getValue();
-            if (s == "body" || s == "outlined_parallel" || s == "outlined_task")
-              v = fnPtrCast;
-            else if (s == "env_ptr")
-              v = structAlloca;
-            else if (s == "num_threads" && getClauseOperand(op))
-              v = getClauseOperand(op);
-            else if (s == "env_size")
-              v = LLVM::ConstantOp::create(builder, loc, i64t,
-                    IntegerAttr::get(i64t, (int64_t)envSize));
-            else if (s == "env_align")
-              v = LLVM::ConstantOp::create(builder, loc, i64t,
-                    IntegerAttr::get(i64t, (int64_t)envAlign));
-            else if (s == "if_clause" && getClauseOperand(op)) {
-              // Normalise the if-clause SSA value (typically i1) to i8 to
-              // match the C `_Bool` parameter of GOMP_task.
-              Value ifv = getClauseOperand(op);
-              if (ifv.getType() != i8t) {
-                unsigned bw = ifv.getType().getIntOrFloatBitWidth();
-                ifv = bw < 8
-                  ? LLVM::ZExtOp::create(builder, loc, i8t, ifv).getResult()
-                  : LLVM::TruncOp::create(builder, loc, i8t, ifv).getResult();
-              }
-              v = ifv;
-            } else if (s == "null")
-              v = LLVM::ZeroOp::create(builder, loc, ptrTy(ctx));
-            else
-              v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-          } else if (auto ba = llvm::dyn_cast<BoolAttr>(argAttr)) {
-            v = LLVM::ConstantOp::create(builder, loc, i8t,
-                  IntegerAttr::get(i8t, ba.getValue() ? 1 : 0));
-          } else if (auto ia = llvm::dyn_cast<IntegerAttr>(argAttr)) {
-            v = arith::ConstantOp::create(builder, loc, i32Ty(ctx),
-              IntegerAttr::get(i32Ty(ctx), ia.getInt()));
-          } else if (auto aa = llvm::dyn_cast<ArrayAttr>(argAttr)) {
-            // Nested array — skip (handles argc(captures) style args)
-            v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-          } else {
-            v = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
-          }
-          callArgs.push_back(v);
-          callTypes.push_back(v.getType());
-        }
-        break; // only first invoke call
-      }
+    Value structAlloca;
+    if (!captures.empty()) {
+      structAlloca = LLVM::AllocaOp::create(builder, loc,
+        ptrTy(ctx), structTy, one64());
+      storeCapturesToBase(builder, loc, structAlloca, structTy, captures,
+        fieldTypes, privateCaptures, scalarAllocaCaptures, ptrAllocaCaptures);
     } else {
-      // -----------------------------------------------------------------------
-      // BY_POINTER (iomp): ident, argc, fn_ptr, captures...
-      // -----------------------------------------------------------------------
-      callArgs.push_back(identVal); callTypes.push_back(ptrTy(ctx));
+      structAlloca = LLVM::UndefOp::create(builder, loc, ptrTy(ctx));
+    }
+    bind("env_ptr", structAlloca);
 
-      Value argcVal = arith::ConstantOp::create(builder, loc,
-        builder.getI32Type(),
-        builder.getI32IntegerAttr((int32_t)captures.size()));
-      callArgs.push_back(argcVal); callTypes.push_back(i32Ty(ctx));
-
-      Value fnPtr = func::ConstantOp::create(builder, loc,
-        outlinedFn.getFunctionType(),
-        FlatSymbolRefAttr::get(ctx, fnName));
-      Value fnPtrCast = UnrealizedConversionCastOp::create(
-        builder, loc, TypeRange{ptrTy(ctx)}, ValueRange{fnPtr}).getResult(0);
-      callArgs.push_back(fnPtrCast); callTypes.push_back(ptrTy(ctx));
-
-      for (auto cap : captures) {
-        Value capVal = cap;
-        // For private captures (loop IVs), pass a fresh local alloca.
-        if (privateCaptures.contains(cap)) {
-          // Private capture — pass a fresh local alloca so each core has
-          // its own copy (not shared through the original caller alloca).
-          auto srcAlloca = cap.getDefiningOp<LLVM::AllocaOp>();
-          Value cnt = LLVM::ConstantOp::create(builder, loc,
-            IntegerType::get(ctx, 64),
-            IntegerAttr::get(IntegerType::get(ctx, 64), 1));
-          capVal = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
-            srcAlloca.getElemType(), cnt);
-        }
-        callArgs.push_back(capVal); callTypes.push_back(capVal.getType());
+    // GOMP_task takes these as long arg_size, long arg_align (libgomp memcpys
+    // arg_size bytes when cpyfn is NULL).  Alignment falls back to 16.
+    DataLayout dataLayout(module);
+    uint64_t envSize  = captures.empty()
+      ? 0u : dataLayout.getTypeSize(structTy).getFixedValue();
+    uint64_t envAlign = captures.empty()
+      ? 1u : dataLayout.getTypeABIAlignment(structTy);
+    if (envAlign == 0) envAlign = 16;
+    bind("env_size",  LLVM::ConstantOp::create(builder, loc, i64t,
+                        IntegerAttr::get(i64t, (int64_t)envSize)));
+    bind("env_align", LLVM::ConstantOp::create(builder, loc, i64t,
+                        IntegerAttr::get(i64t, (int64_t)envAlign)));
+  } else {
+    // --- BY_POINTER (iomp microtask): each capture is its own trailing arg ---
+    // A private capture (a loop IV) gets a fresh alloca per thread.
+    SmallVector<Value> capVals;
+    for (auto cap : captures) {
+      Value capVal = cap;
+      if (privateCaptures.contains(cap)) {
+        auto srcAlloca = cap.getDefiningOp<LLVM::AllocaOp>();
+        capVal = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+          srcAlloca.getElemType(), one64());
       }
+      capVals.push_back(capVal);
     }
 
-    // __kmpc_fork_call is variadic: (ident, argc, fn, ...captures) -> void.
-    // Declare it as llvm.func variadic so multiple parallel regions with
-    // different capture counts can share the same declaration.
-    if (runtimeCallee == "__kmpc_fork_call" ||
-        runtimeCallee == "__kmpc_fork_call_if") {
-      MLIRContext *mctx = module.getContext();
-      // Fixed prefix: ident(ptr), argc(i32), fn(ptr)
-      SmallVector<Type> fixedTypes;
-      size_t fixedCount = std::min((size_t)3, callTypes.size());
-      for (size_t fi = 0; fi < fixedCount; fi++)
-        fixedTypes.push_back(callTypes[fi]);
-      LLVM::LLVMFuncOp llvmDecl;
-      if (auto existing = module.lookupSymbol<LLVM::LLVMFuncOp>(runtimeCallee)) {
-        llvmDecl = existing;
+    // The serialized side of if calls the microtask directly, and that ABI takes
+    // gtid and btid *by pointer* — two slots only this pass can make.
+    if (getClauseOperand(op, "if_clause")) {
+      std::string gtidFnName = getPropStr(op, "global_tid_function");
+      Value gtid;
+      if (gtidFnName.empty()) {
+        // Declaring a nameless function would fail the verifier.
+        op.emitWarning("'%gtid' referenced but the runtime defines no "
+                       "global_tid_function; using undef");
+        gtid = LLVM::UndefOp::create(builder, loc, i32Ty(ctx));
       } else {
-        auto varFnType = LLVM::LLVMFunctionType::get(
-          LLVM::LLVMVoidType::get(mctx), fixedTypes, /*isVarArg=*/true);
-        OpBuilder::InsertionGuard g(builder);
-        builder.setInsertionPointToStart(module.getBody());
-        llvmDecl = LLVM::LLVMFuncOp::create(builder,
-          UnknownLoc::get(mctx), runtimeCallee, varFnType,
-          LLVM::Linkage::External);
+        Value ident = getOrCreateIdent(module, builder, loc, ctx, kIdentKmpc);
+        auto gtidDecl = getOrInsertDeclWithReturn(module, gtidFnName,
+          {ptrTy(ctx)}, i32Ty(ctx), builder);
+        gtid = func::CallOp::create(builder, loc, gtidDecl,
+          ValueRange{ident}).getResult(0);
       }
-      LLVM::CallOp::create(builder, loc, llvmDecl, callArgs);
-    } else {
-      auto decl = getOrInsertDecl(module, runtimeCallee, callTypes, builder);
-      func::CallOp::create(builder, loc, decl, callArgs);
+      Value zero32 = LLVM::ConstantOp::create(builder, loc, i32Ty(ctx),
+        IntegerAttr::get(i32Ty(ctx), 0));
+      Value gtidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+        i32Ty(ctx), one64());
+      Value btidAddr = LLVM::AllocaOp::create(builder, loc, ptrTy(ctx),
+        i32Ty(ctx), one64());
+      LLVM::StoreOp::create(builder, loc, gtid, gtidAddr);
+      LLVM::StoreOp::create(builder, loc, zero32, btidAddr);
+      bind("gtid_addr", gtidAddr);
+      bind("btid_addr", btidAddr);
+      // The serialized calls need it and the store above already materialised
+      // it; without this the plan pass would emit a second gtid call.
+      bind("%gtid", gtid);
     }
+
+    for (Value v : capVals) bind("%captures", v);
+    op.setListNamesAttr(ArrayAttr::get(ctx,
+        {StringAttr::get(ctx, "%captures")}));
   }
 
-  op.erase();
+  op->setOperands(operands);
+  op.setClauseNamesAttr(ArrayAttr::get(ctx, names));
+
+  warnIgnoredClauses(op);
 }
 
-// ---------------------------------------------------------------------------
-// 2. WSLOOP LOWERING — driven by DSL plan
-// ---------------------------------------------------------------------------
+// One scratch slot per loop, in the entry block where the frame is fixed.  An
+// alloca elsewhere is a *dynamic* allocation: inside a sequential loop around
+// the wsloop the stack pointer walks down once per iteration and never comes
+// back, overrunning a PULP cluster core's few kilobytes of stack.
+static Value loopScratchSlot(OpBuilder &builder, Operation *anchor,
+                             Location loc, Type ptrT, Type elemTy) {
+  OpBuilder::InsertionGuard guard(builder);
 
-static void lowerWsloop(omp::WsloopOp wsOp,
-                        ModuleOp module,
-                        const dsl::LoweringPlan &plan) {
+  // Outlined bodies are func.func; anything else keeps the old placement.
+  if (auto fn = anchor->getParentOfType<func::FuncOp>())
+    if (!fn.getBody().empty())
+      builder.setInsertionPointToStart(&fn.getBody().front());
+
+  Value one = LLVM::ConstantOp::create(builder, loc, builder.getI64Type(),
+                                       builder.getI64IntegerAttr(1));
+  return LLVM::AllocaOp::create(builder, loc, ptrT, elemTy, one);
+}
+
+// The same rule for the allocas we did not write: the front-end puts a local's
+// slot in the scope that declares it.  The PULP path runs opt with no passes, so
+// nothing promotes them.  Hoisting a constant-size alloca is what LLVM's own
+// inliner does; a variable-size one really is dynamic and stays.
+static void hoistStaticAllocas(func::FuncOp fn) {
+  if (fn.getBody().empty()) return;
+  Block &entry = fn.getBody().front();
+
+  SmallVector<LLVM::AllocaOp> movable;
+  fn.getBody().walk([&](LLVM::AllocaOp alloca) {
+    if (alloca->getBlock() == &entry) return;
+    if (alloca.getArraySize().getDefiningOp<LLVM::ConstantOp>())
+      movable.push_back(alloca);
+  });
+
+  for (auto alloca : movable) {
+    // The size constant moves first, or the alloca would read a value defined
+    // after it.  A constant takes no operands, so this is always safe.
+    auto size = alloca.getArraySize().getDefiningOp<LLVM::ConstantOp>();
+    if (size->getBlock() != &entry)
+      size->moveBefore(&entry, entry.begin());
+    alloca->moveAfter(size);
+  }
+}
+
+// Returns failure once a diagnostic has been emitted: a wsloop left standing in
+// the output is not something the rest of the pipeline can make sense of.
+static LogicalResult lowerWsloop(omp::WsloopOp wsOp,
+                                 ModuleOp module,
+                                 const dsl::LoweringPlan &plan) {
   omp::LoopNestOp loopNest;
   wsOp.walk([&](omp::LoopNestOp op) { loopNest = op; });
-  if (!loopNest) return;
+  if (!loopNest) return success();
 
   MLIRContext *ctx = wsOp.getContext();
   Location loc = wsOp.getLoc();
@@ -1019,42 +1035,53 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   auto lbs   = loopNest.getLoopLowerBounds();
   auto ubs   = loopNest.getLoopUpperBounds();
   auto steps = loopNest.getLoopSteps();
-  if (lbs.empty() || ubs.empty() || steps.empty()) return;
+  if (lbs.empty() || ubs.empty() || steps.empty()) return success();
+
+  // Only the outermost dimension is distributed.  With a collapsed nest the
+  // inner IVs keep their uses after the body moves out, so erasing would abort.
+  if (lbs.size() > 1) {
+    wsOp.emitError("omp-outline: a collapsed loop nest (")
+        << lbs.size() << " dimensions) is not supported";
+    return failure();
+  }
 
   Value lb = lbs[0], ub = ubs[0], step = steps[0];
   Type iterTy = lb.getType();
 
-  // omp.loop_nest bounds may be inclusive or exclusive depending on how the
-  // front-end emitted them (the "inclusive" keyword on the op means the upper
-  // bound is the last valid iteration value, not one-past-the-end).
-  // Normalise to exclusive here so all downstream trip-count and range
+  // Normalise to an exclusive upper bound so all downstream trip-count
   // arithmetic is uniform: exclusive_ub = inclusive_ub + step.
   if (loopNest.getLoopInclusive())
     ub = LLVM::AddOp::create(builder, loc, ub, step);
 
-  // Get gtid from enclosing outlined function. (idents are resolved per call
-  // argument below, since init/fini and the trailing barrier use different
-  // flags.)
-  // For iomp microtask: arg0 = ptr gtid, arg1 = ptr btid → load i32 from arg0.
-  // For libgomp closure: arg0 = ptr data (capture struct) — no gtid ptr.
-  //   Use omp_get_thread_num() to obtain the current thread id.
-  Value gtidVal   = LLVM::UndefOp::create(builder, loc, iterTy);
-  if (auto parentFn = wsOp->getParentOfType<func::FuncOp>()) {
+  // The thread id, only when the plan asks: on the closure runtimes it costs an
+  // omp_get_thread_num call, which LLVM cannot delete for being unused.
+  auto planNames = [&plan](llvm::StringRef token) {
+    auto inBlock = [&](const std::vector<dsl::PlanAction> &actions) {
+      for (auto &a : actions)
+        if (auto *ca = std::get_if<dsl::PlanCall>(&a))
+          for (auto &av : ca->args)
+            if (auto *sv = std::get_if<dsl::StrVal>(&av))
+              if (sv->value == token) return true;
+      return false;
+    };
+    return inBlock(plan.pre) || inBlock(plan.invoke) || inBlock(plan.post) ||
+           inBlock(plan.firstChunk) || inBlock(plan.nextChunk);
+  };
+  bool needsGtid = planNames("%gtid");
+
+  Value gtidVal;
+  if (needsGtid) gtidVal = LLVM::UndefOp::create(builder, loc, iterTy);
+  if (auto parentFn = wsOp->getParentOfType<func::FuncOp>(); parentFn && needsGtid) {
     auto &entry = parentFn.getBody().front();
     unsigned numArgs = entry.getNumArguments();
-    // Microtask convention: at least 2 args (gtid ptr, btid ptr) + captures.
-    // Closure convention: exactly 1 arg (data ptr).
+    // Microtask: >= 2 args (gtid ptr, btid ptr).  Closure: exactly 1 (data ptr).
     bool isMicrotaskFn = numArgs >= 2 &&
       llvm::isa<LLVM::LLVMPointerType>(entry.getArgument(0).getType()) &&
       llvm::isa<LLVM::LLVMPointerType>(entry.getArgument(1).getType());
     if (isMicrotaskFn) {
-      // Load gtid from the first arg (ptr to i32).
       Value gtidPtr = entry.getArgument(0);
       gtidVal = LLVM::LoadOp::create(builder, loc, iterTy, gtidPtr);
     } else {
-      // libgomp closure: call omp_get_thread_num() to get gtid.
-      // If already declared as llvm.func, use llvm.call; otherwise
-      // create a func.func declaration and use func.call.
       if (module.lookupSymbol<LLVM::LLVMFuncOp>("omp_get_thread_num")) {
         auto callOp = LLVM::CallOp::create(builder, loc, iterTy,
           "omp_get_thread_num", ValueRange{});
@@ -1069,54 +1096,11 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   }
 
   auto ptrT = ptrTy(ctx);
-  Value one64 = LLVM::ConstantOp::create(builder, loc,
-    IntegerType::get(ctx, 64), IntegerAttr::get(IntegerType::get(ctx,64), 1));
   Value zero32 = LLVM::ConstantOp::create(builder, loc, iterTy,
     IntegerAttr::get(iterTy, 0));
   Value one32 = LLVM::ConstantOp::create(builder, loc, iterTy,
     IntegerAttr::get(iterTy, 1));
 
-  // Allocate plb, pub, pstride, plast.
-  // plb/pub/plast are in/out: initialized here, overwritten by the runtime.
-  // pstride is pure output: NOT initialized — runtime writes the stride value.
-  Value plb     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value pub     = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value pstride = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  Value plast   = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-
-  // Convert exclusive upper bound to inclusive last-iteration index.
-  // omp.loop_nest uses exclusive ub: trip = (ub - lb) / step iterations.
-  // __kmpc_for_static_init_4 expects inclusive upper bound: ub_incl = lb + (trip-1)*step
-  //   = lb + ((ub-lb)/step - 1)*step  = ub - step
-  Value ubInclusive = LLVM::SubOp::create(builder, loc, ub, step);
-
-  LLVM::StoreOp::create(builder, loc, lb,          plb);
-  LLVM::StoreOp::create(builder, loc, ubInclusive, pub);
-  // pstride: no initialization — pure output parameter
-  LLVM::StoreOp::create(builder, loc, zero32,      plast);
-
-  // Map symbolic DSL names to SSA values.
-  auto resolveCallArg = [&](const dsl::Value &v) -> Value {
-    if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
-      llvm::StringRef s = sv->value;
-      uint32_t identFlags;
-      if (parseIdentRef(s, identFlags))
-        return getOrCreateIdent(module, builder, loc, ctx, identFlags);
-      if (s == "%gtid")   return gtidVal;
-      if (s == "%lb")     return plb;
-      if (s == "%ub")     return pub;
-      if (s == "%step")   return step;    // actual loop step
-      if (s == "%stride") return pstride; // output ptr for runtime
-      if (s == "%last")   return plast;
-      return LLVM::UndefOp::create(builder, loc, ptrT);
-    }
-    if (auto *iv = std::get_if<dsl::IntVal>(&v))
-      return LLVM::ConstantOp::create(builder, loc, iterTy,
-        IntegerAttr::get(iterTy, iv->value));
-    return LLVM::UndefOp::create(builder, loc, ptrT);
-  };
-
-  // Read DSL properties that drive loop lowering strategy.
   auto getStrProp = [&](llvm::StringRef key) -> std::string {
     auto it = plan.properties.find(key.str());
     if (it == plan.properties.end()) return "";
@@ -1124,9 +1108,142 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     return "";
   };
 
-  // Emit each PlanCall in a block (e.g. plan.pre / plan.post) at the
-  // current insertion point of `b`. Symbolic args are resolved via
-  // resolveCallArg above.
+  // A property present but unreadable is a typo in the rules, and each fails a
+  // different way if it quietly falls back: wrong slot width, wrong truthiness
+  // test, or an inner loop running one past the end of every chunk.
+  bool badProp = false;
+  auto typeProp = [&](llvm::StringRef key, Type fallback) -> Type {
+    std::string spelling = getStrProp(key);
+    if (spelling.empty()) return fallback;
+    if (Type t = parseAbiTypeProp(ctx, spelling, Type())) return t;
+    wsOp.emitError("omp-outline: `") << key << " = " << spelling
+        << "` is not a type this lowering knows (i8, i32, i64, ptr)";
+    badProp = true;
+    return fallback;
+  };
+
+  // The index type of this runtime's loop ABI, not always the loop's own:
+  // libgomp's GOMP_loop_* is long-based whatever the IV is, iomp's __kmpc_*_4
+  // matches an i32.  Defaulting to the IV's type avoids conversions elsewhere.
+  Type chunkIdxTy = typeProp("chunk_index", iterTy);
+
+  // A next_chunk block means the runtime hands out iterations a chunk at a time.
+  // Which schedules are chunked is a statement rules.dsl makes, not this pass.
+  bool isChunked = !plan.nextChunk.empty();
+  // What such a call returns (0 = no work left): an int for iomp, a _Bool for GOMP.
+  Type chunkResTy = typeProp("chunk_result", i32Ty(ctx));
+
+  // Whether the upper bound the runtime writes is the last valid iteration or
+  // the one past it.  Read here so a misspelling is caught with the other two.
+  std::string chunkBound = getStrProp("chunk_bound");
+  if (!chunkBound.empty() && chunkBound != "inclusive" &&
+      chunkBound != "exclusive") {
+    wsOp.emitError("omp-outline: `chunk_bound = ")
+        << chunkBound << "` is neither `inclusive` nor `exclusive`";
+    badProp = true;
+  }
+
+  // The chunk size comes from the clause, so its type is the input's to choose.
+  // A non-integer has no conversion into the index type and would abort below.
+  Value chunkVal = wsOp.getScheduleChunk();
+  if (chunkVal && !llvm::isa<IntegerType>(chunkVal.getType())) {
+    wsOp.emitError("omp-outline: the schedule chunk must be an integer, got ")
+        << chunkVal.getType();
+    badProp = true;
+  }
+
+  // first_chunk without next_chunk leaves isChunked false, so the block is never
+  // emitted: the work-share never registers.  Wrong code, quietly — refuse it.
+  if (!plan.firstChunk.empty() && plan.nextChunk.empty()) {
+    wsOp.emitError("omp-outline: this wsloop declares `first_chunk` but no "
+                   "`next_chunk`; there is no call to ask for another chunk");
+    badProp = true;
+  }
+
+  if (badProp) return failure();
+
+  // Loop indices are signed, so widening is a sign extension.  Both sides are
+  // integers by the checks above.
+  auto convertInt = [&](Value v, Type to) -> Value {
+    if (v.getType() == to) return v;
+    auto fromTy = llvm::dyn_cast<IntegerType>(v.getType());
+    auto destTy = llvm::dyn_cast<IntegerType>(to);
+    if (!fromTy || !destTy) return v;
+    return destTy.getWidth() > fromTy.getWidth()
+               ? LLVM::SExtOp::create(builder, loc, to, v).getResult()
+               : LLVM::TruncOp::create(builder, loc, to, v).getResult();
+  };
+  auto toIdx   = [&](Value v) { return convertInt(v, chunkIdxTy); };
+  auto fromIdx = [&](Value v) { return convertInt(v, iterTy); };
+
+  // In the entry block, see loopScratchSlot.  Element type is the ABI's index
+  // type: the runtime writes them.  pstride is pure output, so not initialised.
+  Value plb     = loopScratchSlot(builder, wsOp, loc, ptrT, chunkIdxTy);
+  Value pub     = loopScratchSlot(builder, wsOp, loc, ptrT, chunkIdxTy);
+  Value pstride = loopScratchSlot(builder, wsOp, loc, ptrT, chunkIdxTy);
+  Value plast   = loopScratchSlot(builder, wsOp, loc, ptrT, chunkIdxTy);
+
+  // The last valid iteration, for the entry points taking the bound that way
+  // (the __kmpc_* family; GOMP's does not).  NOT ub - step: the step need not
+  // divide the range.  0 to 10 by 3 ends at 9, where ub - step is 7 — handing
+  // that over loses the last iteration.  Take the trip count first, then walk
+  // back one step.  Only when asked for: five ops rather than one.
+  Value ubInclusive;
+  if (!isChunked || planNames("%ub_incl")) {
+    Value range   = LLVM::SubOp::create(builder, loc, ub, lb);
+    Value rangeUp = LLVM::AddOp::create(builder, loc, range,
+                      LLVM::SubOp::create(builder, loc, step, one32));
+    Value trip    = LLVM::SDivOp::create(builder, loc, rangeUp, step);
+    Value lastIdx = LLVM::SubOp::create(builder, loc, trip, one32);
+    ubInclusive   = LLVM::AddOp::create(builder, loc, lb,
+                      LLVM::MulOp::create(builder, loc, lastIdx, step));
+  }
+
+  // Chunked: the slots are pure output — bounds go in by value through the
+  // acquisition call — so there is nothing to seed.
+  if (!isChunked) {
+    LLVM::StoreOp::create(builder, loc, toIdx(lb),          plb);
+    LLVM::StoreOp::create(builder, loc, toIdx(ubInclusive), pub);
+    LLVM::StoreOp::create(builder, loc, toIdx(zero32),      plast);
+  }
+
+  // The loop-specific site bindings; ident and %gtid come from the shared
+  // vocabulary (see resolveSymbolToken).
+  llvm::StringMap<Value> wsBindings;
+  wsBindings["%lb"]     = plb;      // in/out lower-bound slot
+  wsBindings["%ub"]     = pub;      // in/out upper-bound slot
+  wsBindings["%step"]   = step;     // actual loop step
+  wsBindings["%stride"] = pstride;  // output ptr for runtime stride
+  wsBindings["%last"]   = plast;    // in/out last-iteration flag
+  // The bounds by value, for the dispatch APIs taking them that way.  Which
+  // upper bound is its own ABI: iomp the last valid iteration, libgomp the next.
+  wsBindings["%lb_val"]  = lb;
+  wsBindings["%ub_val"]  = ub;  // exclusive, as loop_nest was normalised
+  if (ubInclusive) wsBindings["%ub_incl"] = ubInclusive;  // last valid iteration
+  if (chunkVal) wsBindings["%chunk"] = chunkVal;  // integer, checked above
+
+  // Everything naming a loop index crosses into the runtime's index type;
+  // pointers and the thread id do not.  Identity for every runtime but libgomp.
+  auto isIndexToken = [](llvm::StringRef t) {
+    return t == "%lb_val" || t == "%ub_val" || t == "%ub_incl" ||
+           t == "%step"   || t == "%chunk";
+  };
+  auto resolveCallArg = [&](const dsl::Value &v) -> Value {
+    if (auto *sv = std::get_if<dsl::StrVal>(&v)) {
+      Value r = resolveSymbolToken(
+          sv->value, builder, loc, wsBindings,
+          [&](uint32_t flags) {
+            return getOrCreateIdent(module, builder, loc, ctx, flags);
+          },
+          [&] { return gtidVal; });
+      return isIndexToken(sv->value) ? toIdx(r) : r;
+    }
+    if (auto *iv = std::get_if<dsl::IntVal>(&v))
+      return LLVM::ConstantOp::create(builder, loc, chunkIdxTy,
+        IntegerAttr::get(chunkIdxTy, iv->value));
+    return LLVM::UndefOp::create(builder, loc, ptrT);
+  };
+
   auto emitPlanCalls = [&](const std::vector<dsl::PlanAction> &actions,
                            OpBuilder &b) {
     for (auto &action : actions) {
@@ -1143,14 +1260,9 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     }
   };
 
-  // ---------------------------------------------------------------------------
-  // Process plan.pre: emit each PlanCall directly; if `emit thread_bounds`
-  // is encountered, materialise per-thread [lbThread, ubThread) inline via a
-  // contiguous block-chunk formula.  The runtime path (e.g. iomp
-  // __kmpc_for_static_init_4) has only PlanCalls in pre; the inline path
-  // (PMSIS, libgomp) has only `emit thread_bounds`.  Whether `emit
-  // thread_bounds` was seen drives the loop bounds choice below.
-  // ---------------------------------------------------------------------------
+  // plan.pre: emit the PlanCalls; emit thread_bounds instead materialises
+  // per-thread [lbThread, ubThread) inline.  Which one ran drives the bounds
+  // choice below.
   Value lbThread, ubThread;
   bool haveInlineBounds = false;
   for (auto &action : plan.pre) {
@@ -1168,38 +1280,30 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     auto *pe = std::get_if<dsl::PlanEmit>(&action);
     if (!pe || pe->name != "thread_bounds") continue;
 
-    // Block work-distribution (one contiguous chunk per thread):
-    //   trip  = ceil((ub - lb) / step)        -- iteration count
-    //   chunk = ceil(trip / num_threads)      -- block size per thread
-    //   lbThread = lb + threadId * chunk * step           (inclusive start)
-    //   ubThread = min(lbThread + chunk * step, ub)         (exclusive end, clamped)
-    // This avoids the per-thread DIVMOD (SDiv + SRem) of the balanced scheme:
-    // a single ceiling-division computes the chunk and the upper bound is
-    // clamped with a select.  The helper function names come from the DSL
-    // properties thread_id_function / num_threads_function, so this code path
-    // serves any runtime that exposes such helpers.
+    // Block distribution, one contiguous chunk per thread:
+    //   trip     = ceil((ub - lb) / step)
+    //   chunk    = ceil(trip / num_threads)
+    //   lbThread = lb + threadId * chunk * step
+    //   ubThread = min(lbThread + chunk * step, ub)
+    // One ceiling division and a clamping select, not a per-thread SDiv+SRem.
     std::string threadIdFn  = getStrProp("thread_id_function");
     std::string numThreadFn = getStrProp("num_threads_function");
     Value threadId   = emitNoArgI32Call(module, builder, loc, threadIdFn);
     Value numThreads = emitNoArgI32Call(module, builder, loc, numThreadFn);
 
-    // trip = (ub - lb + step - 1) / step  [ceiling division of iteration count]
     Value range    = LLVM::SubOp::create(builder, loc, ub, lb);
     Value rangeS   = LLVM::AddOp::create(builder, loc, range,
                        LLVM::SubOp::create(builder, loc, step, one32));
     Value trip     = LLVM::SDivOp::create(builder, loc, rangeS, step);
 
-    // chunk = ceil(trip / num_threads)
     Value tripPlusNC = LLVM::AddOp::create(builder, loc, trip,
                          LLVM::SubOp::create(builder, loc, numThreads, one32));
     Value chunk    = LLVM::SDivOp::create(builder, loc, tripPlusNC, numThreads);
 
-    // lbThread = lb + threadId * chunk * step
     Value threadChunk  = LLVM::MulOp::create(builder, loc, threadId, chunk);
     Value threadOff    = LLVM::MulOp::create(builder, loc, threadChunk, step);
     lbThread           = LLVM::AddOp::create(builder, loc, lb, threadOff);
 
-    // ubThread = lbThread + chunk * step, then clamp to ub
     Value chunkStep  = LLVM::MulOp::create(builder, loc, chunk, step);
     Value lbThreadEnd  = LLVM::AddOp::create(builder, loc, lbThread, chunkStep);
     Value clampCond  = LLVM::ICmpOp::create(builder, loc,
@@ -1208,49 +1312,115 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     haveInlineBounds = true;
   }
 
-  // Choose loop bounds and comparison predicate based on how pre populated them.
-  // Inline block-chunking produces exclusive ubThread → use slt.
-  // Runtime init (e.g. __kmpc_for_static_init_4) writes inclusive ub into pub
-  // (we initialised pub with ub - step) → use sle.
+  // Bounds and predicate follow how pre populated them: inline chunking gives an
+  // exclusive ubThread (slt), a runtime init an inclusive one (sle).  A chunked
+  // construct has neither yet, so the predicate is the runtime's convention.
   Value loopStart, loopEnd;
-  LLVM::ICmpPredicate cmpPred;
+  LLVM::ICmpPredicate cmpPred = LLVM::ICmpPredicate::sle;
   if (haveInlineBounds) {
     loopStart = lbThread;
     loopEnd   = ubThread;
     cmpPred   = LLVM::ICmpPredicate::slt;
-  } else {
+  } else if (!isChunked) {
     loopStart = LLVM::LoadOp::create(builder, loc, iterTy, plb);
     loopEnd   = LLVM::LoadOp::create(builder, loc, iterTy, pub);
     cmpPred   = LLVM::ICmpPredicate::sle;
+  } else {
+    cmpPred = chunkBound == "exclusive" ? LLVM::ICmpPredicate::slt
+                                        : LLVM::ICmpPredicate::sle;
   }
 
-  // -------------------------------------------------------------------------
-  // Build the sequential loop.
-  // -------------------------------------------------------------------------
+  // Emit a chunk-acquisition block and give back the i1 there-was-work test of
+  // its last call — a when/otherwise chain collapses to exactly one.
+  auto emitChunkCall = [&](const std::vector<dsl::PlanAction> &actions) -> Value {
+    Value more;
+    for (auto &action : actions) {
+      auto *ca = std::get_if<dsl::PlanCall>(&action);
+      if (!ca) continue;
+      SmallVector<Value> args;
+      SmallVector<Type>  types;
+      for (auto &av : ca->args) {
+        Value v = resolveCallArg(av);
+        args.push_back(v); types.push_back(v.getType());
+      }
+      auto decl =
+          getOrInsertDeclWithReturn(module, ca->callee, types, chunkResTy, builder);
+      more = func::CallOp::create(builder, loc, decl, args).getResult(0);
+    }
+    if (!more) return Value();
+    Value zero = LLVM::ConstantOp::create(builder, loc, chunkResTy,
+      IntegerAttr::get(chunkResTy, 0));
+    return LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ne, more, zero);
+  };
+
+  // A chunk block with no call leaves the loop with nothing to turn on.
+  auto blockHasCall = [](const std::vector<dsl::PlanAction> &b) {
+    for (auto &a : b)
+      if (std::get_if<dsl::PlanCall>(&a)) return true;
+    return false;
+  };
+  if (isChunked && (!blockHasCall(plan.nextChunk) ||
+                    (!plan.firstChunk.empty() && !blockHasCall(plan.firstChunk)))) {
+    wsOp.emitError("omp-outline: the chunk block of this wsloop makes no call; "
+                   "there is no chunk to loop on");
+    return failure();
+  }
+
+  // Build the loop.  A chunked construct wraps the sequential loop in an outer
+  // one, rotated so the acquisition call sits in a guard and a latch:
+  //   pre:        first_chunk? -> chunkBody : after
+  //   chunkBody:  read the slots the call filled, then the inner loop
+  //   chunkLatch: next_chunk?  -> chunkBody : after
+  // Rotating it lets the opening call differ from the repeat one, which libgomp
+  // needs and iomp does not.
   Block *preBlock   = builder.getInsertionBlock();
   Block *afterBlock = preBlock->splitBlock(builder.getInsertionPoint());
+  Block *chunkBody  = isChunked ? new Block() : nullptr;
   Block *loopHeader = new Block();
   Block *loopBody   = new Block();
   Block *loopLatch  = new Block();
+  Block *chunkLatch = isChunked ? new Block() : nullptr;
 
   auto &parentRegion = *preBlock->getParent();
-  parentRegion.getBlocks().insertAfter(preBlock->getIterator(), loopHeader);
-  parentRegion.getBlocks().insertAfter(loopHeader->getIterator(), loopBody);
-  parentRegion.getBlocks().insertAfter(loopBody->getIterator(), loopLatch);
+  auto lastInserted = preBlock->getIterator();
+  auto insertBlock = [&](Block *b) {
+    parentRegion.getBlocks().insertAfter(lastInserted, b);
+    lastInserted = b->getIterator();
+  };
+  if (chunkBody) insertBlock(chunkBody);
+  insertBlock(loopHeader);
+  insertBlock(loopBody);
+  insertBlock(loopLatch);
+  if (chunkLatch) insertBlock(chunkLatch);
 
+  // The induction slot goes to the entry block too; only the store that arms it
+  // stays here, where the loop starts.
+  Value pi = loopScratchSlot(builder, wsOp, loc, ptrT, iterTy);
   builder.setInsertionPointToEnd(preBlock);
-  Value pi = LLVM::AllocaOp::create(builder, loc, ptrT, iterTy, one64);
-  LLVM::StoreOp::create(builder, loc, loopStart, pi);
-  LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  if (isChunked) {
+    Value more = emitChunkCall(
+        plan.firstChunk.empty() ? plan.nextChunk : plan.firstChunk);
+    LLVM::CondBrOp::create(builder, loc, more,
+      chunkBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+
+    builder.setInsertionPointToEnd(chunkBody);
+    loopStart = fromIdx(LLVM::LoadOp::create(builder, loc, chunkIdxTy, plb));
+    loopEnd   = fromIdx(LLVM::LoadOp::create(builder, loc, chunkIdxTy, pub));
+    LLVM::StoreOp::create(builder, loc, loopStart, pi);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  } else {
+    LLVM::StoreOp::create(builder, loc, loopStart, pi);
+    LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
+  }
+
+  Block *loopExit = isChunked ? chunkLatch : afterBlock;
 
   builder.setInsertionPointToEnd(loopHeader);
   Value curI = LLVM::LoadOp::create(builder, loc, iterTy, pi);
   Value cond = LLVM::ICmpOp::create(builder, loc, cmpPred, curI, loopEnd);
   LLVM::CondBrOp::create(builder, loc, cond,
-    loopBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+    loopBody, mlir::ValueRange{}, loopExit, mlir::ValueRange{});
 
-  // Move the loop nest body into loopBody.
-  // The nest region may have multiple blocks (from inner loops).
   auto &nestRegion = loopNest.getRegion();
   auto &nestFirst  = nestRegion.front();
   nestFirst.getArgument(0).replaceAllUsesWith(curI);
@@ -1269,9 +1439,8 @@ static void lowerWsloop(omp::WsloopOp wsOp,
     builder.setInsertionPointToEnd(loopBody);
     LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopLatch);
   } else {
-    // Multiple blocks (inner loops from CIR): splice ALL blocks before
-    // loopLatch first, then move first block's ops into loopBody — this
-    // preserves branch targets since blocks are already in the region.
+    // Splice ALL blocks before loopLatch first, then move the first block's ops
+    // into loopBody — this preserves branch targets.
     SmallVector<Block *> blocksToMove;
     for (auto &blk : nestRegion)
       if (&blk != &nestFirst) blocksToMove.push_back(&blk);
@@ -1294,16 +1463,19 @@ static void lowerWsloop(omp::WsloopOp wsOp,
   LLVM::StoreOp::create(builder, loc, nextI, pi);
   LLVM::BrOp::create(builder, loc, mlir::ValueRange{}, loopHeader);
 
-  // Emit post-loop calls (e.g. fini, optional barrier).
+  if (isChunked) {
+    builder.setInsertionPointToEnd(chunkLatch);
+    Value more = emitChunkCall(plan.nextChunk);
+    LLVM::CondBrOp::create(builder, loc, more,
+      chunkBody, mlir::ValueRange{}, afterBlock, mlir::ValueRange{});
+  }
+
   builder.setInsertionPointToStart(afterBlock);
   emitPlanCalls(plan.post, builder);
 
   wsOp.erase();
+  return success();
 }
-
-// ---------------------------------------------------------------------------
-// Pass
-// ---------------------------------------------------------------------------
 
 struct OmpOutliningPass
     : public PassWrapper<OmpOutliningPass, OperationPass<ModuleOp>> {
@@ -1343,26 +1515,14 @@ struct OmpOutliningPass
     }
     dsl::Evaluator evaluator(*program);
 
-    // Pre-compute the barrier plan once; the same plan is reused for every
-    // omp.barrier inside outlined parallel functions.
-    llvm::StringMap<dsl::Value> barrierCtx;
-    barrierCtx["ident"]      = dsl::makeStr("%ident");
-    barrierCtx["global_tid"] = dsl::makeStr("%gtid");
-    auto barrierPlan = evaluator.buildPlan(runtimeName, "barrier", barrierCtx);
-    if (!barrierPlan) {
-      module.emitError("omp-outline: barrier DSL evaluation failed: ")
-        << llvm::toString(barrierPlan.takeError());
-      return signalPassFailure();
-    }
-
-    // Step 1: outline parallel constructs.
+    // Step 1: outline the region constructs.
     SmallVector<ConstructOp> constructs;
     module.walk([&](ConstructOp op) {
       if (!op.getBody().empty()) constructs.push_back(op);
     });
     int counter = 0;
     for (auto op : constructs)
-      outlineConstruct(op, module, counter, *barrierPlan);
+      outlineConstruct(op, module, counter);
 
     // Step 2: lower omp.wsloop ops using the DSL evaluator.
     SmallVector<omp::WsloopOp> wsloops;
@@ -1378,9 +1538,15 @@ struct OmpOutliningPass
       ctx["upper"]      = dsl::makeStr("%ub");
       ctx["step"]       = dsl::makeStr("%step");
       ctx["last"]       = dsl::makeStr("%last");
-      // Removed: no construct references a bare `chunk`; the static schedule's
-      // chunk size flows from the runtime-level `let default_chunk` in rules.dsl.
-      // ctx["chunk"]      = dsl::makeInt(1);
+      // The bounds by value, next to the in/out slots: which upper bound a
+      // dispatch API wants is its own convention, so both are offered.
+      ctx["lower_val"]  = dsl::makeStr("%lb_val");
+      ctx["upper_val"]  = dsl::makeStr("%ub_val");
+      ctx["upper_incl"] = dsl::makeStr("%ub_incl");
+      // Absent when the clause named none, which is what lets the rules write
+      // when has(chunk) and fall back to their own default.
+      ctx["chunk"] = wsOp.getScheduleChunk() ? dsl::makeStr("%chunk")
+                                             : dsl::makeNull();
       ctx["nowait"]     = dsl::makeBool(wsOp.getNowait());
       ctx["schedule"]   = dsl::makeStr("static");
       ctx["stride"]     = dsl::makeStr("%stride");  // output ptr for runtime stride
@@ -1397,8 +1563,18 @@ struct OmpOutliningPass
         return;
       }
 
-      lowerWsloop(wsOp, module, *plan);
+      // Carry on to the next loop: a rule file with a mistake in it usually has
+      // the same mistake in every loop that reads it.
+      if (failed(lowerWsloop(wsOp, module, *plan)))
+        signalPassFailure();
     }
+
+    // Step 3: hoist allocas.  Last, so it sees both what the front-end left
+    // inside a loop and anything the two steps above added.
+    module.walk([](func::FuncOp fn) { hoistStaticAllocas(fn); });
+
+    // The trailing team barrier redundant with the fork's join is dropped by
+    // OmpBarrierElimPass instead, on the omp dialect, so one rule serves all three.
   }
 };
 
