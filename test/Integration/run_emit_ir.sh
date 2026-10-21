@@ -4,7 +4,7 @@
 # lowering can be read step by step.
 #
 # Usage:
-#   ./run_emit_ir.sh                                        # gemm, iomp
+#   ./run_emit_ir.sh                                        # run.env's KERNELS, else gemm
 #   ./run_emit_ir.sh atax                                   # by name
 #   ./run_emit_ir.sh gemm jacobi-2d 2mm                     # several
 #   ./run_emit_ir.sh all                                    # the whole list
@@ -12,8 +12,8 @@
 #   RUNTIME=libgomp ./run_emit_ir.sh atax
 #   BARRIER_ELIM=1 ./run_emit_ir.sh                         # adds --omp-barrier-elim as a stage
 #
-# Leaves results/<runtime>/ir/<kernel>/, one numbered file per stage, and
-# next to each a *.kernel.* copy holding only kernel_* and outlined_*.
+# Leaves results/<runtime>/ir/<kernel>/, starting from a copy of the kernel
+# source and then one numbered file per stage.
 # pmsis stops after the OpenMP lowering: the rest needs the PULP toolchain.
 
 set -uo pipefail
@@ -33,7 +33,10 @@ fi
 # Resolve every argument up front: a name typed wrong should not surface after
 # the first kernel has already been compiled.
 ARGS=("$@")
-[ ${#ARGS[@]} -eq 0 ] && ARGS=("gemm")
+if [ ${#ARGS[@]} -eq 0 ]; then
+    # Nothing asked for: take the list run.env already picked, if it picked one.
+    if [ -n "${KERNELS:-}" ]; then read -ra ARGS <<< "$KERNELS"; else ARGS=("gemm"); fi
+fi
 if [ ${#ARGS[@]} -eq 1 ] && [ "${ARGS[0]}" = "all" ]; then
     ARGS=("${ALL_KERNELS[@]}")
 fi
@@ -60,22 +63,6 @@ else
 fi
 
 # --- Helpers ------------------------------------------------------------------
-# Copy out the kernel_* and outlined_* functions, so a stage can be read
-# without main/init_array/print_array around them.
-extract_kernel() {   # extract_kernel <in> <out>
-    awk '
-        !inside && /(cir\.func|func\.func|llvm\.func|define).*@(kernel_|outlined_)/ {
-            inside = 1; depth = 0
-        }
-        inside {
-            print
-            depth += gsub(/\{/, "{") - gsub(/\}/, "}")
-            if (depth <= 0 && /\}/) { inside = 0; print "" }
-        }
-    ' "$1" > "$2"
-    [ -s "$2" ] || rm -f "$2"
-}
-
 # "a x2, b x1" from a list of names, one per line
 count_names() { sort | uniq -c | awk '{printf "%s%s x%s", sep, $2, $1; sep=", "}'; }
 
@@ -100,10 +87,7 @@ begin_stage() {   # begin_stage <name.ext> -> sets CUR to the next numbered file
 }
 done_stage() {   # done_stage <description>
     printf '  %-28s %s\n' "$(basename "$CUR")" "$1"
-    case "$CUR" in *.cir|*.mlir|*.ll)
-        summary "$CUR"
-        extract_kernel "$CUR" "${CUR%.*}.kernel.${CUR##*.}" ;;
-    esac
+    case "$CUR" in *.cir|*.mlir|*.ll) summary "$CUR" ;; esac
     PREV="$CUR"
 }
 fail() {
@@ -127,6 +111,11 @@ emit_ir() {   # emit_ir <src>
     echo
 
     # --- C -> CIR -> llvm + omp dialects --------------------------------------
+    # The source first, so the directory reads from the C down to the binary.
+    begin_stage "$(basename "$SRC")"
+    cp "$SRC" "$CUR" || { fail; return 1; }
+    done_stage "the kernel, as PolyBench writes it"
+
     begin_stage cir.cir
     "$CLANG" -S $WARN_SUPPRESS -Xclang -fclangir -Xclang -emit-cir -fopenmp \
         -I"$INC" -I"$(dirname "$SRC")" -I"$INC_OMP" -D"$DATASET" $FRONTEND_FLAGS \
