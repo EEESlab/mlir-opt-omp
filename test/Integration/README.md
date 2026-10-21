@@ -15,6 +15,12 @@ kernels and the same `run.env`:
 - **`run_unroll.sh`** — what the CIR unroll-by-two pass is worth on GAP8,
   which is Figure 8 (see [CIR unrolling](#cir-unrolling)). `pmsis` only,
   and only with a `cir-opt` that carries the pass.
+- **`run_emit_ir.sh`** — the named kernels (or `all`, or whatever `KERNELS`
+  holds, else `gemm`) from C to a binary, keeping the IR of every stage and
+  running the `mlir-opt-omp` passes one at a time, so the lowering can be read
+  step by step. `results/<runtime>/ir/<kernel>/` holds a copy of the kernel
+  source and then one numbered file per stage. `pmsis` stops after the OpenMP
+  lowering.
 
 A third driver covers the constructs and clauses PolyBench never writes — which
 is most of them (see [`constructs/`](constructs/)):
