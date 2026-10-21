@@ -46,11 +46,29 @@ select_kernels() {
     fi
 }
 
-# Resolve a kernel argument: an absolute/relative path, or a path under
-# $POLYBENCH. Echoes the resolved path; non-zero if it cannot be found.
+# Resolve a kernel argument: an absolute/relative path, a path under
+# $POLYBENCH, or the bare name — "gemm", "jacobi-2d", "2mm". Echoes the
+# resolved path; non-zero if it cannot be found.
 resolve_src() {
-    local k="$1"
+    local k="$1" cand
     if [ -f "$k" ]; then echo "$k"; return 0; fi
     if [ -f "$POLYBENCH/$k" ]; then echo "$POLYBENCH/$k"; return 0; fi
+    for cand in "${ALL_KERNELS[@]}"; do      # bare name: the directory is the name
+        case "$cand" in
+            */"$k"/*|*/"$k")
+                if [ -f "$POLYBENCH/$cand" ]; then echo "$POLYBENCH/$cand"; return 0; fi
+                ;;
+        esac
+    done
     return 1
+}
+
+# The bare names resolve_src accepts, one line, for an error message.
+kernel_names() {
+    local k out=""
+    for k in "${ALL_KERNELS[@]}"; do
+        k="${k%/*}"                          # drop the file
+        out="$out ${k##*/}"                  # keep the directory
+    done
+    echo "${out# }"
 }
